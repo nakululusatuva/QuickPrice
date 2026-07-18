@@ -109,6 +109,15 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     _assert_security_headers(javascript)
 
 
+def test_dashboard_income_help_labels_align_with_the_numeric_column(client) -> None:
+    css = client.get("/dashboard/assets/dashboard.css")
+
+    assert css.status_code == 200
+    rule = re.search(r"\.income-label\.has-help\s*\{(?P<body>[^}]*)\}", css.text)
+    assert rule is not None
+    assert re.search(r"margin-left\s*:\s*auto\s*;", rule.group("body"))
+
+
 def test_dashboard_quote_projection_keeps_price_with_exact_metadata_error(
     settings,
     auth_headers,

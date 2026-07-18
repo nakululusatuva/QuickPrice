@@ -767,6 +767,7 @@ a:focus-visible {
 
 .income-label.has-help {
   width: fit-content;
+  margin-left: auto;
   border-bottom: 1px dotted currentColor;
   cursor: help;
 }
