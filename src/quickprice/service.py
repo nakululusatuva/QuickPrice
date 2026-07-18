@@ -11,7 +11,13 @@ from datetime import datetime, timedelta
 from threading import RLock
 from typing import Any
 
-from .analytics import boxx_yield, calculate_changes, quarterly_dividend, sgov_yield
+from .analytics import (
+    boxx_yield,
+    calculate_changes,
+    quarterly_dividend,
+    sgov_yield,
+    treasury_proxy_yield,
+)
 from .cache import HistoryCache, SnapshotStore
 from .config import Settings
 from .domain import (
@@ -25,9 +31,15 @@ from .domain import (
 )
 from .market import most_recent_scheduled_close, scheduled_market_status
 from .metrics import Metrics
-from .plugin_api import AssetClass, YieldStrategy
+from .plugin_api import YieldStrategy
 from .registry import InstrumentRegistry, build_registry
-from .runtime import FreeThreadedStatus, inspect_free_threaded_runtime
+from .runtime import (
+    FreeThreadedStatus,
+    RuntimeGeneration,
+    RuntimeGenerationManager,
+    RuntimeRegistryView,
+    inspect_free_threaded_runtime,
+)
 from .schemas import QualityModel, QuoteModel, snapshot_to_wire
 from .staking import (
     ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS,
@@ -46,28 +58,72 @@ class DataUnavailableError(Exception):
         self.code = code
 
 
+@dataclasses.dataclass(slots=True)
+class _RuntimeDataState:
+    """Generation-owned mutable market state.
+
+    A request captures this object together with its registry. Candidate warm-up
+    writes to a clone, so a catalog switch cannot expose definitions from one
+    generation with quotes or income metadata from another.
+    """
+
+    snapshots: SnapshotStore = dataclasses.field(default_factory=SnapshotStore)
+    history: HistoryCache = dataclasses.field(default_factory=HistoryCache)
+    dividends: dict[str, DividendEvent] = dataclasses.field(default_factory=dict)
+    yield_metrics: dict[str, YieldMetric] = dataclasses.field(default_factory=dict)
+    yield_stale_after_seconds: dict[str, float] = dataclasses.field(default_factory=dict)
+    last_quotes: dict[str, ProviderQuote] = dataclasses.field(default_factory=dict)
+    source_failures: set[str] = dataclasses.field(default_factory=set)
+    wire_cache: dict[str, QuoteModel] = dataclasses.field(default_factory=dict)
+    complete_symbols: set[str] = dataclasses.field(default_factory=set)
+    active_aggregates: dict[str, AggregatePrice] = dataclasses.field(default_factory=dict)
+
+    def clone(self) -> _RuntimeDataState:
+        return _RuntimeDataState(
+            snapshots=self.snapshots.clone(),
+            # History is registry-neutral and potentially much larger than the
+            # quote snapshot map. Candidate warm-up stages changed points
+            # separately and publishes only those after the pointer switch.
+            history=self.history,
+            dividends=dict(self.dividends),
+            yield_metrics=dict(self.yield_metrics),
+            yield_stale_after_seconds=dict(self.yield_stale_after_seconds),
+            last_quotes=dict(self.last_quotes),
+            source_failures=set(self.source_failures),
+            wire_cache=dict(self.wire_cache),
+            complete_symbols=set(self.complete_symbols),
+            active_aggregates=dict(self.active_aggregates),
+        )
+
+
 class QuickPriceService:
     def __init__(
         self,
         settings: Settings,
         registry: InstrumentRegistry | None = None,
+        *,
+        runtime_revision: str | None = None,
+        runtime_catalog: Any = None,
     ) -> None:
         self.settings = settings
-        self.registry = build_registry(settings.enabled_plugins) if registry is None else registry
-        self.snapshots = SnapshotStore()
-        self.history = HistoryCache()
+        initial_registry = (
+            build_registry(settings.enabled_plugins) if registry is None else registry
+        )
+        initial_state = _RuntimeDataState()
+        self._generations = RuntimeGenerationManager(
+            initial_registry,
+            revision=runtime_revision,
+            catalog=runtime_catalog,
+            data_state=initial_state,
+        )
+        self._registry_view = RuntimeRegistryView(self._generations)
         self.metrics = Metrics()
         self.runtime_status: FreeThreadedStatus | None = None
         self._metadata_lock = RLock()
-        self._dividends: dict[str, DividendEvent] = {}
-        self._yield_metrics: dict[str, YieldMetric] = {}
-        self._yield_stale_after_seconds: dict[str, float] = {}
-        self._last_quotes: dict[str, ProviderQuote] = {}
-        self._source_failures: set[str] = set()
-        self._wire_cache: dict[str, QuoteModel] = {}
-        self._complete_symbols: set[str] = set()
-        self._active_aggregates: dict[str, AggregatePrice] = {}
+        self._bind_runtime_state(initial_state)
         self._provider_checkpoints: dict[tuple[str, str], Any] = {}
+        self._provider_quota_lock = RLock()
+        self._provider_quotas: dict[str, Any] = {}
         self._storage: Any = None
         self._coordinator: Any = None
         self._collector_start_error: BaseException | None = None
@@ -76,6 +132,732 @@ class QuickPriceService:
         self._started = False
         self._storage_ready = False
         self._api_key_configured: Any = None
+        self._instrument_catalog: Any = None
+        self._catalog_runtime: Any = None
+        self._activation_lock = asyncio.Lock()
+        self._activation_jobs: dict[str, Any] = {}
+
+    @property
+    def registry(self) -> InstrumentRegistry:
+        """Return the immutable registry in the currently active generation."""
+
+        return self._generations.capture().registry
+
+    @property
+    def registry_view(self) -> RuntimeRegistryView:
+        """Expose a compatibility mapping that follows future activations."""
+
+        return self._registry_view
+
+    def capture_generation(self) -> RuntimeGeneration:
+        """Capture one consistent data-plane view for a complete request."""
+
+        return self._generations.capture()
+
+    def _bind_runtime_state(self, state: _RuntimeDataState) -> None:
+        """Update compatibility attributes after an atomic generation switch."""
+
+        self.snapshots = state.snapshots
+        self.history = state.history
+        self._dividends = state.dividends
+        self._yield_metrics = state.yield_metrics
+        self._yield_stale_after_seconds = state.yield_stale_after_seconds
+        self._last_quotes = state.last_quotes
+        self._source_failures = state.source_failures
+        self._wire_cache = state.wire_cache
+        self._complete_symbols = state.complete_symbols
+        self._active_aggregates = state.active_aggregates
+
+    def _state_for_generation(
+        self,
+        generation: RuntimeGeneration | None = None,
+    ) -> _RuntimeDataState:
+        generation = generation or self._generations.capture()
+        state = generation.data_state
+        if not isinstance(state, _RuntimeDataState):
+            raise RuntimeError("runtime generation has no market state")
+        return state
+
+    def is_generation_current(self, generation_id: str | None) -> bool:
+        """Allow collectors to fence durable writes during a handoff."""
+
+        return self._generations.is_current(generation_id)
+
+    def bind_instrument_catalog(
+        self,
+        store: Any,
+        *,
+        audit_sink: Any = None,
+    ) -> None:
+        """Attach the authenticated control plane to the runtime generation manager."""
+
+        from .catalog_runtime import InstrumentCatalogRuntime
+
+        self._instrument_catalog = store
+        self._catalog_runtime = InstrumentCatalogRuntime(
+            self,
+            self.settings,
+            store,
+            audit_sink=audit_sink,
+        )
+
+    async def validate_instrument_catalog(self, expected_revision: str) -> dict[str, Any]:
+        if self._catalog_runtime is None:
+            raise RuntimeError("instrument catalog runtime is not configured")
+        return await self._catalog_runtime.validate(expected_revision)
+
+    async def activate_instrument_catalog(
+        self,
+        expected_revision: str,
+        *,
+        audit: Any = None,
+    ) -> dict[str, Any]:
+        if self._catalog_runtime is None:
+            raise RuntimeError("instrument catalog runtime is not configured")
+        return await self._catalog_runtime.request_activation(expected_revision, audit=audit)
+
+    async def rollback_instrument_catalog(
+        self,
+        expected_revision: str,
+        *,
+        audit: Any = None,
+    ) -> dict[str, Any]:
+        if self._catalog_runtime is None:
+            raise RuntimeError("instrument catalog runtime is not configured")
+        return await self._catalog_runtime.request_rollback(expected_revision, audit=audit)
+
+    def instrument_catalog_job(self, job_id: str) -> dict[str, Any]:
+        if self._catalog_runtime is None:
+            raise RuntimeError("instrument catalog runtime is not configured")
+        return self._catalog_runtime.job(job_id)
+
+    def provider_catalog_snapshot(self) -> dict[str, Any]:
+        from .providers.descriptors import provider_catalog_snapshot
+
+        return provider_catalog_snapshot(self.settings)
+
+    async def search_provider_symbols(
+        self,
+        provider: str,
+        query: str,
+        *,
+        asset_class: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        from .providers.base import ProviderRateLimited, ProviderUnavailable
+        from .providers.descriptors import search_provider_symbols
+
+        started = asyncio.get_running_loop().time()
+        outcome = "unexpected"
+        try:
+            result = await search_provider_symbols(
+                self.settings,
+                provider,
+                query,
+                asset_class=asset_class,
+                limit=limit,
+                credit_reserver=self.reserve_provider_search_credit,
+            )
+        except ProviderRateLimited:
+            outcome = "rate_limited"
+            raise
+        except ProviderUnavailable as exc:
+            outcome = "rate_limited" if exc.status == 429 else "unavailable"
+            raise
+        except TimeoutError:
+            outcome = "timeout"
+            raise
+        except Exception:
+            outcome = "unexpected"
+            raise
+        else:
+            outcome = "success"
+            return result
+        finally:
+            elapsed_ms = (asyncio.get_running_loop().time() - started) * 1_000
+            self.metrics.observe_provider_operation(provider, "other", outcome, elapsed_ms)
+
+    async def reserve_provider_search_credit(self, provider: str, cost: int) -> bool:
+        """Reserve admin-search traffic from the collectors' durable quota ledger."""
+
+        if cost <= 0:
+            raise ValueError("provider search credit cost must be positive")
+        with self._provider_quota_lock:
+            quota = self._provider_quotas.get(provider)
+        if quota is None:
+            from .providers.base import ProviderUnavailable
+
+            raise ProviderUnavailable(
+                provider,
+                "shared provider quota ledger is not initialized",
+                status=503,
+            )
+        return bool(await quota.acquire(cost, allow_reserve=False))
+
+    def _activate_runtime_generation(
+        self,
+        registry: InstrumentRegistry,
+        *,
+        revision: str,
+        catalog: Any = None,
+        route_plan: Any = None,
+        data_state: _RuntimeDataState | None = None,
+        generation_id: str | None = None,
+    ) -> tuple[RuntimeGeneration, RuntimeGeneration]:
+        """Commit a generation already validated and warmed by the control plane."""
+
+        if data_state is None:
+            data_state = self._state_for_generation()
+        return self._generations.activate(
+            registry,
+            revision=revision,
+            catalog=catalog,
+            route_plan=route_plan,
+            data_state=data_state,
+            generation_id=generation_id,
+        )
+
+    def _install_warmed_instruments(
+        self,
+        registry: InstrumentRegistry,
+        warmed: tuple[Any, ...],
+        *,
+        state: _RuntimeDataState | None = None,
+    ) -> None:
+        """Install a validated warm bundle into one isolated runtime state."""
+
+        state = state or self._state_for_generation()
+
+        for item in warmed:
+            definition = item.definition
+            instrument = registry.resolve(definition.symbol)
+            if instrument is None or instrument.symbol != definition.symbol:
+                raise ValueError("warm bundle contains an inactive instrument")
+            quote = item.quote
+            if not isinstance(quote, ProviderQuote):
+                raise TypeError("warm quote is not a ProviderQuote")
+            if quote.symbol != definition.symbol:
+                raise ValueError("warm quote symbol does not match its instrument")
+            if quote.as_of > utc_now() + timedelta(seconds=60):
+                raise ValueError("warm quote timestamp is more than 60 seconds in the future")
+            with self._metadata_lock:
+                if item.dividend is not None:
+                    if not isinstance(item.dividend, DividendEvent):
+                        raise TypeError("warm dividend is not a DividendEvent")
+                    if item.dividend.symbol != definition.symbol:
+                        raise ValueError("warm dividend symbol does not match its instrument")
+                    state.dividends[definition.symbol] = item.dividend
+                if item.yield_metric is not None:
+                    if not isinstance(item.yield_metric, YieldMetric):
+                        raise TypeError("warm yield is not a YieldMetric")
+                    if item.yield_metric.symbol != definition.symbol:
+                        raise ValueError("warm yield symbol does not match its instrument")
+                    state.yield_metrics[definition.symbol] = item.yield_metric
+                    state.yield_stale_after_seconds[definition.symbol] = (
+                        self._default_yield_stale_after_seconds(item.yield_metric)
+                    )
+                state.last_quotes[definition.symbol] = quote
+                state.source_failures.discard(definition.symbol)
+            minute = quote.as_of.replace(second=0, microsecond=0)
+            point = PricePoint(
+                definition.symbol,
+                minute,
+                quote.price,
+                quote.provider,
+                quote.is_derived,
+                "1m",
+            )
+            self._rebuild(
+                definition.symbol,
+                persist=False,
+                registry=registry,
+                state=state,
+                additional_history=(point,),
+            )
+            self._update_aggregate(point, state=state)
+            if definition.symbol not in state.complete_symbols:
+                raise ValueError("warm bundle is missing mandatory income metadata")
+
+    async def _prepare_runtime_state(
+        self,
+        registry: InstrumentRegistry,
+        warmed: tuple[Any, ...],
+        *,
+        retained_symbols: tuple[str, ...] = (),
+    ) -> _RuntimeDataState:
+        """Build all candidate quote state before publishing its generation."""
+
+        state = self._state_for_generation().clone()
+        if retained_symbols:
+            await self._restore_retained_candidate_state(state, retained_symbols)
+        self._install_warmed_instruments(registry, warmed, state=state)
+        return state
+
+    async def _restore_retained_candidate_state(
+        self,
+        state: _RuntimeDataState,
+        symbols: tuple[str, ...],
+    ) -> None:
+        """Restore archived state into an unpublished candidate generation.
+
+        The history cache is intentionally shared between generations because
+        cloning up to 400 days for every activation would make activation cost
+        proportional to the complete catalog. Only symbols absent from the
+        active registry reach this method, so their restored rings cannot be
+        resolved through the old public generation. Candidate metadata maps
+        remain isolated, and the subsequently warmed values win.
+        """
+
+        storage = self._storage
+        restore = None if storage is None else getattr(storage, "restore", None)
+        if not callable(restore):
+            return
+        restored = restore(symbols=symbols)
+        if inspect.isawaitable(restored):
+            restored = await restored
+        if restored is None:
+            return
+        allowed = frozenset(symbols)
+        points = [
+            point
+            for point in (getattr(restored, "price_points", None) or ())
+            if isinstance(point, PricePoint) and point.symbol in allowed
+        ]
+        if points:
+            await asyncio.to_thread(state.history.load, points)
+
+        yield_records = {
+            record.symbol: record
+            for record in (getattr(restored, "yield_metric_records", None) or ())
+            if getattr(record, "symbol", None) in allowed
+        }
+        with self._metadata_lock:
+            for event in getattr(restored, "dividends", None) or ():
+                if not isinstance(event, DividendEvent) or event.symbol not in allowed:
+                    continue
+                current = state.dividends.get(event.symbol)
+                if current is None or event.ex_date > current.ex_date:
+                    state.dividends[event.symbol] = event
+            for metric in getattr(restored, "yield_metrics", None) or ():
+                if not isinstance(metric, YieldMetric) or metric.symbol not in allowed:
+                    continue
+                current = state.yield_metrics.get(metric.symbol)
+                if current is not None and metric.as_of <= current.as_of:
+                    continue
+                state.yield_metrics[metric.symbol] = metric
+                record = yield_records.get(metric.symbol)
+                persisted_threshold = (
+                    None if record is None else record.raw.get("stale_after_seconds")
+                )
+                state.yield_stale_after_seconds[metric.symbol] = (
+                    self._restored_yield_stale_after_seconds(
+                        metric,
+                        persisted_threshold,
+                    )
+                )
+            for quote in getattr(restored, "quotes", None) or ():
+                if not isinstance(quote, ProviderQuote) or quote.symbol not in allowed:
+                    continue
+                current = state.last_quotes.get(quote.symbol)
+                if current is None or quote.as_of > current.as_of:
+                    state.last_quotes[quote.symbol] = quote
+
+    @staticmethod
+    def _publish_warmed_history(
+        warmed: tuple[Any, ...],
+        state: _RuntimeDataState,
+    ) -> None:
+        """Append only changed warm points after the generation switch."""
+
+        for item in warmed:
+            quote = item.quote
+            state.history.add(
+                PricePoint(
+                    item.definition.symbol,
+                    quote.as_of.replace(second=0, microsecond=0),
+                    quote.price,
+                    quote.provider,
+                    quote.is_derived,
+                    "1m",
+                )
+            )
+
+    def _persist_warmed_instruments(
+        self,
+        warmed: tuple[Any, ...],
+        state: _RuntimeDataState,
+    ) -> None:
+        """Queue persistence only after the prepared generation is visible."""
+
+        for item in warmed:
+            symbol = item.definition.symbol
+            quote = item.quote
+            point = PricePoint(
+                symbol,
+                quote.as_of.replace(second=0, microsecond=0),
+                quote.price,
+                quote.provider,
+                quote.is_derived,
+                "1m",
+            )
+            self._persist("enqueue_price", point)
+            aggregate = state.active_aggregates.get(symbol)
+            if aggregate is not None:
+                self._persist("enqueue_aggregate_price", aggregate)
+            if item.dividend is not None:
+                self._persist("enqueue_dividend", item.dividend)
+            if item.yield_metric is not None:
+                self._persist_yield_metric(
+                    item.yield_metric,
+                    state.yield_stale_after_seconds[symbol],
+                )
+            snapshot = state.snapshots.get(symbol)
+            if snapshot is not None:
+                self._persist("enqueue_snapshot", snapshot)
+
+    async def _commit_catalog_activation(
+        self,
+        *,
+        operation: str,
+        expected_file_revision: str,
+        target: Any,
+        registry: InstrumentRegistry,
+        route_plan: Any,
+        generation_id: str,
+        warmed: tuple[Any, ...],
+        candidate_coordinator: Any,
+        reconcile_provider_names: tuple[str, ...] | None = None,
+    ) -> None:
+        """Commit a prepared disk/runtime generation with one pointer publication."""
+
+        if self._instrument_catalog is None:
+            raise RuntimeError("instrument catalog runtime is not configured")
+        previous = self._generations.capture()
+        previous_coordinator = self._coordinator
+        previous_collector_start_error = self._collector_start_error
+        reusing_coordinator = (
+            candidate_coordinator is not None and candidate_coordinator is previous_coordinator
+        )
+        reconciling_coordinator = (
+            reconcile_provider_names is not None
+            and candidate_coordinator is not None
+            and previous_coordinator is not None
+            and candidate_coordinator is not previous_coordinator
+        )
+        previous_coordinator_target: tuple[InstrumentRegistry, str | None] | None = None
+        reconciliation_token: Any = None
+        active_coordinator = candidate_coordinator
+        file_committed = False
+        file_snapshot: dict[str, Any] | None = None
+        transition_token: object | None = None
+        async with self._activation_lock:
+            try:
+                lease_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._instrument_catalog.capture_transition,
+                        expected_file_revision,
+                    ),
+                    name="catalog-transition-lease",
+                )
+                try:
+                    transition_token = await asyncio.shield(lease_task)
+                except asyncio.CancelledError:
+                    # Acquiring the in-process lease is a worker-thread action;
+                    # join it so cancellation cannot orphan an unknown lease.
+                    transition_token = await lease_task
+                    raise
+                retained_symbols = tuple(
+                    sorted(set(registry.symbols) - set(previous.registry.symbols))
+                )
+                candidate_state = await self._prepare_runtime_state(
+                    registry,
+                    warmed,
+                    retained_symbols=retained_symbols,
+                )
+                if (
+                    candidate_coordinator is not None
+                    and not reusing_coordinator
+                    and not reconciling_coordinator
+                ):
+                    # Prove the fresh supervisor can start while both the
+                    # durable catalog and public runtime still point at the old
+                    # generation. Early publications carry the candidate id and
+                    # are therefore rejected by generation fencing.
+                    candidate_coordinator.activate(gated=True)
+                    candidate_coordinator.release_activation()
+                    await candidate_coordinator.wait_started_or_failed()
+                if operation == "activate":
+                    transition = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._instrument_catalog.activate_staged,
+                            expected_file_revision,
+                            target.revision,
+                            transition_token=transition_token,
+                        ),
+                        name="catalog-file-activate",
+                    )
+                elif operation == "rollback":
+                    transition = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._instrument_catalog.rollback,
+                            expected_file_revision,
+                            transition_token=transition_token,
+                        ),
+                        name="catalog-file-rollback",
+                    )
+                else:
+                    raise ValueError("unsupported catalog activation operation")
+                try:
+                    file_snapshot = await asyncio.shield(transition)
+                except asyncio.CancelledError:
+                    # A worker-thread filesystem transition cannot be killed.
+                    # Join it so the outer rollback sees a definite revision.
+                    file_snapshot = await transition
+                    file_committed = True
+                    raise
+                file_committed = True
+                active = await asyncio.to_thread(self._instrument_catalog.active_generation)
+                if active.revision != target.revision:
+                    raise RuntimeError("persisted catalog does not match the warmed generation")
+                file_revision = file_snapshot.get("revision") if file_snapshot is not None else None
+                if not isinstance(file_revision, str) or not file_revision:
+                    raise RuntimeError("catalog commit did not return an exact file revision")
+                await asyncio.to_thread(
+                    self._instrument_catalog.mark_runtime_applied,
+                    file_revision,
+                )
+                if candidate_coordinator is not None:
+                    if reusing_coordinator:
+                        previous_coordinator_target = candidate_coordinator.adopt_generation(
+                            registry,
+                            generation_id,
+                        )
+                        active_coordinator = candidate_coordinator
+                    elif reconciling_coordinator:
+                        reconciliation_token = await previous_coordinator.reconcile_generation(
+                            candidate_coordinator,
+                            registry,
+                            generation_id,
+                            reconcile_provider_names,
+                        )
+                        active_coordinator = previous_coordinator
+                self._activate_runtime_generation(
+                    registry,
+                    revision=target.revision,
+                    catalog=target,
+                    route_plan=route_plan,
+                    data_state=candidate_state,
+                    generation_id=generation_id,
+                )
+                self._bind_runtime_state(candidate_state)
+                self._coordinator = active_coordinator
+                self._collector_start_error = None
+                if (
+                    active_coordinator is candidate_coordinator
+                    and candidate_coordinator is not None
+                    and not reusing_coordinator
+                    and not reconciling_coordinator
+                ):
+                    self._tasks.append(
+                        asyncio.create_task(
+                            self._monitor_collector_run(candidate_coordinator),
+                            name=f"collector-runtime-monitor:{generation_id}",
+                        )
+                    )
+                if reconciliation_token is not None:
+                    # Reconciled tasks are failure-gated until the transition
+                    # lease is released. Check once more after pointer
+                    # publication so a delayed startup failure can still restore
+                    # both the runtime and exact catalog file.
+                    await previous_coordinator.confirm_reconciliation(reconciliation_token)
+                # This bounded local operation performs one revision check,
+                # reads at most the manifest size limit, and releases an RLock.
+                # Keeping it synchronous closes the confirm-to-commit race:
+                # guarded component tasks cannot fail between the final health
+                # check and the activation point of no return.
+                self._instrument_catalog.commit_transition(
+                    transition_token,
+                    file_revision,
+                )
+                transition_token = None
+
+                # The transition lease is now committed and a concurrent admin
+                # draft may be created. Resource retirement is best-effort from
+                # this point and must never roll the active catalog backward.
+                if reconciliation_token is not None:
+                    reconciliation_failure = getattr(
+                        reconciliation_token,
+                        "failure",
+                        None,
+                    )
+                    if (
+                        isinstance(reconciliation_failure, asyncio.Future)
+                        and reconciliation_failure.done()
+                    ):
+                        _LOGGER.error("Collector reconciliation failed after transition commit")
+                    cleanup_task = asyncio.create_task(
+                        previous_coordinator.finalize_reconciliation(reconciliation_token),
+                        name="catalog-reconciliation-finalize",
+                    )
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        await cleanup_task
+                        current_task = asyncio.current_task()
+                        if current_task is not None:
+                            current_task.uncancel()
+                    except Exception as finalize_exc:
+                        _LOGGER.warning(
+                            "Collector reconciliation cleanup failed error_type=%s",
+                            type(finalize_exc).__name__,
+                        )
+                elif (
+                    previous_coordinator is not None
+                    and previous_coordinator is not active_coordinator
+                ):
+                    cleanup_task = asyncio.create_task(
+                        self._retire_coordinator(previous_coordinator),
+                        name="catalog-retired-coordinator-cleanup",
+                    )
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        await cleanup_task
+                        current_task = asyncio.current_task()
+                        if current_task is not None:
+                            current_task.uncancel()
+                    except Exception as retire_exc:
+                        _LOGGER.warning(
+                            "Retired collector cleanup failed error_type=%s",
+                            type(retire_exc).__name__,
+                        )
+
+                # Everything below is local, non-blocking publication into the
+                # active generation; it must not reopen the disk transaction.
+                try:
+                    self._publish_warmed_history(warmed, candidate_state)
+                    self._persist_warmed_instruments(warmed, candidate_state)
+                except Exception as finalize_exc:
+                    self._storage_ready = False
+                    _LOGGER.error(
+                        "Catalog activation local finalization failed error_type=%s",
+                        type(finalize_exc).__name__,
+                    )
+            except BaseException:
+                if self._generations.capture().generation_id != previous.generation_id:
+                    self._generations.activate(
+                        previous.registry,
+                        revision=previous.revision,
+                        catalog=previous.catalog,
+                        route_plan=previous.route_plan,
+                        data_state=previous.data_state,
+                        generation_id=previous.generation_id,
+                    )
+                    self._bind_runtime_state(self._state_for_generation())
+                if reusing_coordinator and previous_coordinator_target is not None:
+                    old_registry, old_generation_id = previous_coordinator_target
+                    try:
+                        candidate_coordinator.adopt_generation(
+                            old_registry,
+                            old_generation_id,
+                        )
+                    except Exception:
+                        candidate_coordinator.registry = old_registry
+                        candidate_coordinator.generation_id = old_generation_id
+                if reconciliation_token is not None:
+                    try:
+                        await asyncio.shield(
+                            previous_coordinator.rollback_reconciliation(reconciliation_token)
+                        )
+                    except Exception as reconcile_exc:
+                        _LOGGER.critical(
+                            "Collector reconciliation rollback failed error_type=%s",
+                            type(reconcile_exc).__name__,
+                        )
+                self._coordinator = previous_coordinator
+                self._collector_start_error = previous_collector_start_error
+                if (
+                    candidate_coordinator is not None
+                    and candidate_coordinator is not previous_coordinator
+                ):
+                    try:
+                        await candidate_coordinator.stop(persist_checkpoints=False)
+                    except Exception as stop_exc:
+                        _LOGGER.error(
+                            "Candidate collector shutdown failed error_type=%s",
+                            type(stop_exc).__name__,
+                        )
+                if file_committed and file_snapshot is not None and transition_token is not None:
+                    try:
+                        restored_file = await asyncio.to_thread(
+                            self._instrument_catalog.restore_transition,
+                            transition_token,
+                            file_snapshot["revision"],
+                        )
+                        await asyncio.to_thread(
+                            self._instrument_catalog.mark_runtime_applied,
+                            restored_file["revision"],
+                        )
+                        transition_token = None
+                    except Exception as rollback_exc:
+                        _LOGGER.critical(
+                            "Instrument catalog file rollback failed error_type=%s",
+                            type(rollback_exc).__name__,
+                        )
+                if transition_token is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self._instrument_catalog.abort_transition,
+                            transition_token,
+                        )
+                        transition_token = None
+                    except Exception as abort_exc:
+                        _LOGGER.critical(
+                            "Instrument catalog lease release failed error_type=%s",
+                            type(abort_exc).__name__,
+                        )
+                raise
+
+    @staticmethod
+    async def _retire_coordinator(coordinator: Any) -> None:
+        """Boundedly stop a retired collector and prove no task remains live."""
+
+        stop_error: BaseException | None = None
+        try:
+            await coordinator.stop(persist_checkpoints=False)
+        except asyncio.CancelledError as exc:
+            stop_error = exc
+        except Exception as exc:
+            stop_error = exc
+        supervisor = getattr(coordinator, "_supervisor", None)
+        if isinstance(supervisor, asyncio.Task) and not supervisor.done():
+            supervisor.cancel()
+            await asyncio.gather(supervisor, return_exceptions=True)
+            try:
+                coordinator._supervisor = None
+            except AttributeError:
+                pass
+        if bool(getattr(coordinator, "is_running", False)):
+            raise RuntimeError("retired collector remained active after forced shutdown")
+        if isinstance(stop_error, asyncio.CancelledError):
+            raise stop_error
+        if stop_error is not None:
+            graph = getattr(coordinator, "graph", None)
+            close = getattr(graph, "close", None)
+            if callable(close):
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as close_exc:
+                    _LOGGER.warning(
+                        "Retired collector resource cleanup failed error_type=%s",
+                        type(close_exc).__name__,
+                    )
+            _LOGGER.warning(
+                "Retired collector required forced shutdown error_type=%s",
+                type(stop_error).__name__,
+            )
 
     @property
     def storage(self) -> Any:
@@ -116,6 +898,8 @@ class QuickPriceService:
         self._started = True
 
     async def stop(self) -> None:
+        if self._catalog_runtime is not None:
+            await self._catalog_runtime.stop()
         for task in self._tasks:
             task.cancel()
         if self._tasks:
@@ -281,11 +1065,40 @@ class QuickPriceService:
             return None
 
     async def _start_collectors(self) -> None:
+        graph = None
+        coordinator = None
         try:
             from .collectors import MarketDataCoordinator
 
-            self._coordinator = MarketDataCoordinator(self, self.settings, self.registry)
-            await self._coordinator.start()
+            generation = self._generations.capture()
+            if generation.catalog is not None:
+                from .providers.compiler import build_compiled_provider_graph
+
+                graph, route_plan = build_compiled_provider_graph(
+                    self.settings,
+                    generation.registry,
+                    generation.catalog.definitions,
+                    metrics=self.metrics,
+                    strict=self.settings.production and self.settings.background_enabled,
+                )
+                self._generations.activate(
+                    generation.registry,
+                    revision=generation.revision,
+                    catalog=generation.catalog,
+                    route_plan=route_plan,
+                    data_state=generation.data_state,
+                    generation_id=generation.generation_id,
+                )
+            coordinator = MarketDataCoordinator(
+                self,
+                self.settings,
+                generation.registry,
+                generation_id=generation.generation_id,
+                graph=graph,
+                catalog=generation.catalog,
+            )
+            self._coordinator = coordinator
+            await coordinator.start()
             self._collector_start_error = None
             self._tasks.append(
                 asyncio.create_task(
@@ -298,6 +1111,16 @@ class QuickPriceService:
             # the unavailable instruments instead of fabricating data.
             self._coordinator = None
             self._collector_start_error = exc
+            if coordinator is not None:
+                try:
+                    await coordinator.stop()
+                except Exception:
+                    pass
+            elif graph is not None:
+                try:
+                    await graph.close()
+                except Exception:
+                    pass
             # Do not include exception text: plugin/provider exceptions may embed
             # authenticated URLs or credential-bearing configuration values.
             _LOGGER.error(
@@ -336,38 +1159,104 @@ class QuickPriceService:
             self.metrics.set_event_loop_lag((now - expected) * 1000)
             expected = now + interval
 
-    def publish_history(self, points: list[PricePoint], *, persist: bool = True) -> None:
-        self._validate_history_timestamps(points)
-        self.history.load(points)
-        self._finish_history_publication(points, persist=persist)
+    def _publication_context(
+        self,
+        generation_id: str | None,
+    ) -> tuple[RuntimeGeneration, _RuntimeDataState] | None:
+        generation = self._generations.capture()
+        if generation_id is not None and generation.generation_id != generation_id:
+            return None
+        return generation, self._state_for_generation(generation)
+
+    def publish_history(
+        self,
+        points: list[PricePoint],
+        *,
+        persist: bool = True,
+        generation_id: str | None = None,
+    ) -> bool:
+        context = self._publication_context(generation_id)
+        if context is None:
+            return False
+        generation, state = context
+        registry = generation.registry
+        self._validate_history_timestamps(points, registry=registry)
+        state.history.load(points)
+        if not self._generations.is_current(generation.generation_id):
+            return False
+        self._finish_history_publication(
+            points,
+            persist=persist,
+            registry=registry,
+            state=state,
+        )
+        return True
 
     async def publish_history_async(
-        self, points: list[PricePoint], *, persist: bool = True
-    ) -> None:
+        self,
+        points: list[PricePoint],
+        *,
+        persist: bool = True,
+        generation_id: str | None = None,
+    ) -> bool:
         """Merge a large backfill without blocking the HTTP event loop."""
 
-        self._validate_history_timestamps(points)
-        await asyncio.to_thread(self.history.load, points)
-        self._finish_history_publication(points, persist=persist)
+        async with self._activation_lock:
+            context = self._publication_context(generation_id)
+            if context is None:
+                return False
+            generation, state = context
+            registry = generation.registry
+            self._validate_history_timestamps(points, registry=registry)
+            await asyncio.to_thread(state.history.load, points)
+            if not self._generations.is_current(generation.generation_id):
+                return False
+            self._finish_history_publication(
+                points,
+                persist=persist,
+                registry=registry,
+                state=state,
+            )
+            return True
 
-    def _finish_history_publication(self, points: list[PricePoint], *, persist: bool) -> None:
+    def _finish_history_publication(
+        self,
+        points: list[PricePoint],
+        *,
+        persist: bool,
+        registry: InstrumentRegistry,
+        state: _RuntimeDataState,
+    ) -> None:
         if persist and points:
             self._persist_history(points)
         for symbol in {point.symbol for point in points}:
-            self._rebuild(symbol, persist=False)
+            self._rebuild(symbol, persist=False, registry=registry, state=state)
 
-    def publish_quote(self, quote: ProviderQuote, *, persist: bool = True) -> None:
-        instrument = self.registry.resolve(quote.symbol)
+    def publish_quote(
+        self,
+        quote: ProviderQuote,
+        *,
+        persist: bool = True,
+        generation_id: str | None = None,
+    ) -> bool:
+        context = self._publication_context(generation_id)
+        if context is None:
+            return False
+        generation, state = context
+        registry = generation.registry
+        instrument = registry.resolve(quote.symbol)
         if instrument is None or quote.symbol != instrument.symbol:
             raise ValueError(f"unsupported symbol: {quote.symbol}")
         if quote.as_of > utc_now() + timedelta(seconds=60):
             raise ValueError("quote timestamp is more than 60 seconds in the future")
         with self._metadata_lock:
-            current = self._last_quotes.get(quote.symbol)
+            current = state.last_quotes.get(quote.symbol)
             if current is not None and quote.as_of < current.as_of:
-                return
-            self._last_quotes[quote.symbol] = quote
-            self._source_failures.discard(quote.symbol)
+                return False
+            if not self._generations.is_current(generation.generation_id):
+                return False
+            state.last_quotes[quote.symbol] = quote
+            state.source_failures.discard(quote.symbol)
         minute = quote.as_of.replace(second=0, microsecond=0)
         point = PricePoint(
             quote.symbol,
@@ -377,20 +1266,35 @@ class QuickPriceService:
             quote.is_derived,
             "1m",
         )
-        self.history.add(point)
-        self._rebuild(quote.symbol, persist=persist)
+        state.history.add(point)
+        self._rebuild(
+            quote.symbol,
+            persist=persist,
+            registry=registry,
+            state=state,
+        )
         if persist:
             self._persist("enqueue_price", point)
-            self._persist("enqueue_aggregate_price", self._update_aggregate(point))
+            self._persist(
+                "enqueue_aggregate_price",
+                self._update_aggregate(point, state=state),
+            )
+        return True
 
-    def _validate_history_timestamps(self, points: list[PricePoint]) -> None:
+    def _validate_history_timestamps(
+        self,
+        points: list[PricePoint],
+        *,
+        registry: InstrumentRegistry | None = None,
+    ) -> None:
+        registry = registry or self.registry
         future_limit = utc_now() + timedelta(seconds=60)
         if any(point.timestamp > future_limit for point in points):
             raise ValueError("history contains a timestamp more than 60 seconds in the future")
         invalid = [
             point.symbol
             for point in points
-            if (item := self.registry.resolve(point.symbol)) is None or item.symbol != point.symbol
+            if (item := registry.resolve(point.symbol)) is None or item.symbol != point.symbol
         ]
         if invalid:
             raise ValueError(
@@ -398,7 +1302,44 @@ class QuickPriceService:
             )
 
     def restored_provider_checkpoints(self) -> dict[tuple[str, str], Any]:
-        return dict(self._provider_checkpoints)
+        with self._provider_quota_lock:
+            return dict(self._provider_checkpoints)
+
+    def share_provider_quota(self, provider_name: str, candidate: Any) -> tuple[Any, bool]:
+        """Return one process-wide ledger for an upstream provider.
+
+        Shadow warm-up and the active collector can overlap. Sharing the quota
+        object prevents either side from restoring or persisting an older
+        counter over credits consumed by the other.
+        """
+
+        with self._provider_quota_lock:
+            current = self._provider_quotas.get(provider_name)
+            if current is None:
+                self._provider_quotas[provider_name] = candidate
+                return candidate, True
+            candidate_policy = (
+                getattr(candidate, "limit", None),
+                getattr(candidate, "period_seconds", None),
+                getattr(candidate, "reserve", None),
+            )
+            current_policy = (
+                getattr(current, "limit", None),
+                getattr(current, "period_seconds", None),
+                getattr(current, "reserve", None),
+            )
+            if candidate_policy != current_policy:
+                raise RuntimeError("provider quota policy changed during runtime handoff")
+            return current, False
+
+    def remember_provider_checkpoint(self, record: Any) -> None:
+        """Keep the in-memory restore image at least as new as durable storage."""
+
+        with self._provider_quota_lock:
+            key = (record.provider, record.feed)
+            current = self._provider_checkpoints.get(key)
+            if current is None or record.updated_at >= current.updated_at:
+                self._provider_checkpoints[key] = record
 
     @staticmethod
     def _five_minute_bucket(timestamp: datetime) -> datetime:
@@ -413,9 +1354,15 @@ class QuickPriceService:
             return point.timestamp, 86_400
         raise ValueError(f"unsupported aggregate interval: {point.interval}")
 
-    def _update_aggregate(self, point: PricePoint) -> AggregatePrice:
+    def _update_aggregate(
+        self,
+        point: PricePoint,
+        *,
+        state: _RuntimeDataState | None = None,
+    ) -> AggregatePrice:
+        state = state or self._state_for_generation()
         bucket = self._five_minute_bucket(point.timestamp)
-        current = self._active_aggregates.get(point.symbol)
+        current = state.active_aggregates.get(point.symbol)
         if current is None or current.bucket_start != bucket:
             aggregate = AggregatePrice(
                 point.symbol,
@@ -442,11 +1389,22 @@ class QuickPriceService:
                 point.provider,
                 point.is_derived,
             )
-        self._active_aggregates[point.symbol] = aggregate
+        state.active_aggregates[point.symbol] = aggregate
         return aggregate
 
-    def publish_dividend(self, event: DividendEvent, *, persist: bool = True) -> None:
-        instrument = self.registry.resolve(event.symbol)
+    def publish_dividend(
+        self,
+        event: DividendEvent,
+        *,
+        persist: bool = True,
+        generation_id: str | None = None,
+    ) -> bool:
+        context = self._publication_context(generation_id)
+        if context is None:
+            return False
+        generation, state = context
+        registry = generation.registry
+        instrument = registry.resolve(event.symbol)
         if (
             instrument is None
             or event.symbol != instrument.symbol
@@ -457,18 +1415,37 @@ class QuickPriceService:
         ):
             raise ValueError(f"dividend is not configured for {event.symbol}")
         if event.event_type != "regular_cash":
-            return
+            return False
         with self._metadata_lock:
-            current = self._dividends.get(event.symbol)
+            current = state.dividends.get(event.symbol)
             if current is not None and event.ex_date < current.ex_date:
-                return
-            self._dividends[event.symbol] = event
-        self._rebuild(event.symbol, persist=persist)
+                return False
+            if not self._generations.is_current(generation.generation_id):
+                return False
+            state.dividends[event.symbol] = event
+        self._rebuild(
+            event.symbol,
+            persist=persist,
+            registry=registry,
+            state=state,
+        )
         if persist:
             self._persist("enqueue_dividend", event)
+        return True
 
-    def publish_yield_metric(self, metric: YieldMetric, *, persist: bool = True) -> None:
-        instrument = self.registry.resolve(metric.symbol)
+    def publish_yield_metric(
+        self,
+        metric: YieldMetric,
+        *,
+        persist: bool = True,
+        generation_id: str | None = None,
+    ) -> bool:
+        context = self._publication_context(generation_id)
+        if context is None:
+            return False
+        generation, state = context
+        registry = generation.registry
+        instrument = registry.resolve(metric.symbol)
         if (
             instrument is None
             or metric.symbol != instrument.symbol
@@ -477,7 +1454,7 @@ class QuickPriceService:
             raise ValueError(f"external yield metric is not configured for {metric.symbol}")
         stale_after_seconds = self._default_yield_stale_after_seconds(metric)
         with self._metadata_lock:
-            current = self._yield_metrics.get(metric.symbol)
+            current = state.yield_metrics.get(metric.symbol)
             if current is not None:
                 same_source = (
                     metric.provider.casefold() == current.provider.casefold()
@@ -486,10 +1463,10 @@ class QuickPriceService:
                 current_rank = self._yield_source_rank(current)
                 incoming_rank = self._yield_source_rank(metric)
                 if (same_source or incoming_rank == current_rank) and metric.as_of < current.as_of:
-                    return
+                    return False
                 is_downgrade = not same_source and incoming_rank > current_rank
                 if is_downgrade:
-                    current_stale_after_seconds = self._yield_stale_after_seconds.get(
+                    current_stale_after_seconds = state.yield_stale_after_seconds.get(
                         current.symbol
                     )
                     if current_stale_after_seconds is None:
@@ -502,12 +1479,20 @@ class QuickPriceService:
                         (now - current.as_of).total_seconds(),
                     )
                     if current_age_seconds <= current_stale_after_seconds:
-                        return
-            self._yield_metrics[metric.symbol] = metric
-            self._yield_stale_after_seconds[metric.symbol] = stale_after_seconds
-        self._rebuild(metric.symbol, persist=persist)
+                        return False
+            if not self._generations.is_current(generation.generation_id):
+                return False
+            state.yield_metrics[metric.symbol] = metric
+            state.yield_stale_after_seconds[metric.symbol] = stale_after_seconds
+        self._rebuild(
+            metric.symbol,
+            persist=persist,
+            registry=registry,
+            state=state,
+        )
         if persist:
             self._persist_yield_metric(metric, stale_after_seconds)
+        return True
 
     @staticmethod
     def _coerce_yield_stale_after_seconds(value: Any) -> float | None:
@@ -572,14 +1557,23 @@ class QuickPriceService:
         except Exception:
             self._storage_ready = False
 
-    def _rebuild(self, symbol: str, *, persist: bool) -> None:
+    def _rebuild(
+        self,
+        symbol: str,
+        *,
+        persist: bool,
+        registry: InstrumentRegistry | None = None,
+        state: _RuntimeDataState | None = None,
+        additional_history: tuple[PricePoint, ...] = (),
+    ) -> None:
+        state = state or self._state_for_generation()
         with self._metadata_lock:
-            quote = self._last_quotes.get(symbol)
-            event = self._dividends.get(symbol)
-            yield_metric = self._yield_metrics.get(symbol)
+            quote = state.last_quotes.get(symbol)
+            event = state.dividends.get(symbol)
+            yield_metric = state.yield_metrics.get(symbol)
         if quote is None:
             return
-        instrument = self.registry[symbol]
+        instrument = (registry or self.registry)[symbol]
         dividend = None
         annual_yield = None
         if (
@@ -598,32 +1592,41 @@ class QuickPriceService:
         ):
             annual_yield = boxx_yield(yield_metric)
         elif (
+            instrument.yield_strategy is YieldStrategy.TREASURY_PROXY_MINUS_EXPENSE
+            and yield_metric is not None
+        ):
+            annual_yield = treasury_proxy_yield(yield_metric)
+        elif (
             instrument.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
             and yield_metric is not None
         ):
             annual_yield = estimate_from_staking_metric(yield_metric)
         snapshot = QuoteSnapshot(
             quote=quote,
-            changes=calculate_changes(quote.price, quote.as_of, self.history.points(symbol)),
+            changes=calculate_changes(
+                quote.price,
+                quote.as_of,
+                (*state.history.points(symbol), *additional_history),
+            ),
             dividend=dividend,
             estimated_annual_yield=annual_yield,
         )
-        self.snapshots.publish(snapshot)
-        self._wire_cache[symbol] = snapshot_to_wire(
+        state.snapshots.publish(snapshot)
+        state.wire_cache[symbol] = snapshot_to_wire(
             snapshot,
             instrument,
             now=quote.as_of,
             stale_after_seconds=instrument.stale_after_seconds,
-            yield_stale_after_seconds=self._yield_stale_after_seconds.get(symbol),
+            yield_stale_after_seconds=state.yield_stale_after_seconds.get(symbol),
         )
         complete = (instrument.yield_strategy is None or annual_yield is not None) and (
             instrument.dividend_strategy is None or dividend is not None
         )
         with self._metadata_lock:
             if complete:
-                self._complete_symbols.add(symbol)
+                state.complete_symbols.add(symbol)
             else:
-                self._complete_symbols.discard(symbol)
+                state.complete_symbols.discard(symbol)
         if persist:
             self._persist("enqueue_snapshot", snapshot)
 
@@ -695,9 +1698,8 @@ class QuickPriceService:
             self._storage_ready = False
 
     def _effective_market_status(
-        self, snapshot: QuoteSnapshot, asset_class: AssetClass, now: datetime
+        self, snapshot: QuoteSnapshot, instrument: Any, now: datetime
     ) -> str:
-        instrument = self.registry[snapshot.quote.symbol]
         scheduled = scheduled_market_status(instrument.market_calendar, now)
         observed_at = snapshot.quote.market_status_as_of
         if observed_at is not None:
@@ -710,13 +1712,18 @@ class QuickPriceService:
         return scheduled
 
     def _quality(
-        self, snapshot: QuoteSnapshot, asset_class: AssetClass, now: datetime
+        self,
+        snapshot: QuoteSnapshot,
+        instrument: Any,
+        now: datetime,
+        *,
+        state: _RuntimeDataState | None = None,
     ) -> tuple[str, QualityModel]:
+        state = state or self._state_for_generation()
         quote = snapshot.quote
-        instrument = self.registry[quote.symbol]
         staleness_ms = max(0, int((now - quote.as_of).total_seconds() * 1000))
         threshold_seconds = instrument.stale_after_seconds
-        status = self._effective_market_status(snapshot, asset_class, now)
+        status = self._effective_market_status(snapshot, instrument, now)
         stale = staleness_ms > int(threshold_seconds * 1000)
         status_observation_age = (
             None
@@ -738,12 +1745,24 @@ class QuickPriceService:
             # 16:00 schedule would incorrectly mark it stale all weekend.
             stale = False
         with self._metadata_lock:
-            stale = stale or quote.symbol in self._source_failures
+            stale = stale or quote.symbol in state.source_failures
         return status, QualityModel(stale=stale, staleness_ms=staleness_ms)
 
-    def mark_source_failed(self, *symbols: str) -> None:
+    def mark_source_failed(
+        self,
+        *symbols: str,
+        generation_id: str | None = None,
+    ) -> bool:
+        context = self._publication_context(generation_id)
+        if context is None:
+            return False
+        generation, state = context
+        registry = generation.registry
         with self._metadata_lock:
-            self._source_failures.update(symbol for symbol in symbols if symbol in self.registry)
+            if not self._generations.is_current(generation.generation_id):
+                return False
+            state.source_failures.update(symbol for symbol in symbols if symbol in registry)
+        return True
 
     def get_quote(
         self,
@@ -751,6 +1770,7 @@ class QuickPriceService:
         *,
         now: datetime | None = None,
         require_complete_metadata: bool = True,
+        generation: RuntimeGeneration | None = None,
     ) -> QuoteModel:
         """Project a snapshot with dynamic quote and yield freshness.
 
@@ -760,8 +1780,10 @@ class QuickPriceService:
         status, quote quality, and annual-yield quality calculations.
         """
 
-        instrument = self.registry[symbol]
-        snapshot = self.snapshots.get(symbol)
+        generation = generation or self._generations.capture()
+        state = self._state_for_generation(generation)
+        instrument = generation.registry[symbol]
+        snapshot = state.snapshots.get(symbol)
         if snapshot is None:
             raise DataUnavailableError(symbol, "no valid price has ever been received")
         if require_complete_metadata:
@@ -775,14 +1797,14 @@ class QuickPriceService:
                     symbol,
                     "required latest regular dividend is unavailable",
                 )
-        cached = self._wire_cache[symbol]
+        cached = state.wire_cache[symbol]
         now = utc_now() if now is None else now
-        market_status, quality = self._quality(snapshot, instrument.asset_class, now)
+        market_status, quality = self._quality(snapshot, instrument, now, state=state)
         annual_yield = cached.estimated_annual_yield
         if annual_yield is not None:
-            threshold = self._yield_stale_after_seconds.get(symbol)
+            threshold = state.yield_stale_after_seconds.get(symbol)
             if threshold is None:
-                metric = self._yield_metrics.get(symbol)
+                metric = state.yield_metrics.get(symbol)
                 threshold = (
                     self._default_yield_stale_after_seconds(metric)
                     if metric is not None
@@ -818,26 +1840,30 @@ class QuickPriceService:
         collectors_running = self._coordinator is not None and bool(
             getattr(self._coordinator, "is_running", True)
         )
+        generation = self._generations.capture()
+        state = self._state_for_generation(generation)
         with self._metadata_lock:
-            complete_count = len(self._complete_symbols)
+            all_complete = all(symbol in state.complete_symbols for symbol in generation.registry)
         return (
             runtime_ok
             and self._has_active_api_key()
             and self._storage_ready
             and (collectors_running or not self.settings.background_enabled)
-            and complete_count == len(self.registry)
+            and all_complete
         )
 
     def readiness(self) -> tuple[bool, dict[str, Any]]:
         runtime = self.runtime_status or inspect_free_threaded_runtime()
         missing: list[str] = []
         incomplete: list[str] = []
-        for symbol in self.registry:
-            if self.snapshots.get(symbol) is None:
+        generation = self._generations.capture()
+        state = self._state_for_generation(generation)
+        for symbol in generation.registry:
+            if state.snapshots.get(symbol) is None:
                 missing.append(symbol)
                 continue
             try:
-                self.get_quote(symbol)
+                self.get_quote(symbol, generation=generation)
             except DataUnavailableError:
                 incomplete.append(symbol)
         collectors_running = self._coordinator is not None and bool(
@@ -850,6 +1876,8 @@ class QuickPriceService:
         )
         details: dict[str, Any] = {
             "ready": False,
+            "active_instrument_count": len(generation.registry.symbols),
+            "intentionally_empty_catalog": not generation.registry.symbols,
             "runtime": runtime.as_dict(),
             "free_threaded_required": self.settings.require_free_threaded,
             "api_key_configured": self._has_active_api_key(),
@@ -860,7 +1888,7 @@ class QuickPriceService:
                 if collector_failure is None
                 else {
                     "type": type(collector_failure).__name__,
-                    "message": str(collector_failure),
+                    "message": "collector runtime failed",
                 }
             ),
             "missing_prices": missing,
@@ -873,13 +1901,20 @@ class QuickPriceService:
     def operational_metrics(self) -> dict[str, Any]:
         result = self.metrics.snapshot()
         now = utc_now()
+        generation = self._generations.capture()
+        state = self._state_for_generation(generation)
         with self._metadata_lock:
-            result["source_failures"] = sorted(self._source_failures)
+            result["source_failures"] = sorted(state.source_failures)
         result["snapshot_age_ms"] = {
             symbol: max(0, int((now - snapshot.quote.as_of).total_seconds() * 1000))
-            for symbol, snapshot in self.snapshots.all().items()
+            for symbol, snapshot in state.snapshots.all().items()
+            if symbol in generation.registry
         }
-        result["history_ring_points"] = self.history.sizes()
+        result["history_ring_points"] = {
+            symbol: sizes
+            for symbol, sizes in state.history.sizes().items()
+            if symbol in generation.registry
+        }
         if self._storage is not None:
             storage_metrics = getattr(self._storage, "metrics", None)
             if storage_metrics is not None:

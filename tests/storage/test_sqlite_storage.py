@@ -273,6 +273,122 @@ def test_restore_windows_latest_state_and_cleanup(tmp_path) -> None:
     run(scenario())
 
 
+def test_symbol_scoped_restore_rehydrates_retained_archived_instrument_state(tmp_path) -> None:
+    async def scenario() -> None:
+        now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+        database = tmp_path / "quickprice.db"
+        storage = SQLiteStorage(database, batch_interval_ms=10)
+        await storage.start()
+        await storage.enqueue_many(
+            [
+                minute("ACTIVE:USD", now, 1),
+                minute("ARCHIVED:USD", now, 2),
+                aggregate("ACTIVE:USD", now, 1),
+                aggregate("ARCHIVED:USD", now, 2),
+                LatestSnapshotRecord(
+                    "ACTIVE:USD",
+                    now,
+                    {"symbol": "ACTIVE:USD", "price": "101"},
+                    Decimal("101"),
+                ),
+                LatestSnapshotRecord(
+                    "ARCHIVED:USD",
+                    now,
+                    {"symbol": "ARCHIVED:USD", "price": "102"},
+                    Decimal("102"),
+                ),
+                DividendEventRecord(
+                    "ACTIVE:USD",
+                    date(2026, 7, 1),
+                    Decimal("0.1"),
+                    "USD",
+                    "quarterly",
+                    "fixture",
+                ),
+                DividendEventRecord(
+                    "ARCHIVED:USD",
+                    date(2026, 7, 1),
+                    Decimal("0.2"),
+                    "USD",
+                    "quarterly",
+                    "fixture",
+                ),
+                YieldMetricRecord(
+                    "ACTIVE:USD",
+                    now,
+                    Decimal("4.1"),
+                    "fixture_yield",
+                    "fixture",
+                ),
+                YieldMetricRecord(
+                    "ARCHIVED:USD",
+                    now,
+                    Decimal("4.2"),
+                    "fixture_yield",
+                    "fixture",
+                ),
+                ProviderCheckpointRecord(
+                    "fixture",
+                    "quotes",
+                    now,
+                    {"symbols": {"ACTIVE:USD": 1, "ARCHIVED:USD": 2}},
+                ),
+            ]
+        )
+        await storage.flush()
+        await storage.stop()
+
+        # Simulate a process restart where startup omitted this archived symbol.
+        restarted = SQLiteStorage(database)
+        rehydrated = await restarted.restore(
+            now=now,
+            symbols=("ARCHIVED:USD", "ARCHIVED:USD"),
+        )
+        assert {item.symbol for item in rehydrated.minute_prices} == {"ARCHIVED:USD"}
+        assert {item.symbol for item in rehydrated.aggregate_prices} == {"ARCHIVED:USD"}
+        assert set(rehydrated.snapshots_by_symbol) == {"ARCHIVED:USD"}
+        assert {item.symbol for item in rehydrated.dividend_events} == {"ARCHIVED:USD"}
+        assert {item.symbol for item in rehydrated.yield_metric_records} == {"ARCHIVED:USD"}
+        assert rehydrated.provider_checkpoints == ()
+
+        # A targeted read never deletes archived rows or process-global checkpoints.
+        full = await restarted.restore(now=now)
+        assert {item.symbol for item in full.minute_prices} == {"ACTIVE:USD", "ARCHIVED:USD"}
+        assert set(full.snapshots_by_symbol) == {"ACTIVE:USD", "ARCHIVED:USD"}
+        assert full.checkpoints_by_key[("fixture", "quotes")].checkpoint == {
+            "symbols": {"ACTIVE:USD": 1, "ARCHIVED:USD": 2}
+        }
+
+    run(scenario())
+
+
+def test_symbol_scoped_restore_batches_more_than_sqlite_legacy_parameter_limit(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+        storage = SQLiteStorage(tmp_path / "quickprice.db", batch_interval_ms=10)
+        await storage.start()
+        symbols = tuple(f"FIXTURE-{index:04d}:USD" for index in range(1_005))
+        await storage.enqueue_many(
+            [minute(symbol, now, index) for index, symbol in enumerate(symbols)]
+        )
+        await storage.flush()
+
+        restored = await storage.restore(now=now, symbols=reversed(symbols))
+        assert len(restored.minute_prices) == len(symbols)
+        assert {item.symbol for item in restored.minute_prices} == set(symbols)
+        empty = await storage.restore(now=now, symbols=())
+        assert empty.price_points == ()
+        assert empty.latest_snapshots == ()
+        assert empty.dividend_events == ()
+        assert empty.yield_metric_records == ()
+        assert empty.provider_checkpoints == ()
+        await storage.stop()
+
+    run(scenario())
+
+
 def test_yield_restore_and_metadata_cleanup_follow_last_publication_order(tmp_path) -> None:
     async def scenario() -> None:
         now = datetime(2026, 7, 20, 6, tzinfo=UTC)

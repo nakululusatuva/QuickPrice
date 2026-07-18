@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -18,6 +19,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -26,7 +28,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
 from .admin_api import install_admin_routes
-from .admin_security import AdminRateLimitError, AdminSecurity
+from .admin_security import (
+    AdminAuthorizationError,
+    AdminNotConfiguredError,
+    AdminRateLimitError,
+    AdminSecurity,
+)
 from .api_keys import ApiKeyManager
 from .auth import AuthenticationError, Authenticator, RateLimitError
 from .config import Settings
@@ -36,7 +43,6 @@ from .managed_config import (
     InstrumentPolicyStore,
     ManagedEnvironmentStore,
     ProviderKeyStore,
-    build_managed_registry,
 )
 from .registry import InstrumentRegistry, build_registry, normalize_symbol
 from .schemas import EnvelopeModel, ErrorModel, instrument_to_wire
@@ -46,7 +52,9 @@ _LOGGER = logging.getLogger(__name__)
 _DASHBOARD_ROOT = Path(__file__).with_name("dashboard")
 _ADMIN_ROOT = Path(__file__).with_name("admin")
 _LOG_STREAM_PATH = "/internal/logs/stream"
+_CATALOG_REVISION_HEADER = "X-QuickPrice-Catalog-Revision"
 _ADMIN_BODY_LIMIT = 64 * 1024
+_ADMIN_CATALOG_IMPORT_BODY_LIMIT = 8 * 1024 * 1024
 _CONTENT_SECURITY_POLICY = "; ".join(
     (
         "default-src 'self'",
@@ -86,18 +94,21 @@ class _AdminRequestBodyTooLarge(RuntimeError):
 
 
 class _AdminRequestGuardMiddleware:
-    """Rate-limit and cap admin requests before JSON parsing or validation."""
+    """Authenticate, rate-limit, and cap admin requests before body parsing."""
 
     def __init__(
         self,
         app: ASGIApp,
         *,
         maximum_bytes: int,
+        catalog_import_maximum_bytes: int,
         security: AdminSecurity,
     ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
+        self.catalog_import_maximum_bytes = catalog_import_maximum_bytes
         self.security = security
+        self._catalog_import_slots = asyncio.Semaphore(1)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = str(scope.get("path", ""))
@@ -107,6 +118,11 @@ class _AdminRequestGuardMiddleware:
             return
 
         headers = {key.lower(): value for key, value in scope.get("headers", ())}
+        maximum_bytes = (
+            self.catalog_import_maximum_bytes
+            if path == "/admin-api/instrument-catalog/import"
+            else self.maximum_bytes
+        )
         peer = scope.get("client")
         peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
         forwarded_ip = headers.get(b"x-real-ip")
@@ -129,8 +145,95 @@ class _AdminRequestGuardMiddleware:
             )
             return
 
+        is_login = method == "POST" and path == "/admin-api/session"
+        provider_search = (
+            method in {"GET", "HEAD"}
+            and path.startswith("/admin-api/provider-catalog/")
+            and path.endswith("/search")
+        )
+        if not is_login:
+            mutation = method not in {"GET", "HEAD", "OPTIONS"}
+            authorization_level = (
+                "same_origin_action" if provider_search else ("mutation" if mutation else "read")
+            )
+            try:
+                request = Request(scope)
+                scheme = str(scope.get("scheme", "http"))
+                forwarded_proto = headers.get(b"x-forwarded-proto")
+                if self.security.trusts_proxy(peer_ip) and forwarded_proto is not None:
+                    candidate = forwarded_proto.decode("ascii", errors="ignore").lower()
+                    if candidate in {"http", "https"}:
+                        scheme = candidate
+                origin = request.headers.get("Origin")
+                sec_fetch_site = request.headers.get("Sec-Fetch-Site")
+                if mutation:
+                    self.security.validate_browser_request(
+                        origin=origin,
+                        sec_fetch_site=sec_fetch_site,
+                        effective_scheme=scheme,
+                        mutation=True,
+                    )
+                elif provider_search:
+                    self.security.validate_same_origin_action(
+                        origin=origin,
+                        sec_fetch_site=sec_fetch_site,
+                        effective_scheme=scheme,
+                    )
+                session = self.security.authorize(
+                    session_token=request.cookies.get(self.security.cookie_name),
+                    user_agent=request.headers.get("User-Agent", ""),
+                    csrf_token=request.headers.get("X-CSRF-Token"),
+                    mutation=mutation or provider_search,
+                )
+            except AdminNotConfiguredError:
+                await self._error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=503,
+                    code="admin_not_configured",
+                    message="administrator access is unavailable",
+                )
+                return
+            except AdminRateLimitError as exc:
+                await self._error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=429,
+                    code="admin_rate_limited",
+                    message="administrator request rate limit exceeded",
+                    retry_after=exc.retry_after,
+                )
+                return
+            except AdminAuthorizationError:
+                await self._error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=401,
+                    code="admin_unauthorized",
+                    message="administrator authorization failed",
+                )
+                return
+            state = scope.setdefault("state", {})
+            state["quickprice_admin_session"] = session
+            state["quickprice_admin_authorization_level"] = authorization_level
+
         if method in {"GET", "HEAD", "OPTIONS"}:
             await self.app(scope, receive, send)
+            return
+
+        content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+        if content_type != b"application/json":
+            await self._error(
+                scope,
+                receive,
+                send,
+                status_code=415,
+                code="json_required",
+                message="administrator mutations require application/json",
+            )
             return
 
         raw_length = headers.get(b"content-length")
@@ -143,7 +246,7 @@ class _AdminRequestGuardMiddleware:
             except ValueError:
                 await self._body_too_large(scope, receive, send)
                 return
-            if content_length < 0 or content_length > self.maximum_bytes:
+            if content_length < 0 or content_length > maximum_bytes:
                 await self._body_too_large(scope, receive, send)
                 return
 
@@ -154,14 +257,21 @@ class _AdminRequestGuardMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.maximum_bytes:
+                if received > maximum_bytes:
                     raise _AdminRequestBodyTooLarge
             return message
 
-        try:
-            await self.app(scope, limited_receive, send)
-        except _AdminRequestBodyTooLarge:
-            await self._body_too_large(scope, receive, send)
+        async def dispatch() -> None:
+            try:
+                await self.app(scope, limited_receive, send)
+            except _AdminRequestBodyTooLarge:
+                await self._body_too_large(scope, receive, send)
+
+        if path == "/admin-api/instrument-catalog/import":
+            async with self._catalog_import_slots:
+                await dispatch()
+            return
+        await dispatch()
 
     @staticmethod
     async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
@@ -237,6 +347,16 @@ def _envelope(
     return model.model_dump(mode="json")
 
 
+def _if_none_match_matches(value: str | None, etag: str) -> bool:
+    """Match the active catalog validator without accepting malformed partial tags."""
+
+    if value is None:
+        return False
+    return any(
+        candidate in {"*", etag, f"W/{etag}"} for candidate in map(str.strip, value.split(","))
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     service: QuickPriceService | None = None,
@@ -244,18 +364,40 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     admin_catalog: InstrumentRegistry
+    active_catalog: Any
     if service is not None:
         if registry is not None and registry is not service.registry:
             raise ValueError("the API registry must match the service registry")
         registry = service.registry
-        admin_catalog = registry
+        admin_catalog = build_registry(settings.enabled_plugins)
+        managed_instruments = InstrumentPolicyStore(
+            settings.managed_instruments_path,
+            admin_catalog,
+            defer_migration=True,
+        )
+        active_catalog = managed_instruments.active_generation()
+        active_registry = active_catalog.to_registry()
+        if active_registry.symbols == service.registry.symbols:
+            service._activate_runtime_generation(
+                active_registry,
+                revision=active_catalog.revision,
+                catalog=active_catalog,
+            )
     else:
-        if registry is None:
-            registry = build_managed_registry(settings)
-            admin_catalog = build_registry(settings.enabled_plugins)
-        else:
-            admin_catalog = registry
-        service = QuickPriceService(settings, registry)
+        admin_catalog = registry or build_registry(settings.enabled_plugins)
+        managed_instruments = InstrumentPolicyStore(
+            settings.managed_instruments_path,
+            admin_catalog,
+            defer_migration=True,
+        )
+        active_catalog = managed_instruments.active_generation()
+        registry = active_catalog.to_registry()
+        service = QuickPriceService(
+            settings,
+            registry,
+            runtime_revision=active_catalog.revision,
+            runtime_catalog=active_catalog,
+        )
     api_key_manager = ApiKeyManager(settings.api_key_hashes)
     authenticator = Authenticator(settings, api_key_manager)
     service.bind_api_key_state(lambda: authenticator.configured)
@@ -271,9 +413,26 @@ def create_app(
     )
     managed_configuration = ManagedEnvironmentStore(settings.managed_config_path, settings)
     managed_provider_keys = ProviderKeyStore(settings.managed_provider_keys_path)
-    managed_instruments = InstrumentPolicyStore(
-        settings.managed_instruments_path,
-        admin_catalog,
+
+    async def catalog_audit_sink(
+        action: str,
+        target_id: str,
+        details: Any,
+        audit: Any,
+    ) -> None:
+        if audit is None:
+            return
+        await api_key_manager.append_audit(
+            audit=audit,
+            action=action,
+            target_type="instrument_catalog_job",
+            target_id=target_id,
+            details=dict(details),
+        )
+
+    service.bind_instrument_catalog(
+        managed_instruments,
+        audit_sink=catalog_audit_sink,
     )
     dashboard_logs = DashboardLogBroker(
         max_subscribers=settings.dashboard_max_log_streams,
@@ -293,6 +452,7 @@ def create_app(
             try:
                 await service.start()
                 await api_key_manager.start(service.storage)
+                await asyncio.to_thread(managed_instruments.persist_migration)
             except Exception as exc:
                 _LOGGER.error("QuickPrice startup failed error_type=%s", type(exc).__name__)
                 raise
@@ -325,6 +485,7 @@ def create_app(
     app.add_middleware(
         _AdminRequestGuardMiddleware,
         maximum_bytes=_ADMIN_BODY_LIMIT,
+        catalog_import_maximum_bytes=_ADMIN_CATALOG_IMPORT_BODY_LIMIT,
         security=admin_security,
     )
     if settings.admin_origin:
@@ -338,7 +499,7 @@ def create_app(
         )
     app.state.settings = settings
     app.state.service = service
-    app.state.registry = registry
+    app.state.registry = service.registry_view
     app.state.authenticator = authenticator
     app.state.api_key_manager = api_key_manager
     app.state.admin_security = admin_security
@@ -443,13 +604,19 @@ def create_app(
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        message = "; ".join(error["msg"] for error in exc.errors())
+        if request.url.path == "/admin-api" or request.url.path.startswith("/admin-api/"):
+            return JSONResponse(
+                {"error": {"code": "invalid_request", "message": message}},
+                status_code=422,
+            )
         content = _envelope(
             request,
             data=None,
             errors=[
                 ErrorModel(
                     code="invalid_request",
-                    message="; ".join(error["msg"] for error in exc.errors()),
+                    message=message,
                 )
             ],
         )
@@ -512,7 +679,17 @@ def create_app(
 
     @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/admin/", response_class=HTMLResponse, include_in_schema=False)
-    async def admin_dashboard() -> HTMLResponse:
+    async def admin_dashboard(request: Request) -> Response:
+        effective_scheme = request.url.scheme
+        peer = request.client.host if request.client else None
+        forwarded = request.headers.get("X-Forwarded-Proto")
+        if admin_security.trusts_proxy(peer) and forwarded in {"http", "https"}:
+            effective_scheme = forwarded
+        if admin_security.require_https and effective_scheme.lower() != "https":
+            # Do not present a credential form over a transport that would
+            # expose the administrator key and one-time code before the login
+            # endpoint has an opportunity to reject the request.
+            return Response(status_code=404)
         return HTMLResponse(admin_html)
 
     @app.get("/admin/assets/admin.css", include_in_schema=False)
@@ -563,13 +740,15 @@ def create_app(
         so operators can distinguish an absent price from incomplete metadata.
         """
 
+        generation = service.capture_generation()
+        active_registry = generation.registry
         if symbols is None:
-            requested = list(registry.symbols)
+            requested = list(active_registry.symbols)
         else:
             requested = []
             for raw in symbols.split(","):
                 normalized = normalize_symbol(raw)
-                instrument = registry.resolve(normalized)
+                instrument = active_registry.resolve(normalized)
                 symbol = instrument.symbol if instrument is not None else normalized
                 if symbol and symbol not in requested:
                     requested.append(symbol)
@@ -586,14 +765,14 @@ def create_app(
         errors: list[ErrorModel] = []
         now = utc_now()
         for symbol in requested:
-            instrument = registry.resolve(symbol)
+            instrument = active_registry.resolve(symbol)
             if instrument is None:
                 errors.append(
                     ErrorModel(code="unknown_symbol", message="unsupported symbol", symbol=symbol)
                 )
                 continue
             try:
-                quote = service.get_quote(instrument.symbol, now=now)
+                quote = service.get_quote(instrument.symbol, now=now, generation=generation)
             except DataUnavailableError as exc:
                 errors.append(
                     ErrorModel(code=exc.code, message=exc.reason, symbol=instrument.symbol)
@@ -603,6 +782,7 @@ def create_app(
                         instrument.symbol,
                         now=now,
                         require_complete_metadata=False,
+                        generation=generation,
                     )
                 except DataUnavailableError:
                     continue
@@ -615,7 +795,8 @@ def create_app(
                 errors=errors,
                 partial=bool(errors),
                 generated_at=now,
-            )
+            ),
+            headers={_CATALOG_REVISION_HEADER: generation.revision},
         )
 
     @app.get(_LOG_STREAM_PATH, include_in_schema=False)
@@ -656,10 +837,25 @@ def create_app(
         )
 
     @app.get("/v1/instruments")
-    async def instruments(request: Request) -> dict[str, Any]:
-        return _envelope(
-            request,
-            data=[instrument_to_wire(item).model_dump(mode="json") for item in registry.values()],
+    async def instruments(request: Request) -> Response:
+        generation = service.capture_generation()
+        etag = f'"{generation.revision}"'
+        headers = {
+            "Cache-Control": "private, no-cache, max-age=0",
+            "ETag": etag,
+            _CATALOG_REVISION_HEADER: generation.revision,
+        }
+        if _if_none_match_matches(request.headers.get("If-None-Match"), etag):
+            return Response(status_code=304, headers=headers)
+        return JSONResponse(
+            _envelope(
+                request,
+                data=[
+                    instrument_to_wire(item).model_dump(mode="json")
+                    for item in generation.registry.values()
+                ],
+            ),
+            headers=headers,
         )
 
     install_admin_routes(
@@ -680,13 +876,15 @@ def create_app(
             Query(min_length=1, description="Comma-separated instrument symbols, maximum 100"),
         ] = None,
     ) -> JSONResponse:
+        generation = service.capture_generation()
+        active_registry = generation.registry
         if symbols is None:
-            requested = list(registry.symbols)
+            requested = list(active_registry.symbols)
         else:
             requested = []
             for raw in symbols.split(","):
                 normalized = normalize_symbol(raw)
-                instrument = registry.resolve(normalized)
+                instrument = active_registry.resolve(normalized)
                 symbol = instrument.symbol if instrument is not None else normalized
                 if symbol and symbol not in requested:
                     requested.append(symbol)
@@ -699,22 +897,47 @@ def create_app(
         valid_requested = 0
         now = utc_now()
         for symbol in requested:
-            if symbol not in registry:
+            if symbol not in active_registry:
                 errors.append(
                     ErrorModel(code="unknown_symbol", message="unsupported symbol", symbol=symbol)
                 )
                 continue
             valid_requested += 1
             try:
-                data.append(service.get_quote(symbol, now=now).model_dump(mode="json"))
+                data.append(
+                    service.get_quote(symbol, now=now, generation=generation).model_dump(
+                        mode="json"
+                    )
+                )
             except DataUnavailableError as exc:
                 errors.append(ErrorModel(code=exc.code, message=exc.reason, symbol=symbol))
         if not data and valid_requested:
             content = _envelope(request, data=[], errors=errors, partial=True, generated_at=now)
-            return JSONResponse(content, status_code=503)
+            return JSONResponse(
+                content,
+                status_code=503,
+                headers={_CATALOG_REVISION_HEADER: generation.revision},
+            )
         if not data and not valid_requested:
+            if symbols is None:
+                content = _envelope(
+                    request,
+                    data=[],
+                    errors=[],
+                    partial=False,
+                    generated_at=now,
+                )
+                return JSONResponse(
+                    content,
+                    status_code=200,
+                    headers={_CATALOG_REVISION_HEADER: generation.revision},
+                )
             content = _envelope(request, data=[], errors=errors, partial=True, generated_at=now)
-            return JSONResponse(content, status_code=400)
+            return JSONResponse(
+                content,
+                status_code=400,
+                headers={_CATALOG_REVISION_HEADER: generation.revision},
+            )
         content = _envelope(
             request,
             data=data,
@@ -722,21 +945,32 @@ def create_app(
             partial=bool(errors),
             generated_at=now,
         )
-        return JSONResponse(content, status_code=200)
+        return JSONResponse(
+            content,
+            status_code=200,
+            headers={_CATALOG_REVISION_HEADER: generation.revision},
+        )
 
     @app.get("/v1/quotes/{symbol}")
     async def quote(request: Request, symbol: str) -> JSONResponse:
+        generation = service.capture_generation()
+        active_registry = generation.registry
         normalized = normalize_symbol(symbol)
-        instrument = registry.resolve(normalized)
+        instrument = active_registry.resolve(normalized)
         if instrument is None:
             raise APIError(404, "unknown_symbol", "unsupported symbol", symbol=normalized)
         normalized = instrument.symbol
         now = utc_now()
         try:
-            data = service.get_quote(normalized, now=now).model_dump(mode="json")
+            data = service.get_quote(normalized, now=now, generation=generation).model_dump(
+                mode="json"
+            )
         except DataUnavailableError as exc:
             raise APIError(503, exc.code, exc.reason, symbol=normalized) from exc
-        return JSONResponse(_envelope(request, data=data, generated_at=now))
+        return JSONResponse(
+            _envelope(request, data=data, generated_at=now),
+            headers={_CATALOG_REVISION_HEADER: generation.revision},
+        )
 
     return app
 

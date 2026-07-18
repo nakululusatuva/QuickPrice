@@ -108,6 +108,8 @@ class _Envelope:
 
 
 _STOP = object()
+_RESTORE_SYMBOL_MARKER = "/* QUICKPRICE_SYMBOL_SCOPE */"
+_RESTORE_SYMBOL_BATCH_SIZE = 500
 
 
 class SQLiteStorage:
@@ -1102,7 +1104,17 @@ class SQLiteStorage:
         aggregate_retention: timedelta = timedelta(days=45),
         daily_retention: timedelta = timedelta(days=400),
         aggregate_interval_seconds: int = 300,
+        symbols: Iterable[str] | None = None,
     ) -> RestoredState:
+        """Restore retained state, optionally for an explicit instrument subset.
+
+        A symbol-scoped restore is intended for catalog hot activation after an
+        archived or disabled instrument is enabled again. Provider checkpoints
+        are process-global and cannot be safely attributed to one instrument, so
+        they are returned only by the unscoped startup restore.
+        """
+
+        symbol_scope = self._normalize_restore_symbols(symbols)
         await asyncio.to_thread(self.initialize)
         return await asyncio.to_thread(
             self.restore_sync,
@@ -1111,6 +1123,7 @@ class SQLiteStorage:
             aggregate_retention=aggregate_retention,
             daily_retention=daily_retention,
             aggregate_interval_seconds=aggregate_interval_seconds,
+            symbols=symbol_scope,
         )
 
     def restore_sync(
@@ -1121,8 +1134,10 @@ class SQLiteStorage:
         aggregate_retention: timedelta = timedelta(days=45),
         daily_retention: timedelta = timedelta(days=400),
         aggregate_interval_seconds: int = 300,
+        symbols: Iterable[str] | None = None,
     ) -> RestoredState:
         self.initialize()
+        symbol_scope = self._normalize_restore_symbols(symbols)
         current = utc_datetime(now or datetime.now(UTC))
         if (
             minute_retention <= timedelta(0)
@@ -1137,34 +1152,53 @@ class SQLiteStorage:
         daily_cutoff = encode_timestamp(current - daily_retention)
         try:
             with self._reader_connection() as connection:
-                minute_rows = connection.execute(
+                # Keep every table and every symbol batch on one WAL snapshot.
+                # Otherwise a writer commit between batches could produce a
+                # mixed restoration image during a catalog activation.
+                connection.execute("BEGIN")
+                minute_rows = self._fetch_restore_rows(
+                    connection,
                     """
                     SELECT symbol, timestamp, price, provider, is_derived, source_json
                     FROM minute_prices
                     WHERE timestamp >= ?
+                    /* QUICKPRICE_SYMBOL_SCOPE */
                     ORDER BY timestamp, symbol, provider
                     """,
                     (minute_cutoff,),
-                ).fetchall()
-                aggregate_rows = connection.execute(
+                    symbol_scope,
+                    order_columns=("timestamp", "symbol", "provider"),
+                )
+                aggregate_rows = self._fetch_restore_rows(
+                    connection,
                     """
                     SELECT symbol, bucket_start, interval_seconds, open, high, low, close,
                            sample_count, provider, is_derived, source_json
                     FROM aggregate_prices
-                    WHERE (interval_seconds = ? AND bucket_start >= ?)
-                       OR (interval_seconds = 86400 AND bucket_start >= ?)
+                    WHERE ((interval_seconds = ? AND bucket_start >= ?)
+                       OR (interval_seconds = 86400 AND bucket_start >= ?))
+                    /* QUICKPRICE_SYMBOL_SCOPE */
                     ORDER BY bucket_start, symbol, provider
                     """,
                     (aggregate_interval_seconds, aggregate_cutoff, daily_cutoff),
-                ).fetchall()
-                snapshot_rows = connection.execute(
+                    symbol_scope,
+                    order_columns=("bucket_start", "symbol", "provider"),
+                )
+                snapshot_rows = self._fetch_restore_rows(
+                    connection,
                     """
                     SELECT symbol, as_of, price, snapshot_json
                     FROM latest_snapshots
+                    WHERE 1 = 1
+                    /* QUICKPRICE_SYMBOL_SCOPE */
                     ORDER BY symbol
-                    """
-                ).fetchall()
-                dividend_rows = connection.execute(
+                    """,
+                    (),
+                    symbol_scope,
+                    order_columns=("symbol",),
+                )
+                dividend_rows = self._fetch_restore_rows(
+                    connection,
                     """
                     SELECT symbol, ex_date, payment_date, amount, currency, frequency,
                            event_type, is_special, provider, raw_json
@@ -1182,12 +1216,18 @@ class SQLiteStorage:
                                 provider DESC
                         ) AS row_number
                         FROM dividend_events
+                        WHERE 1 = 1
+                        /* QUICKPRICE_SYMBOL_SCOPE */
                     )
                     WHERE row_number = 1
                     ORDER BY symbol
-                    """
-                ).fetchall()
-                yield_rows = connection.execute(
+                    """,
+                    (),
+                    symbol_scope,
+                    order_columns=("symbol",),
+                )
+                yield_rows = self._fetch_restore_rows(
+                    connection,
                     """
                     SELECT symbol, as_of, annual_percent, method, provider, is_proxy,
                            source_series, raw_json
@@ -1198,18 +1238,28 @@ class SQLiteStorage:
                                      method DESC, provider DESC
                         ) AS row_number
                         FROM yield_metrics
+                        WHERE 1 = 1
+                        /* QUICKPRICE_SYMBOL_SCOPE */
                     )
                     WHERE row_number = 1
                     ORDER BY symbol
-                    """
-                ).fetchall()
-                checkpoint_rows = connection.execute(
-                    """
-                    SELECT provider, feed, checkpoint_json, updated_at
-                    FROM provider_checkpoints
-                    ORDER BY provider, feed
-                    """
-                ).fetchall()
+                    """,
+                    (),
+                    symbol_scope,
+                    order_columns=("symbol",),
+                )
+                checkpoint_rows = (
+                    connection.execute(
+                        """
+                        SELECT provider, feed, checkpoint_json, updated_at
+                        FROM provider_checkpoints
+                        ORDER BY provider, feed
+                        """
+                    ).fetchall()
+                    if symbol_scope is None
+                    else ()
+                )
+                connection.execute("COMMIT")
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise StorageCorruptionError(
                 f"could not restore persisted QuickPrice state: {exc}"
@@ -1297,6 +1347,49 @@ class SQLiteStorage:
             )
         except (ValueError, TypeError, KeyError) as exc:
             raise StorageCorruptionError(f"invalid persisted QuickPrice record: {exc}") from exc
+
+    @staticmethod
+    def _normalize_restore_symbols(symbols: Iterable[str] | None) -> tuple[str, ...] | None:
+        if symbols is None:
+            return None
+        if isinstance(symbols, (str, bytes)):
+            raise TypeError("restore symbols must be an iterable of instrument symbols")
+        normalized: set[str] = set()
+        for symbol in symbols:
+            if not isinstance(symbol, str) or not symbol or symbol != symbol.strip():
+                raise ValueError("restore symbols must be non-empty normalized strings")
+            normalized.add(symbol)
+        return tuple(sorted(normalized))
+
+    @staticmethod
+    def _fetch_restore_rows(
+        connection: sqlite3.Connection,
+        query: str,
+        parameters: Sequence[Any],
+        symbols: tuple[str, ...] | None,
+        *,
+        order_columns: tuple[str, ...],
+    ) -> list[sqlite3.Row]:
+        if query.count(_RESTORE_SYMBOL_MARKER) != 1:
+            raise ValueError("restore query must contain exactly one symbol-scope marker")
+        if symbols is None:
+            return connection.execute(
+                query.replace(_RESTORE_SYMBOL_MARKER, ""), parameters
+            ).fetchall()
+        if not symbols:
+            return []
+
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(symbols), _RESTORE_SYMBOL_BATCH_SIZE):
+            batch = symbols[start : start + _RESTORE_SYMBOL_BATCH_SIZE]
+            placeholders = ", ".join("?" for _ in batch)
+            scoped_query = query.replace(
+                _RESTORE_SYMBOL_MARKER,
+                f"AND symbol IN ({placeholders})",
+            )
+            rows.extend(connection.execute(scoped_query, (*parameters, *batch)).fetchall())
+        rows.sort(key=lambda row: tuple(row[column] for column in order_columns))
+        return rows
 
     async def integrity_check(self) -> str:
         await asyncio.to_thread(self.initialize)

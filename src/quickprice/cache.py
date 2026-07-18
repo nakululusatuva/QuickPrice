@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from threading import RLock
 from types import MappingProxyType
@@ -49,6 +49,14 @@ class SnapshotStore:
             with lock:
                 combined.update(shard)
         return MappingProxyType(combined)
+
+    def clone(self) -> SnapshotStore:
+        """Return an isolated store containing the current immutable snapshots."""
+
+        replacement = SnapshotStore(shard_count=len(self._shards))
+        for snapshot in self.all().values():
+            replacement.publish(snapshot)
+        return replacement
 
 
 class HistoryCache:
@@ -110,7 +118,7 @@ class HistoryCache:
                 self._upsert_bucket(self._five_minute[point.symbol], five_point, five_bucket)
             else:
                 raise ValueError(f"unsupported history interval: {point.interval}")
-            self._prune(point.symbol, point.timestamp)
+            self._prune_symbol_locked(point.symbol, point.timestamp)
 
     def load(self, points: list[PricePoint]) -> None:
         if not points:
@@ -166,29 +174,69 @@ class HistoryCache:
                 one_cutoff = latest - self.ONE_MINUTE_RETENTION
                 five_cutoff = latest - self.FIVE_MINUTE_RETENTION
                 daily_cutoff = latest - self.DAILY_RETENTION
-                self._one_minute[symbol] = deque(
-                    one[key] for key in sorted(one) if key >= one_cutoff
+                self._replace_ring(
+                    self._one_minute,
+                    symbol,
+                    (one[key] for key in sorted(one) if key >= one_cutoff),
                 )
-                self._five_minute[symbol] = deque(
-                    five[key] for key in sorted(five) if key >= five_cutoff
+                self._replace_ring(
+                    self._five_minute,
+                    symbol,
+                    (five[key] for key in sorted(five) if key >= five_cutoff),
                 )
-                self._daily[symbol] = deque(
-                    daily[key] for key in sorted(daily) if key >= daily_cutoff
+                self._replace_ring(
+                    self._daily,
+                    symbol,
+                    (daily[key] for key in sorted(daily) if key >= daily_cutoff),
                 )
 
-    def _prune(self, symbol: str, now: datetime) -> None:
+    @staticmethod
+    def _replace_ring(
+        rings: dict[str, deque[PricePoint]],
+        symbol: str,
+        points: Iterable[PricePoint],
+    ) -> None:
+        replacement = deque(points)
+        if replacement:
+            rings[symbol] = replacement
+        else:
+            rings.pop(symbol, None)
+
+    @staticmethod
+    def _prune_ring(
+        rings: dict[str, deque[PricePoint]],
+        symbol: str,
+        cutoff: datetime,
+    ) -> int:
+        ring = rings.get(symbol)
+        if ring is None:
+            return 0
+        previous_size = len(ring)
+        while ring and ring[0].timestamp < cutoff:
+            ring.popleft()
+        if not ring:
+            rings.pop(symbol, None)
+        return previous_size - len(ring)
+
+    def _prune_symbol_locked(self, symbol: str, now: datetime) -> int:
         one_cutoff = now - self.ONE_MINUTE_RETENTION
         five_cutoff = now - self.FIVE_MINUTE_RETENTION
         daily_cutoff = now - self.DAILY_RETENTION
-        one = self._one_minute[symbol]
-        five = self._five_minute[symbol]
-        daily = self._daily[symbol]
-        while one and one[0].timestamp < one_cutoff:
-            one.popleft()
-        while five and five[0].timestamp < five_cutoff:
-            five.popleft()
-        while daily and daily[0].timestamp < daily_cutoff:
-            daily.popleft()
+        return sum(
+            (
+                self._prune_ring(self._one_minute, symbol, one_cutoff),
+                self._prune_ring(self._five_minute, symbol, five_cutoff),
+                self._prune_ring(self._daily, symbol, daily_cutoff),
+            )
+        )
+
+    def prune(self, now: datetime | None = None) -> int:
+        """Expire every history ring, including symbols no longer being collected."""
+
+        effective_now = datetime.now(UTC) if now is None else now.astimezone(UTC)
+        with self._lock:
+            symbols = set(self._one_minute) | set(self._five_minute) | set(self._daily)
+            return sum(self._prune_symbol_locked(symbol, effective_now) for symbol in symbols)
 
     def points(self, symbol: str) -> tuple[PricePoint, ...]:
         with self._lock:

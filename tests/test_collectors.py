@@ -10,6 +10,7 @@ import pytest
 
 from quickprice.analytics import calculate_changes
 from quickprice.builtin_plugin import FX_INSTRUMENTS
+from quickprice.cache import HistoryCache
 from quickprice.collectors import MarketDataCoordinator, derive_cross_history
 from quickprice.config import Settings
 from quickprice.domain import (
@@ -1590,7 +1591,8 @@ async def test_fresh_alpaca_stream_observation_suppresses_rest_poll(monkeypatch)
 
         next_interval = await coordinator._poll_quote_once("QQQM:USD")
 
-        assert next_interval == coordinator.registry["QQQM:USD"].quote_poll_seconds == 5
+        assert coordinator.registry["QQQM:USD"].quote_poll_seconds == 5
+        assert next_interval == provider.minimum_quote_poll_seconds == 20
         provider._request_json.assert_not_awaited()
     finally:
         await coordinator.graph.close()
@@ -1785,7 +1787,7 @@ async def test_provider_quota_usage_is_restored_from_sqlite(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fatal_supervisor_state_is_visible_and_stop_does_not_reraise(tmp_path):
+async def test_fatal_startup_is_surfaced_and_stop_does_not_reraise(tmp_path):
     settings = Settings(
         production=False,
         require_free_threaded=False,
@@ -1801,8 +1803,8 @@ async def test_fatal_supervisor_state_is_visible_and_stop_does_not_reraise(tmp_p
         raise RuntimeError("collector exploded")
 
     coordinator._run = fail_after_start
-    await coordinator.start()
-    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="collector failed during startup"):
+        await coordinator.start()
     assert coordinator.is_running is False
     assert isinstance(coordinator.fatal_error, RuntimeError)
     await coordinator.stop()
@@ -2061,3 +2063,90 @@ async def test_history_backfill_uses_a_fixed_worker_pool() -> None:
 
     assert len(completed) == 50
     assert maximum_active == 2
+
+
+@pytest.mark.asyncio
+async def test_maintenance_prunes_inactive_memory_history_with_supplied_clock() -> None:
+    archived_at = datetime(2025, 1, 1, tzinfo=UTC)
+    history = HistoryCache()
+    history.load([PricePoint("ARCHIVED:USD", archived_at, Decimal("1"), "fixture", interval="1d")])
+    coordinator = object.__new__(MarketDataCoordinator)
+    coordinator.service = SimpleNamespace(history=history, _storage=None)
+
+    await coordinator._run_maintenance(archived_at + timedelta(days=401))
+
+    assert history.sizes() == {}
+
+
+@pytest.mark.asyncio
+async def test_restarted_rest_schedulers_preserve_unchanged_due_times() -> None:
+    registry = _large_registry(2, history_enabled=True)
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+        registry,
+    )
+    future = asyncio.get_running_loop().time() + 60
+
+    quote_calls: list[str] = []
+    quote_called = asyncio.Event()
+
+    async def poll_quote(symbol: str) -> float:
+        quote_calls.append(symbol)
+        quote_called.set()
+        return 60
+
+    coordinator._quote_next_refresh_at = {"ASSET0:USD": future}
+    coordinator._poll_quote_once = poll_quote
+    quote_task = asyncio.create_task(coordinator._quote_scheduler_loop())
+    try:
+        async with asyncio.timeout(1):
+            await quote_called.wait()
+        await asyncio.sleep(0)
+    finally:
+        quote_task.cancel()
+        await asyncio.gather(quote_task, return_exceptions=True)
+    assert quote_calls == ["ASSET1:USD"]
+
+    metadata_calls: list[str] = []
+    metadata_called = asyncio.Event()
+
+    async def refresh_metadata(instrument) -> bool:
+        metadata_calls.append(instrument.symbol)
+        metadata_called.set()
+        return False
+
+    coordinator._metadata_next_refresh_at = {"ASSET0:USD": future}
+    coordinator._refresh_metadata = refresh_metadata
+    metadata_task = asyncio.create_task(coordinator._metadata_loop())
+    try:
+        async with asyncio.timeout(1):
+            await metadata_called.wait()
+        await asyncio.sleep(0)
+    finally:
+        metadata_task.cancel()
+        await asyncio.gather(metadata_task, return_exceptions=True)
+    assert metadata_calls == ["ASSET1:USD"]
+
+    history_due: list[set[str] | None] = []
+    history_called = asyncio.Event()
+
+    async def backfill_history(*, include_fx: bool) -> bool:
+        assert include_fx is False
+        history_due.append(coordinator._history_due_symbols)
+        history_called.set()
+        return True
+
+    coordinator._history_next_regular_refresh_at = {"ASSET0:USD": future}
+    coordinator._next_fx_history_refresh_at = future
+    coordinator._backfill_history = backfill_history
+    history_task = asyncio.create_task(coordinator._history_loop())
+    try:
+        async with asyncio.timeout(1):
+            await history_called.wait()
+        await asyncio.sleep(0)
+    finally:
+        history_task.cancel()
+        await asyncio.gather(history_task, return_exceptions=True)
+        await coordinator.graph.close()
+    assert history_due == [{"ASSET1:USD"}]

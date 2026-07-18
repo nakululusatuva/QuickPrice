@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import re
+from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
-from typing import Any
+from enum import Enum
+from typing import Any, Literal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,6 +31,7 @@ from .api_keys import (
     AuditContext,
     DuplicateApiKeyError,
 )
+from .catalog import MAX_CUSTOM_INSTRUMENTS
 from .managed_config import (
     InstrumentPolicyStore,
     ManagedConfigurationError,
@@ -87,6 +93,23 @@ class RevisionedValuesRequest(_StrictModel):
 class InstrumentPolicyRequest(_StrictModel):
     revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     instruments: list[dict[str, Any]] = Field(max_length=2_000)
+
+
+class CatalogRevisionRequest(_StrictModel):
+    revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class CreateCatalogInstrumentRequest(CatalogRevisionRequest):
+    instrument: dict[str, Any]
+
+
+class UpdateCatalogInstrumentRequest(CatalogRevisionRequest):
+    changes: dict[str, Any]
+
+
+class ImportInstrumentCatalogRequest(CatalogRevisionRequest):
+    mode: Literal["merge", "replace_custom", "replace-custom"] = "merge"
+    catalog: dict[str, Any] | list[dict[str, Any]]
 
 
 class AdminRouteError(RuntimeError):
@@ -165,7 +188,29 @@ def install_admin_routes(
             headers=headers,
         )
 
-    def authorize(request: Request, *, mutation: bool = False):
+    def authorize(
+        request: Request,
+        *,
+        mutation: bool = False,
+        same_origin_action: bool = False,
+    ):
+        preauthorized = getattr(request.state, "quickprice_admin_session", None)
+        authorization_level = getattr(
+            request.state,
+            "quickprice_admin_authorization_level",
+            None,
+        )
+        accepted_levels = (
+            {"mutation"}
+            if mutation
+            else {"mutation", "same_origin_action"}
+            if same_origin_action
+            else {"read", "mutation", "same_origin_action"}
+        )
+        if preauthorized is not None and authorization_level in accepted_levels:
+            if mutation:
+                _json_content_required(request)
+            return preauthorized
         try:
             if mutation:
                 _json_content_required(request)
@@ -175,11 +220,17 @@ def install_admin_routes(
                     effective_scheme=_effective_scheme(request, security),
                     mutation=True,
                 )
+            elif same_origin_action:
+                security.validate_same_origin_action(
+                    origin=request.headers.get("Origin"),
+                    sec_fetch_site=request.headers.get("Sec-Fetch-Site"),
+                    effective_scheme=_effective_scheme(request, security),
+                )
             return security.authorize(
                 session_token=request.cookies.get(security.cookie_name),
                 user_agent=request.headers.get("User-Agent", ""),
                 csrf_token=request.headers.get("X-CSRF-Token"),
-                mutation=mutation,
+                mutation=mutation or same_origin_action,
             )
         except AdminNotConfiguredError as exc:
             raise AdminRouteError(
@@ -217,6 +268,32 @@ def install_admin_routes(
             raise AdminRouteError(
                 503, "audit_unavailable", "durable administrator audit is unavailable"
             ) from exc
+
+    async def audit_completion(
+        request: Request,
+        *,
+        action: str,
+        target_type: str,
+        target_id: str | None,
+        fields: list[str],
+    ) -> None:
+        """Record an outcome without changing an already committed response."""
+
+        try:
+            await audit_intent(
+                request,
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                fields=fields,
+            )
+        except AdminRouteError as exc:
+            cause = exc.__cause__ or exc
+            _LOGGER.error(
+                "Administrator completion audit unavailable action=%s error_type=%s",
+                action,
+                type(cause).__name__,
+            )
 
     @app.post("/admin-api/session", include_in_schema=False)
     async def admin_login(request: Request, body: LoginRequest) -> JSONResponse:
@@ -418,7 +495,7 @@ def install_admin_routes(
         result = await _patch_store(
             configuration, updates=updates, removals=removals, revision=body.revision
         )
-        await audit_intent(
+        await audit_completion(
             request,
             action="configuration.changed",
             target_type="configuration",
@@ -453,7 +530,7 @@ def install_admin_routes(
         result = await _patch_store(
             provider_keys, updates=updates, removals=removals, revision=body.revision
         )
-        await audit_intent(
+        await audit_completion(
             request,
             action="provider_keys.changed",
             target_type="provider_keys",
@@ -480,7 +557,7 @@ def install_admin_routes(
         )
         try:
             result = await asyncio.to_thread(
-                instruments.patch,
+                instruments.stage_patch,
                 instruments=body.instruments,
                 expected_revision=body.revision,
             )
@@ -492,7 +569,7 @@ def install_admin_routes(
             raise AdminRouteError(
                 422, "invalid_instrument_policy", "instrument policy is invalid"
             ) from exc
-        await audit_intent(
+        await audit_completion(
             request,
             action="instruments.changed",
             target_type="instrument_policy",
@@ -500,6 +577,385 @@ def install_admin_routes(
             fields=symbols,
         )
         return result
+
+    @app.get("/admin-api/instrument-catalog", include_in_schema=False)
+    async def get_instrument_catalog(request: Request) -> dict[str, Any]:
+        authorize(request)
+        result = await _invoke_catalog_hook(instruments, ("catalog_snapshot", "snapshot"))
+        return _response_mapping(result, code="instrument_catalog_unavailable")
+
+    @app.post(
+        "/admin-api/instrument-catalog/instruments",
+        include_in_schema=False,
+        status_code=201,
+    )
+    async def create_catalog_instrument(
+        request: Request, body: CreateCatalogInstrumentRequest
+    ) -> dict[str, Any]:
+        authorize(request, mutation=True)
+        instrument_id = _manifest_identifier(body.instrument)
+        await audit_intent(
+            request,
+            action="instrument_catalog.create_requested",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=sorted(body.instrument),
+        )
+        try:
+            _validate_managed_manifest(body.instrument)
+            result = await _invoke_catalog_hook(
+                instruments,
+                ("create_instrument", "create"),
+                instrument=body.instrument,
+                expected_revision=body.revision,
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.create_failed",
+                target_type="instrument",
+                target_id=instrument_id,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_catalog_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.created",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=sorted(body.instrument),
+        )
+        return response
+
+    @app.patch(
+        "/admin-api/instrument-catalog/instruments/{instrument_id}",
+        include_in_schema=False,
+    )
+    async def update_catalog_instrument(
+        instrument_id: str,
+        request: Request,
+        body: UpdateCatalogInstrumentRequest,
+    ) -> dict[str, Any]:
+        authorize(request, mutation=True)
+        _validate_catalog_identifier(instrument_id)
+        await audit_intent(
+            request,
+            action="instrument_catalog.update_requested",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=sorted(body.changes),
+        )
+        try:
+            _validate_managed_manifest(body.changes)
+            result = await _invoke_catalog_hook(
+                instruments,
+                ("update_instrument", "patch_instrument", "update"),
+                instrument_id=instrument_id,
+                changes=body.changes,
+                expected_revision=body.revision,
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.update_failed",
+                target_type="instrument",
+                target_id=instrument_id,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_catalog_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.updated",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=sorted(body.changes),
+        )
+        return response
+
+    @app.delete(
+        "/admin-api/instrument-catalog/instruments/{instrument_id}",
+        include_in_schema=False,
+    )
+    async def archive_catalog_instrument(
+        instrument_id: str,
+        request: Request,
+        body: CatalogRevisionRequest,
+    ) -> dict[str, Any]:
+        authorize(request, mutation=True)
+        _validate_catalog_identifier(instrument_id)
+        await audit_intent(
+            request,
+            action="instrument_catalog.archive_requested",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=["archived"],
+        )
+        try:
+            result = await _invoke_catalog_hook(
+                instruments,
+                ("archive_instrument", "delete_instrument", "archive"),
+                instrument_id=instrument_id,
+                expected_revision=body.revision,
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.archive_failed",
+                target_type="instrument",
+                target_id=instrument_id,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_catalog_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.archived",
+            target_type="instrument",
+            target_id=instrument_id,
+            fields=["archived"],
+        )
+        return response
+
+    @app.post("/admin-api/instrument-catalog/import", include_in_schema=False)
+    async def import_instrument_catalog(
+        request: Request, body: ImportInstrumentCatalogRequest
+    ) -> dict[str, Any]:
+        authorize(request, mutation=True)
+        await audit_intent(
+            request,
+            action="instrument_catalog.import_requested",
+            target_type="instrument_catalog",
+            target_id=None,
+            fields=["catalog", "mode"],
+        )
+        try:
+            _validate_managed_manifest(body.catalog)
+            import_payload = (
+                {"version": 2, "instruments": body.catalog}
+                if isinstance(body.catalog, list)
+                else body.catalog
+            )
+            result = await _invoke_catalog_hook(
+                instruments,
+                ("import_catalog", "import_manifest"),
+                catalog=import_payload,
+                mode=body.mode,
+                expected_revision=body.revision,
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.import_failed",
+                target_type="instrument_catalog",
+                target_id=None,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_catalog_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.imported",
+            target_type="instrument_catalog",
+            target_id=str(response.get("staged_revision") or response.get("revision") or ""),
+            fields=["catalog", "mode"],
+        )
+        return response
+
+    @app.get("/admin-api/instrument-catalog/export", include_in_schema=False)
+    async def export_instrument_catalog(
+        request: Request,
+        state: Literal["active", "staged"] = Query(default="active"),
+    ) -> dict[str, Any]:
+        authorize(request)
+        try:
+            result = await _invoke_catalog_hook(
+                instruments,
+                ("export_catalog", "export_manifest", "snapshot"),
+                state=state,
+            )
+        except Exception as exc:
+            raise _catalog_route_error(exc) from exc
+        return _response_mapping(result, code="instrument_catalog_unavailable")
+
+    @app.post("/admin-api/instrument-catalog/validate", include_in_schema=False)
+    async def validate_instrument_catalog(
+        request: Request, body: CatalogRevisionRequest
+    ) -> dict[str, Any]:
+        authorize(request, mutation=True)
+        await audit_intent(
+            request,
+            action="instrument_catalog.validation_requested",
+            target_type="instrument_catalog",
+            target_id=body.revision,
+            fields=["revision"],
+        )
+        try:
+            catalog_before = await _invoke_catalog_hook(
+                instruments,
+                ("catalog_snapshot", "snapshot"),
+            )
+            validation_target = (
+                service
+                if callable(getattr(service, "validate_instrument_catalog", None))
+                else instruments
+            )
+            result = await _invoke_catalog_hook(
+                validation_target,
+                (
+                    "validate_instrument_catalog",
+                    "validate",
+                    "validate_catalog",
+                    "validate_staged",
+                ),
+                expected_revision=body.revision,
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.validation_failed",
+                target_type="instrument_catalog",
+                target_id=body.revision,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_catalog_unavailable")
+        response.setdefault("diff", _catalog_staged_diff(catalog_before))
+        await audit_completion(
+            request,
+            action="instrument_catalog.validated",
+            target_type="instrument_catalog",
+            target_id=body.revision,
+            fields=["revision"],
+        )
+        return response
+
+    @app.post("/admin-api/instrument-catalog/activate", include_in_schema=False)
+    async def activate_instrument_catalog(
+        request: Request, body: CatalogRevisionRequest
+    ) -> JSONResponse:
+        authorize(request, mutation=True)
+        await audit_intent(
+            request,
+            action="instrument_catalog.activation_requested",
+            target_type="instrument_catalog",
+            target_id=body.revision,
+            fields=["revision"],
+        )
+        try:
+            result = await _invoke_catalog_hook(
+                service,
+                ("activate_instrument_catalog",),
+                expected_revision=body.revision,
+                audit=_audit_context(request, security),
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.activation_failed",
+                target_type="instrument_catalog",
+                target_id=body.revision,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_activation_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.activation_started",
+            target_type="instrument_catalog_job",
+            target_id=str(response.get("job_id") or body.revision),
+            fields=["revision"],
+        )
+        return JSONResponse(response, status_code=202)
+
+    @app.post("/admin-api/instrument-catalog/rollback", include_in_schema=False)
+    async def rollback_instrument_catalog(
+        request: Request, body: CatalogRevisionRequest
+    ) -> JSONResponse:
+        authorize(request, mutation=True)
+        await audit_intent(
+            request,
+            action="instrument_catalog.rollback_requested",
+            target_type="instrument_catalog",
+            target_id=body.revision,
+            fields=["revision"],
+        )
+        try:
+            result = await _invoke_catalog_hook(
+                service,
+                ("rollback_instrument_catalog",),
+                expected_revision=body.revision,
+                audit=_audit_context(request, security),
+            )
+        except Exception as exc:
+            await _audit_catalog_failure(
+                audit_intent,
+                request,
+                action="instrument_catalog.rollback_failed",
+                target_type="instrument_catalog",
+                target_id=body.revision,
+            )
+            raise _catalog_route_error(exc) from exc
+        response = _response_mapping(result, code="instrument_activation_unavailable")
+        await audit_completion(
+            request,
+            action="instrument_catalog.rollback_started",
+            target_type="instrument_catalog_job",
+            target_id=str(response.get("job_id") or body.revision),
+            fields=["revision"],
+        )
+        return JSONResponse(response, status_code=202)
+
+    @app.get("/admin-api/instrument-catalog/jobs/{job_id}", include_in_schema=False)
+    async def instrument_catalog_job(job_id: str, request: Request) -> dict[str, Any]:
+        authorize(request)
+        _validate_catalog_identifier(job_id)
+        try:
+            result = await _invoke_catalog_hook(
+                service,
+                ("instrument_catalog_job", "get_instrument_catalog_job"),
+                job_id=job_id,
+            )
+        except Exception as exc:
+            raise _catalog_route_error(exc) from exc
+        if result is None:
+            raise AdminRouteError(404, "activation_job_not_found", "activation job was not found")
+        return _response_mapping(result, code="instrument_activation_unavailable")
+
+    @app.get("/admin-api/provider-catalog", include_in_schema=False)
+    async def get_provider_catalog(request: Request) -> dict[str, Any]:
+        authorize(request)
+        try:
+            result = await _provider_catalog_snapshot(service)
+        except Exception as exc:
+            raise _catalog_route_error(exc, provider=True) from exc
+        return _provider_catalog_response(result)
+
+    @app.get("/admin-api/provider-catalog/{provider}/search", include_in_schema=False)
+    async def search_provider_catalog(
+        provider: str,
+        request: Request,
+        q: str = Query(min_length=1, max_length=128),
+        asset_class: str | None = Query(default=None, min_length=1, max_length=32),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict[str, Any]:
+        authorize(request, same_origin_action=True)
+        _validate_provider_name(provider)
+        query = q.strip()
+        if not query or any(character in query for character in ("\x00", "\r", "\n")):
+            raise AdminRouteError(422, "invalid_provider_query", "provider search query is invalid")
+        try:
+            result = await _search_provider_catalog(
+                service,
+                provider=provider,
+                query=query,
+                asset_class=asset_class,
+                limit=limit,
+            )
+        except Exception as exc:
+            raise _catalog_route_error(exc, provider=True) from exc
+        return _response_mapping(result, code="provider_search_unavailable")
 
     @app.get("/admin-api/provider-statistics", include_in_schema=False)
     async def provider_statistics(request: Request) -> dict[str, Any]:
@@ -526,6 +982,439 @@ def install_admin_routes(
                 422, "invalid_limit", "audit event limit must be between 1 and 500"
             )
         return {"events": list(await api_keys.audit_events(limit=limit))}
+
+
+_CATALOG_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_BLOCKED_MANIFEST_KEYS = {
+    "api_key",
+    "api_keys",
+    "authorization",
+    "base_url",
+    "code",
+    "command",
+    "credential",
+    "credentials",
+    "endpoint",
+    "headers",
+    "import",
+    "import_path",
+    "module",
+    "module_path",
+    "password",
+    "python",
+    "request_headers",
+    "script",
+    "secret",
+    "secrets",
+    "token",
+    "url",
+    "urls",
+}
+_BLOCKED_RESPONSE_KEYS = {
+    "api_key",
+    "authorization",
+    "auth_url",
+    "authentication_url",
+    "credentials",
+    "headers",
+    "password",
+    "raw_response",
+    "response_body",
+    "secret",
+    "token",
+}
+_MAX_MANIFEST_DEPTH = 12
+# A complete generation can contain the 2,000 custom definitions promised by
+# the catalog contract plus the installed built-ins. 256 nodes per definition
+# comfortably covers the bounded routes, aliases, bindings, income policy, and
+# synthetic recipe while the independent 8 MiB request cap remains authoritative.
+_MAX_MANIFEST_LIST_ITEMS = MAX_CUSTOM_INSTRUMENTS + 256
+_MAX_MANIFEST_NODES = _MAX_MANIFEST_LIST_ITEMS * 256
+_HOOK_PARAMETER_ALIASES = {
+    "catalog": ("payload", "manifest"),
+    "changes": ("updates", "patch"),
+    "expected_revision": ("revision",),
+    "instrument": ("definition", "item"),
+    "instrument_id": ("id",),
+    "query": ("q",),
+}
+
+
+async def _invoke_catalog_hook(
+    target: Any,
+    names: tuple[str, ...],
+    **values: Any,
+) -> Any:
+    hook = next(
+        (getattr(target, name, None) for name in names if callable(getattr(target, name, None))),
+        None,
+    )
+    if hook is None:
+        raise AdminRouteError(
+            503,
+            "catalog_runtime_unavailable",
+            "instrument catalog runtime is unavailable",
+        )
+    signature = inspect.signature(hook)
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    arguments: dict[str, Any] = {}
+    for name, value in values.items():
+        if accepts_kwargs or name in signature.parameters:
+            arguments[name] = value
+            continue
+        alias = next(
+            (
+                candidate
+                for candidate in _HOOK_PARAMETER_ALIASES.get(name, ())
+                if candidate in signature.parameters
+            ),
+            None,
+        )
+        if alias is not None:
+            arguments[alias] = value
+    if inspect.iscoroutinefunction(hook):
+        return await hook(**arguments)
+    result = await asyncio.to_thread(hook, **arguments)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _response_mapping(value: Any, *, code: str) -> dict[str, Any]:
+    converted = _safe_admin_value(value)
+    if not isinstance(converted, dict):
+        raise AdminRouteError(503, code, "administrator data source returned an invalid response")
+    return converted
+
+
+def _safe_admin_value(value: Any) -> Any:
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        value = value.model_dump(mode="json")
+    elif is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    if isinstance(value, Enum):
+        return _safe_admin_value(value.value)
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if isinstance(value, Mapping):
+        return {
+            str(key): _safe_admin_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _BLOCKED_RESPONSE_KEYS
+        }
+    if isinstance(value, tuple | list | set | frozenset):
+        return [_safe_admin_value(item) for item in value]
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
+
+
+def _validate_managed_manifest(value: Any) -> None:
+    nodes = 0
+    pending: list[tuple[Any, int]] = [(value, 0)]
+
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_MANIFEST_NODES or depth > _MAX_MANIFEST_DEPTH:
+            raise AdminRouteError(
+                422,
+                "invalid_instrument_catalog",
+                "instrument catalog exceeds structural limits",
+            )
+        if isinstance(item, dict):
+            if len(item) > 256:
+                raise AdminRouteError(
+                    422,
+                    "invalid_instrument_catalog",
+                    "instrument catalog object is too large",
+                )
+            for key, nested in item.items():
+                if not isinstance(key, str) or not key or len(key) > 128:
+                    raise AdminRouteError(
+                        422,
+                        "invalid_instrument_catalog",
+                        "instrument catalog contains an invalid field name",
+                    )
+                if key.lower() in _BLOCKED_MANIFEST_KEYS:
+                    raise AdminRouteError(
+                        422,
+                        "unsafe_instrument_catalog",
+                        "instrument catalog contains a prohibited field",
+                    )
+                pending.append((nested, depth + 1))
+            continue
+        if isinstance(item, list):
+            if len(item) > _MAX_MANIFEST_LIST_ITEMS:
+                raise AdminRouteError(
+                    422,
+                    "invalid_instrument_catalog",
+                    "instrument catalog list is too large",
+                )
+            for nested in item:
+                pending.append((nested, depth + 1))
+            continue
+        if isinstance(item, str):
+            lowered = item.lower()
+            if (
+                len(item) > 4_096
+                or any(character in item for character in ("\x00", "\r", "\n", "<", ">"))
+                or any(
+                    scheme in lowered
+                    for scheme in ("http://", "https://", "file://", "javascript:")
+                )
+            ):
+                raise AdminRouteError(
+                    422,
+                    "unsafe_instrument_catalog",
+                    "instrument catalog contains a prohibited value",
+                )
+            continue
+        if item is None or isinstance(item, int | float | bool):
+            continue
+        raise AdminRouteError(
+            422,
+            "invalid_instrument_catalog",
+            "instrument catalog contains an unsupported value",
+        )
+
+
+def _validate_catalog_identifier(value: str) -> None:
+    if not _CATALOG_IDENTIFIER.fullmatch(value):
+        raise AdminRouteError(422, "invalid_catalog_identifier", "catalog identifier is invalid")
+
+
+def _validate_provider_name(value: str) -> None:
+    if not _PROVIDER_NAME.fullmatch(value):
+        raise AdminRouteError(404, "provider_not_found", "provider was not found")
+
+
+def _manifest_identifier(value: dict[str, Any]) -> str | None:
+    candidate = value.get("id") or value.get("symbol")
+    if not isinstance(candidate, str) or not _CATALOG_IDENTIFIER.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _catalog_staged_diff(snapshot: Any) -> dict[str, Any]:
+    """Return a bounded, secret-free active-to-staged summary for validation UX."""
+
+    if not isinstance(snapshot, Mapping):
+        return {"available": False}
+    active = snapshot.get("active")
+    staged = snapshot.get("staged")
+    if not isinstance(active, Mapping) or not isinstance(staged, Mapping):
+        return {"available": False}
+    active_items = active.get("instruments")
+    staged_items = staged.get("instruments")
+    if not isinstance(active_items, list) or not isinstance(staged_items, list):
+        return {"available": False}
+
+    def by_id(items: list[Any]) -> dict[str, Mapping[str, Any]]:
+        result: dict[str, Mapping[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            identifier = item.get("id")
+            if isinstance(identifier, str) and identifier:
+                result[identifier] = item
+        return result
+
+    active_by_id = by_id(active_items)
+    staged_by_id = by_id(staged_items)
+    added_ids = staged_by_id.keys() - active_by_id.keys()
+    removed_ids = active_by_id.keys() - staged_by_id.keys()
+    common_ids = active_by_id.keys() & staged_by_id.keys()
+    categories: dict[str, list[str]] = {
+        "added": [],
+        "removed": [],
+        "archived": [],
+        "restored": [],
+        "enabled": [],
+        "disabled": [],
+        "modified": [],
+    }
+    changed_ids = set(added_ids) | set(removed_ids)
+    categories["added"] = [str(staged_by_id[item].get("symbol", item)) for item in added_ids]
+    categories["removed"] = [str(active_by_id[item].get("symbol", item)) for item in removed_ids]
+    state_fields = {"enabled", "archived"}
+    for identifier in common_ids:
+        before = active_by_id[identifier]
+        after = staged_by_id[identifier]
+        symbol = str(after.get("symbol") or before.get("symbol") or identifier)
+        before_archived = before.get("archived") is True
+        after_archived = after.get("archived") is True
+        before_enabled = before.get("enabled") is not False and not before_archived
+        after_enabled = after.get("enabled") is not False and not after_archived
+        if not before_archived and after_archived:
+            categories["archived"].append(symbol)
+        elif before_archived and not after_archived:
+            categories["restored"].append(symbol)
+        if not before_enabled and after_enabled:
+            categories["enabled"].append(symbol)
+        elif before_enabled and not after_enabled and not after_archived:
+            categories["disabled"].append(symbol)
+        before_core = {key: value for key, value in before.items() if key not in state_fields}
+        after_core = {key: value for key, value in after.items() if key not in state_fields}
+        if before_core != after_core:
+            categories["modified"].append(symbol)
+        if before != after:
+            changed_ids.add(identifier)
+    for values in categories.values():
+        values.sort()
+    return {
+        "available": True,
+        "changed_count": len(changed_ids),
+        "unchanged_count": max(0, len(common_ids) - len(changed_ids & set(common_ids))),
+        **categories,
+    }
+
+
+def _catalog_route_error(exc: Exception, *, provider: bool = False) -> AdminRouteError:
+    if isinstance(exc, AdminRouteError):
+        return exc
+    name = type(exc).__name__.lower()
+    if "catalogjobnotfound" in name or "activationjobnotfound" in name:
+        return AdminRouteError(
+            404,
+            "activation_job_not_found",
+            "activation job was not found",
+        )
+    if isinstance(exc, RevisionConflictError) or "revisionconflict" in name:
+        return AdminRouteError(409, "revision_conflict", "instrument catalog changed concurrently")
+    if provider and (getattr(exc, "status", None) == 429 or "ratelimit" in name):
+        raw_retry_after = getattr(exc, "retry_after", None)
+        retry_after = (
+            raw_retry_after if isinstance(raw_retry_after, int) and raw_retry_after > 0 else None
+        )
+        return AdminRouteError(
+            429,
+            "provider_rate_limited",
+            "provider search rate limit exceeded",
+            retry_after=retry_after,
+        )
+    if isinstance(exc, LookupError) or "notfound" in name or "unknowninstrument" in name:
+        code = "provider_not_found" if provider else "instrument_not_found"
+        message = "provider was not found" if provider else "instrument was not found"
+        return AdminRouteError(404, code, message)
+    if "busy" in name or "inprogress" in name or "alreadyrunning" in name:
+        return AdminRouteError(
+            409, "activation_in_progress", "an activation job is already running"
+        )
+    if "catalogruntime" in name:
+        return AdminRouteError(
+            409,
+            "invalid_catalog_state",
+            "instrument catalog is not in a valid state for this operation",
+        )
+    if (
+        isinstance(exc, ManagedConfigurationError | ValueError)
+        or "validation" in name
+        or "routecompile" in name
+    ):
+        code = "invalid_provider_request" if provider else "invalid_instrument_catalog"
+        message = "provider request is invalid" if provider else "instrument catalog is invalid"
+        return AdminRouteError(422, code, message)
+    _LOGGER.error("Administrator catalog operation failed error_type=%s", type(exc).__name__)
+    code = "provider_catalog_unavailable" if provider else "instrument_catalog_unavailable"
+    message = "provider catalog is unavailable" if provider else "instrument catalog is unavailable"
+    return AdminRouteError(503, code, message)
+
+
+async def _audit_catalog_failure(
+    audit: Any,
+    request: Request,
+    *,
+    action: str,
+    target_type: str,
+    target_id: str | None,
+) -> None:
+    await audit(
+        request,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        fields=["error_type"],
+    )
+
+
+async def _provider_catalog_snapshot(service: Any) -> Any:
+    if callable(getattr(service, "provider_catalog_snapshot", None)):
+        return await _invoke_catalog_hook(service, ("provider_catalog_snapshot",))
+    try:
+        from .providers.descriptors import provider_catalog_snapshot
+    except ImportError as exc:
+        raise AdminRouteError(
+            503, "provider_catalog_unavailable", "provider catalog is unavailable"
+        ) from exc
+    return provider_catalog_snapshot(getattr(service, "settings", None))
+
+
+def _provider_catalog_response(value: Any) -> dict[str, Any]:
+    converted = _safe_admin_value(value)
+    if isinstance(converted, list):
+        return {
+            "providers": converted,
+            "fixed_endpoints_only": True,
+            "custom_providers_allowed": False,
+        }
+    if isinstance(converted, dict):
+        converted.setdefault("fixed_endpoints_only", True)
+        converted.setdefault("custom_providers_allowed", False)
+        return converted
+    raise AdminRouteError(
+        503,
+        "provider_catalog_unavailable",
+        "provider catalog returned an invalid response",
+    )
+
+
+async def _search_provider_catalog(
+    service: Any,
+    *,
+    provider: str,
+    query: str,
+    asset_class: str | None,
+    limit: int,
+) -> Any:
+    try:
+        from .providers.descriptors import get_provider_descriptor
+
+        get_provider_descriptor(provider)
+    except ImportError as exc:
+        raise AdminRouteError(
+            503, "provider_catalog_unavailable", "provider catalog is unavailable"
+        ) from exc
+    except ValueError as exc:
+        raise AdminRouteError(404, "provider_not_found", "provider was not found") from exc
+    if callable(getattr(service, "search_provider_symbols", None)):
+        return await _invoke_catalog_hook(
+            service,
+            ("search_provider_symbols",),
+            provider=provider,
+            query=query,
+            asset_class=asset_class,
+            limit=limit,
+        )
+    try:
+        from .providers.descriptors import (
+            search_provider_symbols,
+        )
+    except ImportError as exc:
+        raise AdminRouteError(
+            503, "provider_catalog_unavailable", "provider catalog is unavailable"
+        ) from exc
+    return await search_provider_symbols(
+        getattr(service, "settings", None),
+        provider,
+        query,
+        asset_class=asset_class,
+        limit=limit,
+    )
 
 
 async def _patch_store(

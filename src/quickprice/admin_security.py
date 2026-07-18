@@ -286,6 +286,33 @@ class AdminSecurity:
         if mutation and sec_fetch_site is not None and sec_fetch_site.lower() != "same-origin":
             raise AdminAuthorizationError("cross-site administrator request rejected")
 
+    def validate_same_origin_action(
+        self,
+        *,
+        origin: str | None,
+        sec_fetch_site: str | None,
+        effective_scheme: str,
+    ) -> None:
+        """Validate a browser action whose HTTP method is otherwise read-only.
+
+        Provider symbol discovery uses GET for a stable administrative API
+        contract, but it can consume upstream quota. Require both the session
+        CSRF token (in :meth:`authorize`) and an unforgeable browser same-origin
+        signal before allowing that request to reach a provider.
+        """
+
+        self._require_configured()
+        if self.require_https and effective_scheme.lower() != "https":
+            raise AdminAuthorizationError("administrator HTTPS is required")
+        if origin is not None and origin != self._expected_origin:
+            raise AdminAuthorizationError("administrator origin is invalid")
+        if sec_fetch_site is not None and sec_fetch_site.lower() != "same-origin":
+            raise AdminAuthorizationError("cross-site administrator request rejected")
+        if origin != self._expected_origin and (
+            sec_fetch_site is None or sec_fetch_site.lower() != "same-origin"
+        ):
+            raise AdminAuthorizationError("administrator same-origin signal is missing")
+
     def throttle_browser_request(self, client_ip: str) -> None:
         """Bound every admin API request, including requests rejected during parsing."""
 

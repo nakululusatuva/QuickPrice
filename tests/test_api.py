@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import UTC
 
 import pytest
@@ -16,7 +18,7 @@ from quickprice.domain import (
     YieldRateType,
 )
 from quickprice.plugin_api import AssetClass, InstrumentPlugin, InstrumentSpec
-from quickprice.registry import InstrumentRegistry
+from quickprice.registry import InstrumentRegistry, build_registry
 from quickprice.service import QuickPriceService
 from tests.helpers import NOW, seed_complete
 
@@ -35,6 +37,79 @@ def test_unknown_single_symbol_is_404(client, auth_headers):
     response = client.get("/v1/quotes/NOPE:USD", headers=auth_headers)
     assert response.status_code == 404
     assert response.json()["errors"][0]["code"] == "unknown_symbol"
+
+
+def test_public_routes_follow_one_atomically_activated_generation(client, auth_headers):
+    service = client.app.state.service
+    bitcoin = service.registry["BTC:USDC"]
+    replacement = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="runtime-api-fixture",
+                version="1",
+                instruments=(bitcoin,),
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+
+    service._activate_runtime_generation(replacement, revision="a" * 64)
+
+    instruments = client.get("/v1/instruments", headers=auth_headers)
+    quotes = client.get("/v1/quotes", headers=auth_headers)
+    archived = client.get("/v1/quotes/ETH:USDC", headers=auth_headers)
+    assert [item["symbol"] for item in instruments.json()["data"]] == ["BTC:USDC"]
+    assert [item["symbol"] for item in quotes.json()["data"]] == ["BTC:USDC"]
+    assert instruments.headers["X-QuickPrice-Catalog-Revision"] == "a" * 64
+    assert quotes.headers["X-QuickPrice-Catalog-Revision"] == "a" * 64
+    assert archived.status_code == 404
+    assert client.app.state.registry.symbols == ("BTC:USDC",)
+
+
+def test_instrument_catalog_uses_the_active_generation_as_a_conditional_validator(
+    client,
+    auth_headers,
+):
+    initial = client.get("/v1/instruments", headers=auth_headers)
+    assert initial.status_code == 200
+    assert initial.headers["ETag"] == f'"{client.app.state.service.capture_generation().revision}"'
+    assert initial.headers["Cache-Control"] == "private, no-cache, max-age=0"
+
+    unchanged = client.get(
+        "/v1/instruments",
+        headers={**auth_headers, "If-None-Match": initial.headers["ETag"]},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+    assert unchanged.headers["ETag"] == initial.headers["ETag"]
+
+    weak = client.get(
+        "/v1/instruments",
+        headers={**auth_headers, "If-None-Match": f"W/{initial.headers['ETag']}"},
+    )
+    assert weak.status_code == 304
+
+    service = client.app.state.service
+    bitcoin = service.registry["BTC:USDC"]
+    replacement = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="conditional-catalog-fixture",
+                version="1",
+                instruments=(bitcoin,),
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    service._activate_runtime_generation(replacement, revision="b" * 64)
+
+    changed = client.get(
+        "/v1/instruments",
+        headers={**auth_headers, "If-None-Match": initial.headers["ETag"]},
+    )
+    assert changed.status_code == 200
+    assert changed.headers["ETag"] == f'"{"b" * 64}"'
+    assert [item["symbol"] for item in changed.json()["data"]] == ["BTC:USDC"]
 
 
 def test_framework_404_and_405_also_use_the_standard_envelope(client, auth_headers):
@@ -298,6 +373,46 @@ def test_batch_quotes_defaults_to_all_and_limits_explicit_unique_items(client, a
     response = client.get(f"/v1/quotes?symbols={too_many}", headers=auth_headers)
     assert response.status_code == 422
     assert "more than 100" in response.json()["errors"][0]["message"]
+
+
+def test_all_disabled_v1_catalog_has_an_empty_successful_default_batch(
+    settings,
+    auth_headers,
+    tmp_path,
+) -> None:
+    installed = build_registry()
+    policy_path = tmp_path / "all-disabled.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "disabled_symbols": list(installed.symbols),
+                "overrides": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    empty_settings = replace(settings, managed_instruments_path=policy_path)
+
+    with TestClient(create_app(empty_settings)) as empty_client:
+        instruments = empty_client.get("/v1/instruments", headers=auth_headers)
+        quotes = empty_client.get("/v1/quotes", headers=auth_headers)
+        explicit_unknown = empty_client.get(
+            "/v1/quotes?symbols=BTC:USDC",
+            headers=auth_headers,
+        )
+        readiness = empty_client.get("/internal/readiness", headers=auth_headers)
+
+    assert instruments.status_code == 200
+    assert instruments.json()["data"] == []
+    assert quotes.status_code == 200
+    assert quotes.json()["data"] == []
+    assert quotes.json()["errors"] == []
+    assert quotes.json()["partial"] is False
+    assert explicit_unknown.status_code == 400
+    assert readiness.json()["data"]["ready"] is True
+    assert readiness.json()["data"]["active_instrument_count"] == 0
+    assert readiness.json()["data"]["intentionally_empty_catalog"] is True
 
 
 def test_batch_accepts_one_hundred_plugin_instruments(settings, auth_headers) -> None:

@@ -102,3 +102,25 @@ def test_daily_and_five_minute_rings_use_independent_retention_windows() -> None
     sizes = cache.sizes()["TEST:USD"]
     assert sizes == {"1m": 0, "5m": 1, "1d": 2}
     assert min(point.timestamp for point in cache.points("TEST:USD")) == now - timedelta(days=399)
+
+
+def test_global_prune_expires_archived_symbol_without_new_observations() -> None:
+    cache = HistoryCache()
+    archived_at = datetime(2026, 1, 1, tzinfo=UTC)
+    cache.load(
+        [
+            PricePoint("ARCHIVED:USD", archived_at, Decimal("1"), "fixture", interval="1m"),
+            PricePoint("ARCHIVED:USD", archived_at, Decimal("1"), "fixture", interval="5m"),
+            PricePoint("ARCHIVED:USD", archived_at, Decimal("1"), "fixture", interval="1d"),
+        ]
+    )
+
+    assert cache.prune(archived_at + timedelta(hours=49)) == 1
+    assert cache.sizes()["ARCHIVED:USD"] == {"1m": 0, "5m": 1, "1d": 1}
+
+    assert cache.prune(archived_at + timedelta(days=46)) == 1
+    assert cache.sizes()["ARCHIVED:USD"] == {"1m": 0, "5m": 0, "1d": 1}
+
+    assert cache.prune(archived_at + timedelta(days=401)) == 1
+    assert "ARCHIVED:USD" not in cache.sizes()
+    assert cache.points("ARCHIVED:USD") == ()

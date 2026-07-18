@@ -118,6 +118,29 @@ def test_admin_browser_boundary_requires_exact_origin_https_and_same_origin_fetc
                 mutation=True,
             )
 
+    security.validate_same_origin_action(
+        origin=None,
+        sec_fetch_site="same-origin",
+        effective_scheme="https",
+    )
+    security.validate_same_origin_action(
+        origin="https://quickprice.example",
+        sec_fetch_site=None,
+        effective_scheme="https",
+    )
+    for origin, fetch_site, scheme in (
+        (None, None, "https"),
+        (None, "same-site", "https"),
+        ("https://evil.quickprice.example", "same-origin", "https"),
+        ("https://quickprice.example", "same-origin", "http"),
+    ):
+        with pytest.raises(AdminAuthorizationError):
+            security.validate_same_origin_action(
+                origin=origin,
+                sec_fetch_site=fetch_site,
+                effective_scheme=scheme,
+            )
+
 
 def test_forwarded_client_ip_requires_an_explicit_trusted_proxy() -> None:
     assert resolve_client_ip("127.0.0.1", "203.0.113.9") == "127.0.0.1"
