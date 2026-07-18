@@ -19,6 +19,7 @@ const state = {
   instruments: [],
   quotes: new Map(),
   quoteErrors: new Map(),
+  expandedSymbols: new Set(),
   sortField: "symbol",
   ascending: true,
   refreshing: false,
@@ -208,6 +209,17 @@ function rows() {
   }));
 }
 
+function instrumentExpansion(symbol) {
+  const expanded = state.expandedSymbols.has(symbol);
+  return { expanded, buttonText: expanded ? "Close" : "Inspect" };
+}
+
+function setInstrumentExpanded(symbol, expanded) {
+  if (expanded) state.expandedSymbols.add(symbol);
+  else state.expandedSymbols.delete(symbol);
+  return instrumentExpansion(symbol);
+}
+
 function sortValue(item) {
   const quote = item.quote;
   const values = {
@@ -339,6 +351,7 @@ function renderMarket() {
   const items = visibleRows();
   const fragment = document.createDocumentFragment();
   for (const item of items) {
+    const expansion = instrumentExpansion(item.instrument.symbol);
     const row = document.createElement("tr");
     row.className = "market-row";
     const instrumentCell = document.createElement("td");
@@ -370,22 +383,23 @@ function renderMarket() {
     );
     row.append(sourceCell);
     const actionCell = document.createElement("td");
-    const inspect = textNode("button", "Inspect", "inspect-button");
+    const inspect = textNode("button", expansion.buttonText, "inspect-button");
     inspect.type = "button";
-    inspect.setAttribute("aria-expanded", "false");
+    inspect.setAttribute("aria-expanded", String(expansion.expanded));
     actionCell.append(inspect);
     row.append(actionCell);
 
     const detail = document.createElement("tr");
     detail.className = "detail-row";
     detail.id = `instrument-detail-${item.instrument.symbol.replace(/[^A-Z0-9]/gi, "-")}`;
-    detail.hidden = true;
+    detail.hidden = !expansion.expanded;
     detail.append(buildDetails(item));
     inspect.setAttribute("aria-controls", detail.id);
     inspect.addEventListener("click", () => {
-      detail.hidden = !detail.hidden;
-      inspect.textContent = detail.hidden ? "Inspect" : "Close";
-      inspect.setAttribute("aria-expanded", String(!detail.hidden));
+      const next = setInstrumentExpanded(item.instrument.symbol, detail.hidden);
+      detail.hidden = !next.expanded;
+      inspect.textContent = next.buttonText;
+      inspect.setAttribute("aria-expanded", String(next.expanded));
     });
     fragment.append(row, detail);
   }
@@ -498,6 +512,7 @@ function clearDashboardData() {
   state.instruments = [];
   state.quotes.clear();
   state.quoteErrors.clear();
+  state.expandedSymbols.clear();
   state.logs = [];
   state.logCursor = null;
   state.logsWhilePaused = 0;

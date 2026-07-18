@@ -68,6 +68,9 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert '"X-API-Key"' in javascript.text
     assert 'headers["Last-Event-ID"]' in javascript.text
     assert "chunks(symbols, 100)" in javascript.text
+    assert "expandedSymbols: new Set()" in javascript.text
+    assert "state.expandedSymbols.clear()" in javascript.text
+    assert 'inspect.setAttribute("aria-expanded", String(expansion.expanded))' in javascript.text
     assert "FIXTURE_SOURCE_PATTERN" in javascript.text
     assert "isFixtureSource(quote.source)" in javascript.text
     assert "updateFixtureWarning();" in javascript.text
@@ -289,6 +292,43 @@ for (const [source, expected] of cases) {
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-e", classifier + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_instrument_expansion_persists_independently_by_symbol() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function instrumentExpansion") : source.index("\n\nfunction sortValue")
+    ]
+    assertions = """
+const state = { expandedSymbols: new Set() };
+function assertExpansion(symbol, expanded, buttonText) {
+  const actual = instrumentExpansion(symbol);
+  if (actual.expanded !== expanded || actual.buttonText !== buttonText) process.exit(1);
+}
+assertExpansion("BTC:USDC", false, "Inspect");
+setInstrumentExpanded("BTC:USDC", true);
+setInstrumentExpanded("ETH:USDC", true);
+assertExpansion("BTC:USDC", true, "Close");
+assertExpansion("ETH:USDC", true, "Close");
+for (const symbol of ["ETH:USDC", "BTC:USDC"]) assertExpansion(symbol, true, "Close");
+setInstrumentExpanded("BTC:USDC", false);
+assertExpansion("BTC:USDC", false, "Inspect");
+assertExpansion("ETH:USDC", true, "Close");
+state.expandedSymbols.clear();
+assertExpansion("ETH:USDC", false, "Inspect");
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helpers + assertions],
         check=False,
         capture_output=True,
         text=True,
