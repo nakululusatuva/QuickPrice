@@ -266,8 +266,10 @@ The default route families are:
   Binance synthetic routes for history.
 - stETH and wstETH: CoinGecko price normalization, Lido protocol yield, then
   the declared 30-day market-ratio yield fallback.
-- Common stocks and ETFs: Alpaca IEX, Twelve Data, then Alpha Vantage end-of-day
-  data.
+- Common-stock and ETF quotes: Alpaca IEX, Finnhub, Twelve Data, then Alpha
+  Vantage end-of-day data. History remains Alpaca, Twelve Data, then Alpha
+  Vantage because [Finnhub's free plan](https://finnhub.io/pricing) does not
+  include OHLC history.
 - FX: quota-bounded USD hub quotes and histories, with reciprocal and cross
   rates derived from common timestamped components.
 - Dividend-paying common stocks, QQQM, and SGOV income: classified corporate
@@ -277,6 +279,19 @@ The default route families are:
 Synthetic responses expose every component timestamp. Components that exceed
 their configured age or skew limits are rejected. Free IEX is a single venue,
 so responses preserve `feed=iex` and `coverage=single_venue`.
+
+Finnhub is deliberately quote-only. When it is the first configured listed-
+security provider, QuickPrice uses Finnhub's WebSocket feed for up to 50
+symbols. REST fallback uses `X-Finnhub-Token` header authentication, a durable
+60-call-per-minute gate, a 29-call-per-second sliding-window burst gate, a
+catalog-scaled polling floor, and a short negative cache. Recent stream trades
+suppress REST polling, and closed-market REST checks run no more than every 15
+minutes. Quotes without a positive vendor timestamp fail closed instead of
+being assigned a synthetic receipt time. Finnhub does not document whether its
+US real-time quote is SIP, single-venue, or aggregated, so responses use
+`coverage=us_realtime_unspecified` rather than making a stronger claim. See the
+[Finnhub API documentation](https://finnhub.io/docs/api) and
+[rate-limit policy](https://finnhub.io/docs/api/rate-limit).
 
 With the default 9,000-credit monthly CoinGecko budget and healthy primary spot
 providers, stETH and wstETH drive one all-symbol quote batch on a 660-second
@@ -450,6 +465,8 @@ connections, task counts, SQLite queues, database size, and WAL size.
 - Provider key files must be readable only by the QuickPrice service identity.
 - The public reverse proxy must not inherit application or provider settings.
 - Alpaca free IEX data is personal, single-venue data rather than SIP data.
+- Finnhub free data is used only for personal, internal display; its coverage
+  remains explicitly unspecified and its data is not redistributed.
 - Provider data must not be redistributed without the required license.
 - Fund issuer pages are not scraped; BOXX uses the documented FRED proxy.
 - Binance fallback credentials must have no trading or withdrawal permission.

@@ -102,8 +102,8 @@ Daily:
 
 1. Request the configured workbook symbols and inspect `partial`, `errors`,
    `quality`, and `fallback_level`.
-2. Check Twelve Data, Alpha Vantage, CoinGecko, Ethereum RPC, and Binance
-   staking route metrics.
+2. Check Finnhub, Twelve Data, Alpha Vantage, CoinGecko, Ethereum RPC, and
+   Binance staking route metrics.
 3. Review 401, 429, 5xx, circuit-breaker, and WebSocket reconnect counts.
 4. Check free disk space and journal growth.
 
@@ -246,6 +246,11 @@ market proxy rather than a protocol-reported rate.
 - Do not rotate keys to bypass a free plan.
 - Twelve Data protects 769 of its 790 daily credits for FX: 744 hub quotes plus
   25 cold-start history pages. The remaining 21 credits fund listed-security fallback.
+- Finnhub enforces a durable 60-call-per-minute local gate. Listed-security
+  polling scales with the catalog and successful or expected-failure responses
+  are cached briefly; do not lower the cadence below the calculated floor. A
+  separate 29-call-per-second sliding gate protects cold starts, recent stream
+  trades suppress REST polling, and closed-market checks use a 15-minute floor.
 - Alpha FX uses a six-hour emergency cadence.
 - CoinGecko uses one all-symbol request no more than every five minutes.
 - Binance staking fallback uses only a read-only USER_DATA key.
