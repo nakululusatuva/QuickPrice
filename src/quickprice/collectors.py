@@ -462,6 +462,24 @@ class MarketDataCoordinator:
                 and any(provider == "alpha_vantage" for provider, _ in exc.attempts)
             ):
                 next_interval = max(next_interval, 6 * 60 * 60)
+            if isinstance(exc, AllProvidersFailed):
+                attempted_providers = {provider for provider, _ in exc.attempts}
+                retry_hints = tuple(
+                    float(delay)
+                    for provider in chain
+                    if str(getattr(provider, "name", provider.__class__.__name__))
+                    in attempted_providers
+                    and callable(
+                        retry_after := getattr(
+                            provider,
+                            "quote_failure_retry_after_seconds",
+                            None,
+                        )
+                    )
+                    and (delay := retry_after()) is not None
+                )
+                if retry_hints:
+                    next_interval = min(next_interval, max(0.25, min(retry_hints)))
             self._mark_source_failed(symbol)
             self._record_error(f"quote:{symbol}", exc)
         return next_interval

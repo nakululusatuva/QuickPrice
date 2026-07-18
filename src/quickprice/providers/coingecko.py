@@ -77,6 +77,7 @@ class CoinGeckoProvider(HttpProvider):
         *,
         coin_ids: Mapping[str, str] | None = None,
         cache_ttl_seconds: float = 300.0,
+        maximum_error_cache_ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         **kwargs,
     ):
@@ -87,11 +88,16 @@ class CoinGeckoProvider(HttpProvider):
             key.strip().upper(): value for key, value in (coin_ids or type(self).coin_ids).items()
         }
         self._cache_ttl_seconds = max(1.0, cache_ttl_seconds)
+        self._maximum_error_cache_ttl_seconds = max(
+            self._cache_ttl_seconds,
+            maximum_error_cache_ttl_seconds,
+        )
         self._clock = clock
         self._refresh_lock = asyncio.Lock()
         self._price_cache: Mapping[str, object] | None = None
         self._cache_expires_at = 0.0
         self._refresh_error: str | None = None
+        self._consecutive_refresh_failures = 0
         self._daily_snapshot_cache = AsyncTtlCache[tuple[str, str], Decimal](clock=clock)
 
     @property
@@ -104,6 +110,13 @@ class CoinGeckoProvider(HttpProvider):
             return self.coin_ids[normalized]
         except KeyError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}") from exc
+
+    def quote_failure_retry_after_seconds(self) -> float | None:
+        """Return the remaining shared negative-cache delay, when active."""
+
+        if self._price_cache is not None or self._refresh_error is None:
+            return None
+        return max(0.0, self._cache_expires_at - self._clock())
 
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
@@ -165,10 +178,10 @@ class CoinGeckoProvider(HttpProvider):
         if now < self._cache_expires_at:
             if self._price_cache is not None:
                 return self._price_cache
-            raise ProviderUnavailable(
-                self.name,
-                self._refresh_error or "simple-price refresh is in backoff",
-            )
+            if self._refresh_error is not None:
+                raise ProviderUnavailable(self.name, self._refresh_error)
+            # A refresh is in flight. Wait for its lock instead of treating
+            # every concurrent symbol in the shared batch as a failed poll.
 
         async with self._refresh_lock:
             now = self._clock()
@@ -184,6 +197,7 @@ class CoinGeckoProvider(HttpProvider):
             # so concurrent symbol requests cannot consume one credit each.
             self._cache_expires_at = now + self._cache_ttl_seconds
             self._price_cache = None
+            self._refresh_error = None
             ids = sorted({*self.coin_ids.values(), "usd-coin"})
             try:
                 payload = await self._request_json(
@@ -198,10 +212,18 @@ class CoinGeckoProvider(HttpProvider):
                 )
                 document = require_mapping(payload, self.name)
             except Exception as exc:
+                self._consecutive_refresh_failures += 1
+                exponent = min(self._consecutive_refresh_failures - 1, 10)
+                error_ttl = min(
+                    self._maximum_error_cache_ttl_seconds,
+                    self._cache_ttl_seconds * (2**exponent),
+                )
+                self._cache_expires_at = self._clock() + error_ttl
                 self._refresh_error = str(exc) or type(exc).__name__
                 raise
             self._price_cache = document
             self._refresh_error = None
+            self._consecutive_refresh_failures = 0
             return document
 
     async def get_history(

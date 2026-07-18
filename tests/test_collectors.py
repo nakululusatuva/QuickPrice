@@ -1547,6 +1547,29 @@ async def test_all_failed_fx_quote_keeps_normal_primary_probe_cadence(
 
 
 @pytest.mark.asyncio
+async def test_coingecko_negative_cache_retries_slow_staking_quote_at_expiry() -> None:
+    monotonic = [100.0]
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False, coingecko_api_key="coingecko-key"),
+    )
+    provider = coordinator.graph.providers["coingecko"]
+    provider._clock = lambda: monotonic[0]
+    provider._request_json = AsyncMock(
+        side_effect=ProviderUnavailable("coingecko", "temporary outage")
+    )
+    try:
+        next_interval = await coordinator._poll_quote_once("WSTETH:USDC")
+    finally:
+        await coordinator.graph.close()
+
+    assert coordinator.registry["WSTETH:USDC"].quote_poll_seconds == 660
+    assert next_interval == provider._cache_ttl_seconds == 300
+    assert provider._request_json.await_count == 1
+    assert "simple-price refresh" not in coordinator._last_errors["quote:WSTETH:USDC"]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_fresh_alpaca_stream_observation_suppresses_rest_poll(monkeypatch) -> None:
     import quickprice.collectors as collectors
 

@@ -333,7 +333,12 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "usd-coin": {"usd": 1, "last_updated_at": timestamp},
     }
     provider = CoinGeckoProvider("key", clock=lambda: 10.0)
-    provider._request_json = AsyncMock(return_value=payload)
+
+    async def request_json(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return payload
+
+    provider._request_json = AsyncMock(side_effect=request_json)
 
     results = await asyncio.gather(
         provider.get_quote("BTC:USDC"),
@@ -369,6 +374,50 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "wrapped-steth",
         "usd-coin",
     }
+
+
+@pytest.mark.asyncio
+async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_failures():
+    monotonic = [0.0]
+    timestamp = 1_768_000_000
+    provider = CoinGeckoProvider(
+        "key",
+        cache_ttl_seconds=300,
+        maximum_error_cache_ttl_seconds=3600,
+        clock=lambda: monotonic[0],
+    )
+    provider._request_json = AsyncMock(
+        side_effect=[
+            ProviderUnavailable("coingecko", "first failure"),
+            ProviderUnavailable("coingecko", "second failure"),
+            {
+                "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
+                "usd-coin": {"usd": 1, "last_updated_at": timestamp},
+            },
+        ]
+    )
+
+    with pytest.raises(ProviderUnavailable, match="first failure"):
+        await provider.get_quote("WSTETH:USDC")
+    assert provider.quote_failure_retry_after_seconds() == 300
+
+    monotonic[0] = 299
+    with pytest.raises(ProviderUnavailable, match="first failure"):
+        await provider.get_quote("WSTETH:USDC")
+    assert provider._request_json.await_count == 1
+    assert provider.quote_failure_retry_after_seconds() == 1
+
+    monotonic[0] = 300
+    with pytest.raises(ProviderUnavailable, match="second failure"):
+        await provider.get_quote("WSTETH:USDC")
+    assert provider._request_json.await_count == 2
+    assert provider.quote_failure_retry_after_seconds() == 600
+
+    monotonic[0] = 900
+    result = await provider.get_quote("WSTETH:USDC")
+    assert result.price == Decimal("4800")
+    assert provider._request_json.await_count == 3
+    assert provider.quote_failure_retry_after_seconds() is None
 
 
 @pytest.mark.asyncio
