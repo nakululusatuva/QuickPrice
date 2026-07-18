@@ -21,6 +21,7 @@ class BinanceProvider(HttpProvider):
     symbols: ClassVar[dict[str, str]] = {
         "BTC:USDC": "BTCUSDC",
         "ETH:USDC": "ETHUSDC",
+        "SOL:USDC": "SOLUSDC",
         "WBETH:ETH": "WBETHETH",
         "WBETH:USDT": "WBETHUSDT",
         "USDC:USDT": "USDCUSDT",

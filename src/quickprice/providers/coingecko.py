@@ -27,6 +27,8 @@ class CoinGeckoProvider(HttpProvider):
     coin_ids: ClassVar[dict[str, str]] = {
         "BTC:USDC": "bitcoin",
         "ETH:USDC": "ethereum",
+        "SOL:USDC": "solana",
+        "XMR:USDC": "monero",
         "WBETH:USDC": "wrapped-beacon-eth",
         "STETH:USDC": "staked-ether",
         "WSTETH:USDC": "wrapped-steth",

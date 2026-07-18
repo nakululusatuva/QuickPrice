@@ -5,7 +5,13 @@ from decimal import Decimal
 
 import pytest
 
-from quickprice.analytics import boxx_yield, calculate_changes, qqqm_dividend, sgov_yield
+from quickprice.analytics import (
+    boxx_yield,
+    calculate_changes,
+    qqqm_dividend,
+    quarterly_dividend,
+    sgov_yield,
+)
 from quickprice.domain import DividendEvent, PricePoint, ProviderQuote, YieldMetric
 
 UTC = UTC
@@ -82,6 +88,7 @@ def test_qqqm_and_sgov_annualization_rules():
     )
     qqqm = qqqm_dividend(event, Decimal("100"))
     assert qqqm.yield_percent == Decimal("2.00")
+    assert quarterly_dividend(event, Decimal("100")) == qqqm
 
     sgov_event = DividendEvent(
         "SGOV:USD",

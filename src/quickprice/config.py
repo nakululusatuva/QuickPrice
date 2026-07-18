@@ -124,7 +124,7 @@ class Settings:
     metadata_poll_seconds: float = 21600.0
     history_poll_seconds: float = 3600.0
     twelve_daily_credits: int = 790
-    twelve_fx_reserve_credits: int = 20
+    twelve_fx_reserve_credits: int = 769
     alpha_vantage_daily_credits: int = 25
     coingecko_monthly_credits: int = 9000
     high_frequency_publish_ms: int = 250
@@ -189,7 +189,7 @@ class Settings:
             metadata_poll_seconds=_float("QUICKPRICE_METADATA_POLL_SECONDS", 21600, minimum=300),
             history_poll_seconds=_float("QUICKPRICE_HISTORY_POLL_SECONDS", 3600, minimum=60),
             twelve_daily_credits=_int("QUICKPRICE_TWELVE_DAILY_CREDITS", 790, minimum=1),
-            twelve_fx_reserve_credits=_int("QUICKPRICE_TWELVE_FX_RESERVE_CREDITS", 20, minimum=0),
+            twelve_fx_reserve_credits=_int("QUICKPRICE_TWELVE_FX_RESERVE_CREDITS", 769, minimum=0),
             alpha_vantage_daily_credits=_int(
                 "QUICKPRICE_ALPHA_VANTAGE_DAILY_CREDITS", 25, minimum=1
             ),

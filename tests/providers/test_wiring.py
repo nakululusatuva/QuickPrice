@@ -147,6 +147,33 @@ async def test_provider_graph_wires_fx_cache_cadences_and_alpaca_clock_url() -> 
         await graph.close()
 
 
+@pytest.mark.asyncio
+async def test_default_twelve_quota_reserves_fx_budget() -> None:
+    graph = build_provider_graph(
+        Settings(
+            require_free_threaded=False,
+            background_enabled=False,
+            twelve_data_api_key="twelve-key",
+        )
+    )
+    try:
+        quota = graph.providers["twelve_data"].quota
+        snapshot = await quota.snapshot()
+        assert snapshot.limit == 790
+        assert quota.reserve == 769
+
+        assert await quota.acquire(21)
+        assert not await quota.acquire()
+        assert await quota.acquire(769, allow_reserve=True)
+        assert not await quota.acquire(allow_reserve=True)
+
+        exhausted = await quota.snapshot()
+        assert exhausted.used == 790
+        assert exhausted.remaining == 0
+    finally:
+        await graph.close()
+
+
 def test_strict_graph_validation_reports_missing_public_capabilities() -> None:
     registry = InstrumentRegistry(
         (

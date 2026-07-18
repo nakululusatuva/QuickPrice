@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, ClassVar
 
+from quickprice.equities import LISTED_TICKERS
 from quickprice.fx import FX_HUB_SYMBOLS
 
 from ._models import decimal_value, point, quote, utc_datetime
@@ -28,9 +29,7 @@ class TwelveDataProvider(HttpProvider):
     base_url = "https://api.twelvedata.com"
     feed = "twelve_data_rest"
     symbols: ClassVar[dict[str, str]] = {
-        "QQQM:USD": "QQQM",
-        "BOXX:USD": "BOXX",
-        "SGOV:USD": "SGOV",
+        **LISTED_TICKERS,
         **{symbol: symbol.replace(":", "/") for symbol in FX_HUB_SYMBOLS},
     }
     fx_quote_ttl_floors_seconds: ClassVar[Mapping[str, float]] = MappingProxyType(

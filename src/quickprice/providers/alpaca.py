@@ -10,6 +10,8 @@ from typing import Any, ClassVar
 
 import aiohttp
 
+from quickprice.equities import DIVIDEND_FREQUENCIES, LISTED_TICKERS
+
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
 from .base import (
     HttpProvider,
@@ -28,16 +30,9 @@ class AlpacaProvider(HttpProvider):
     trading_base_url = "https://paper-api.alpaca.markets/v2"
     websocket_url = "wss://stream.data.alpaca.markets/v2/iex"
     feed = "iex"
-    symbols: ClassVar[dict[str, str]] = {
-        "QQQM:USD": "QQQM",
-        "BOXX:USD": "BOXX",
-        "SGOV:USD": "SGOV",
-    }
+    symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
     _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
-    _frequencies: ClassVar[dict[str, str]] = {
-        "QQQM:USD": "quarterly",
-        "SGOV:USD": "monthly",
-    }
+    _frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1Min",
         "5m": "5Min",

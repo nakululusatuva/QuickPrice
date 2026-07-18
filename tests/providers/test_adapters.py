@@ -46,6 +46,29 @@ async def test_binance_quote_and_unadjusted_kline_contract(fixture_json):
 
 
 @pytest.mark.asyncio
+async def test_binance_sol_quote_and_history_use_the_solusdc_market(fixture_json):
+    provider = BinanceProvider()
+    provider._request_json = AsyncMock(
+        side_effect=[fixture_json("binance_quote.json"), fixture_json("binance_history.json")]
+    )
+
+    latest = await provider.get_quote("SOL:USDC")
+    points = await provider.get_history(
+        "SOL:USDC",
+        interval="5m",
+        start=datetime(2026, 7, 20, tzinfo=UTC),
+        end=datetime(2026, 7, 21, tzinfo=UTC),
+    )
+
+    assert latest.symbol == "SOL:USDC"
+    assert all(point.symbol == "SOL:USDC" for point in points)
+    assert provider._request_json.await_args_list[0].kwargs["params"]["symbol"] == "SOLUSDC"
+    assert provider._request_json.await_args_list[1].kwargs["params"]["symbol"] == "SOLUSDC"
+    with pytest.raises(UnsupportedInstrument):
+        await provider.get_quote("XMR:USDC")
+
+
+@pytest.mark.asyncio
 async def test_kraken_trade_contract(fixture_json):
     provider = KrakenProvider()
     provider._request_json = AsyncMock(return_value=fixture_json("kraken_quote.json"))
@@ -55,6 +78,40 @@ async def test_kraken_trade_contract(fixture_json):
     assert result.provider == "kraken"
     assert result.price == Decimal("118249.90")
     assert result.as_of.tzinfo is UTC
+
+
+@pytest.mark.asyncio
+async def test_kraken_sol_and_xmr_use_canonical_rest_pairs(fixture_json):
+    provider = KrakenProvider()
+    timestamp = int(datetime(2026, 7, 20, 1, tzinfo=UTC).timestamp())
+    provider._request_json = AsyncMock(
+        side_effect=[
+            fixture_json("kraken_quote.json"),
+            {
+                "error": [],
+                "result": {
+                    "SOLUSDC": [[timestamp, "180", "181", "179", "180.5", "180.2", "10", 5]],
+                    "last": timestamp,
+                },
+            },
+        ]
+    )
+
+    latest = await provider.get_quote("XMR:USDC")
+    points = await provider.get_history(
+        "SOL:USDC",
+        interval="5m",
+        start=datetime(2026, 7, 20, tzinfo=UTC),
+        end=datetime(2026, 7, 21, tzinfo=UTC),
+    )
+
+    assert latest.symbol == "XMR:USDC"
+    assert points[0].symbol == "SOL:USDC"
+    assert points[0].price == Decimal("180.5")
+    assert provider._request_json.await_args_list[0].kwargs["params"]["pair"] == "XMRUSDC"
+    assert provider._request_json.await_args_list[1].kwargs["params"]["pair"] == "SOLUSDC"
+    assert provider.symbols["SOL:USDC"][1] == "SOL/USDC"
+    assert provider.symbols["XMR:USDC"][1] == "XMR/USDC"
 
 
 @pytest.mark.asyncio
@@ -103,6 +160,8 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
     payload = {
         "bitcoin": {"usd": 100_000, "last_updated_at": timestamp},
         "ethereum": {"usd": 4_000, "last_updated_at": timestamp},
+        "solana": {"usd": 180, "last_updated_at": timestamp},
+        "monero": {"usd": 325, "last_updated_at": timestamp},
         "wrapped-beacon-eth": {"usd": 4_500, "last_updated_at": timestamp},
         "staked-ether": {"usd": 3_990, "last_updated_at": timestamp},
         "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
@@ -114,17 +173,23 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
     results = await asyncio.gather(
         provider.get_quote("BTC:USDC"),
         provider.get_quote("ETH:USDC"),
+        provider.get_quote("SOL:USDC"),
+        provider.get_quote("XMR:USDC"),
         provider.get_quote("WBETH:USDC"),
         provider.get_quote("STETH:USDC"),
         provider.get_quote("WSTETH:USDC"),
     )
 
-    assert len(results) == 5
+    assert len(results) == 7
+    assert results[2].price == Decimal("180")
+    assert results[3].price == Decimal("325")
     assert provider._request_json.await_count == 1
     requested_ids = provider._request_json.await_args.kwargs["params"]["ids"].split(",")
     assert set(requested_ids) == {
         "bitcoin",
         "ethereum",
+        "solana",
+        "monero",
         "wrapped-beacon-eth",
         "staked-ether",
         "wrapped-steth",
@@ -140,6 +205,20 @@ async def test_coingecko_does_not_claim_intraday_history_support():
         await provider.get_history(
             "BTC:USDC",
             interval="1m",
+            start=datetime(2026, 7, 1, tzinfo=UTC),
+            end=datetime(2026, 7, 2, tzinfo=UTC),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["SOL:USDC", "XMR:USDC"])
+async def test_coingecko_is_quote_only_for_ordinary_spot_fallbacks(symbol: str):
+    provider = CoinGeckoProvider("key")
+
+    with pytest.raises(UnsupportedInstrument, match="only for configured"):
+        await provider.get_history(
+            symbol,
+            interval="1d",
             start=datetime(2026, 7, 1, tzinfo=UTC),
             end=datetime(2026, 7, 2, tzinfo=UTC),
         )

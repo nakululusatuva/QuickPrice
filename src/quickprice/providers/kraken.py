@@ -31,6 +31,8 @@ class KrakenProvider(HttpProvider):
     symbols: ClassVar[dict[str, tuple[str, str]]] = {
         "BTC:USDC": ("XBTUSDC", "BTC/USDC"),
         "ETH:USDC": ("ETHUSDC", "ETH/USDC"),
+        "SOL:USDC": ("SOLUSDC", "SOL/USDC"),
+        "XMR:USDC": ("XMRUSDC", "XMR/USDC"),
     }
     _ws_reverse: ClassVar[dict[str, str]] = {
         ws: canonical for canonical, (_, ws) in symbols.items()

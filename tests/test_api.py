@@ -116,6 +116,11 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     assert by_symbol["BOXX:USD"]["asset_type"] == "growth_bond_etf"
     assert by_symbol["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"
     assert by_symbol["QQQM:USD"]["description"]
+    assert by_symbol["SOL:USDC"]["asset_type"] == "spot_crypto"
+    assert by_symbol["XMR:USDC"]["asset_type"] == "spot_crypto"
+    assert isinstance(by_symbol["AAPL:USD"]["dividend"]["yield_percent"], float | int)
+    assert by_symbol["AMZN:USD"]["dividend"] is None
+    assert by_symbol["SPCX:USD"]["name"] == "Space Exploration Technologies Corp."
     assert set(by_symbol["BTC:USDC"]["changes"]) == {
         "1h",
         "4h",
@@ -254,6 +259,10 @@ def test_instruments_documents_classification_and_methods(client, auth_headers):
     assert items["QQQM:USD"]["dividend_method"] == "latest_regular_cash_annualized_x4"
     assert items["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"
     assert items["QQQM:USD"]["description"]
+    assert items["AAPL:USD"]["asset_type"] == "common_stock"
+    assert items["AAPL:USD"]["dividend_method"] == "latest_regular_cash_annualized_x4"
+    assert items["AMZN:USD"]["dividend_method"] is None
+    assert items["SPCX:USD"]["name"] == "Space Exploration Technologies Corp."
     assert items["QQQM:USD"]["change_windows"]["1y"] == "rolling_365_days"
 
 

@@ -73,8 +73,14 @@ def annualize_dividend(
     )
 
 
-def qqqm_dividend(event: DividendEvent, current_price: Decimal) -> DividendMetric:
+def quarterly_dividend(event: DividendEvent, current_price: Decimal) -> DividendMetric:
     return annualize_dividend(event, current_price, 4, "latest_regular_cash_annualized_x4")
+
+
+def qqqm_dividend(event: DividendEvent, current_price: Decimal) -> DividendMetric:
+    """Backward-compatible alias for the generic quarterly dividend rule."""
+
+    return quarterly_dividend(event, current_price)
 
 
 def sgov_yield(event: DividendEvent, current_price: Decimal, as_of: datetime) -> YieldEstimate:

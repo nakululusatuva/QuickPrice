@@ -8,6 +8,7 @@ from datetime import UTC, datetime, time
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
+from quickprice.equities import DIVIDEND_FREQUENCIES, LISTED_TICKERS
 from quickprice.fx import FX_HUB_SYMBOLS
 
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
@@ -27,18 +28,11 @@ class AlphaVantageProvider(HttpProvider):
     name = "alpha_vantage"
     base_url = "https://www.alphavantage.co/query"
     feed = "alpha_vantage_eod"
-    equity_symbols: ClassVar[dict[str, str]] = {
-        "QQQM:USD": "QQQM",
-        "BOXX:USD": "BOXX",
-        "SGOV:USD": "SGOV",
-    }
+    equity_symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
     fx_symbols: ClassVar[dict[str, tuple[str, str]]] = {
         symbol: tuple(symbol.split(":")) for symbol in FX_HUB_SYMBOLS
     }
-    dividend_frequencies: ClassVar[dict[str, str]] = {
-        "QQQM:USD": "quarterly",
-        "SGOV:USD": "monthly",
-    }
+    dividend_frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
     _new_york = ZoneInfo("America/New_York")
 
     def __init__(

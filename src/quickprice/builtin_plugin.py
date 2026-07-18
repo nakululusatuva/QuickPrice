@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .equities import COMMON_STOCKS, QUARTERLY_DIVIDEND_STRATEGY, CommonStockMetadata
 from .fx import FX_CURRENCY_NAMES, FX_SYMBOLS
 from .plugin_api import (
     AssetClass,
@@ -35,9 +36,31 @@ def _fx_instrument(symbol: str) -> InstrumentSpec:
 FX_INSTRUMENTS = tuple(_fx_instrument(symbol) for symbol in FX_SYMBOLS)
 
 
+def _common_stock_instrument(metadata: CommonStockMetadata) -> InstrumentSpec:
+    return InstrumentSpec(
+        symbol=metadata.symbol,
+        base=metadata.ticker,
+        quote="USD",
+        name=metadata.name,
+        description=metadata.description,
+        asset_class=AssetClass.EQUITY,
+        asset_type="common_stock",
+        price_basis="last_trade",
+        dividend_strategy=(
+            QUARTERLY_DIVIDEND_STRATEGY if metadata.dividend_frequency == "quarterly" else None
+        ),
+        market_calendar=MarketCalendar.US_EQUITY,
+        stale_after_seconds=120.0,
+        quote_poll_seconds=5.0,
+    )
+
+
+COMMON_STOCK_INSTRUMENTS = tuple(_common_stock_instrument(item) for item in COMMON_STOCKS)
+
+
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.2.0",
+    version="1.3.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -57,6 +80,28 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             quote="USDC",
             name="Ethereum",
             description="Ether spot price quoted in USD Coin.",
+            asset_class=AssetClass.CRYPTO,
+            asset_type="spot_crypto",
+            price_basis="last_trade",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="SOL:USDC",
+            base="SOL",
+            quote="USDC",
+            name="Solana",
+            description="Solana's native token spot price quoted in USD Coin.",
+            asset_class=AssetClass.CRYPTO,
+            asset_type="spot_crypto",
+            price_basis="last_trade",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="XMR:USDC",
+            base="XMR",
+            quote="USDC",
+            name="Monero",
+            description="Monero's privacy-focused native asset spot price quoted in USD Coin.",
             asset_class=AssetClass.CRYPTO,
             asset_type="spot_crypto",
             price_basis="last_trade",
@@ -115,6 +160,7 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             stale_after_seconds=1800.0,
             quote_poll_seconds=660.0,
         ),
+        *COMMON_STOCK_INSTRUMENTS,
         InstrumentSpec(
             symbol="QQQM:USD",
             base="QQQM",

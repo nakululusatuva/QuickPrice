@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import Any
 
 from quickprice.config import Settings
+from quickprice.equities import DIVIDEND_SYMBOLS, LISTED_SYMBOLS
 from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
 from quickprice.plugin_api import ProviderInstallContext, YieldStrategy
 from quickprice.registry import InstrumentRegistry, build_registry
@@ -61,13 +62,19 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
         )
 
-    for symbol in ("BTC:USDC", "ETH:USDC"):
+    for symbol in ("BTC:USDC", "ETH:USDC", "SOL:USDC"):
         quote_chain = [binance, kraken]
         history_chain = [binance, kraken]
         if coingecko is not None:
             quote_chain.append(coingecko)
         router.register(symbol, Capability.QUOTE, quote_chain)
         router.register(symbol, Capability.HISTORY, history_chain)
+
+    xmr_quote_chain = [kraken]
+    if coingecko is not None:
+        xmr_quote_chain.append(coingecko)
+    router.register("XMR:USDC", Capability.QUOTE, xmr_quote_chain)
+    router.register("XMR:USDC", Capability.HISTORY, [kraken])
 
     if coingecko is not None:
         for symbol in ("STETH:USDC", "WSTETH:USDC"):
@@ -171,19 +178,19 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             quota=daily_budget(settings.alpha_vantage_daily_credits),
         )
 
-    for symbol in ("QQQM:USD", "BOXX:USD", "SGOV:USD"):
+    for symbol in LISTED_SYMBOLS:
         chain = [provider for provider in (alpaca, twelve, alpha) if provider is not None]
         if chain:
             router.register(symbol, Capability.QUOTE, chain)
             router.register(symbol, Capability.HISTORY, chain)
 
-    # Alpha Vantage does not classify ordinary versus special distributions.
-    # Keep only classified Alpaca events in the annualization route and retain
-    # the last valid event from SQLite when Alpaca is unavailable.
+    # Keep only classified Alpaca events in annualization routes. Alpha Vantage
+    # is excluded because its dividend feed cannot reliably distinguish every
+    # ordinary distribution from special or capital-gain events.
     dividend_chain = [provider for provider in (alpaca,) if provider is not None]
     if dividend_chain:
-        router.register("QQQM:USD", Capability.DIVIDEND, dividend_chain)
-        router.register("SGOV:USD", Capability.DIVIDEND, dividend_chain)
+        for symbol in DIVIDEND_SYMBOLS:
+            router.register(symbol, Capability.DIVIDEND, dividend_chain)
 
     fx_chain = [provider for provider in (twelve, alpha) if provider is not None]
     if fx_chain:

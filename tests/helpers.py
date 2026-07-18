@@ -25,12 +25,24 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
     prices = {
         "BTC:USDC": Decimal("120000"),
         "ETH:USDC": Decimal("5000"),
+        "SOL:USDC": Decimal("180"),
+        "XMR:USDC": Decimal("325"),
         "WBETH:USDC": Decimal("5500"),
         "STETH:USDC": Decimal("4990"),
         "WSTETH:USDC": Decimal("6000"),
         "QQQM:USD": Decimal("250"),
         "BOXX:USD": Decimal("110"),
         "SGOV:USD": Decimal("100.50"),
+        "AAPL:USD": Decimal("225"),
+        "MSFT:USD": Decimal("515"),
+        "AMZN:USD": Decimal("235"),
+        "GOOGL:USD": Decimal("205"),
+        "META:USD": Decimal("705"),
+        "NVDA:USD": Decimal("185"),
+        "TSLA:USD": Decimal("345"),
+        "SPCX:USD": Decimal("65"),
+        "MSTR:USD": Decimal("410"),
+        "CRCL:USD": Decimal("145"),
         "USD:CNH": Decimal("7.20"),
         "HKD:CNH": Decimal("0.923"),
     }
@@ -61,18 +73,21 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
             )
         )
         service.publish_history(history, persist=False)
-    service.publish_dividend(
-        DividendEvent(
-            "QQQM:USD",
-            date(2026, 6, 23),
-            date(2026, 6, 27),
-            Decimal("0.32"),
-            "USD",
-            "quarterly",
-            "fixture",
-        ),
-        persist=False,
-    )
+    for instrument in service.registry.values():
+        if instrument.dividend_strategy != "latest_regular_cash_annualized_x4":
+            continue
+        service.publish_dividend(
+            DividendEvent(
+                instrument.symbol,
+                date(2026, 6, 23),
+                date(2026, 6, 27),
+                Decimal("0.32"),
+                "USD",
+                "quarterly",
+                "fixture",
+            ),
+            persist=False,
+        )
     service.publish_dividend(
         DividendEvent(
             "SGOV:USD",

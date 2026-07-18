@@ -5,11 +5,17 @@ from dataclasses import replace
 import pytest
 
 from quickprice.builtin_plugin import BUILTIN_PLUGIN
+from quickprice.equities import (
+    COMMON_STOCK_SYMBOLS,
+    QUARTERLY_DIVIDEND_STRATEGY,
+    QUARTERLY_STOCK_DIVIDEND_SYMBOLS,
+)
 from quickprice.fx import FX_SYMBOLS
 from quickprice.plugin_api import (
     AssetClass,
     InstrumentPlugin,
     InstrumentSpec,
+    MarketCalendar,
     RewardAccrualMode,
     SyntheticRecipe,
     YieldStrategy,
@@ -18,24 +24,45 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS[:8] == (
+    assert SYMBOLS[:7] == (
         "BTC:USDC",
         "ETH:USDC",
+        "SOL:USDC",
+        "XMR:USDC",
         "WBETH:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
+    )
+    assert SYMBOLS[7:17] == COMMON_STOCK_SYMBOLS
+    assert SYMBOLS[17:20] == (
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
     )
-    assert SYMBOLS[8:] == FX_SYMBOLS
-    assert len(SYMBOLS) == 38
+    assert SYMBOLS[20:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 50
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND
     assert INSTRUMENTS["SGOV:USD"].asset_type == "income_bond_etf"
     assert INSTRUMENTS["WBETH:USDC"].asset_type == "liquid_staking_token"
     assert all(item.name and item.description for item in INSTRUMENTS.values())
+
+
+def test_common_stock_metadata_and_dividend_policies_are_explicit() -> None:
+    stocks = [INSTRUMENTS[symbol] for symbol in COMMON_STOCK_SYMBOLS]
+
+    assert all(item.asset_class is AssetClass.EQUITY for item in stocks)
+    assert all(item.asset_type == "common_stock" for item in stocks)
+    assert all(item.market_calendar is MarketCalendar.US_EQUITY for item in stocks)
+    assert all(item.price_basis == "last_trade" for item in stocks)
+    assert all(item.quote_poll_seconds == 5.0 for item in stocks)
+    assert all(item.stale_after_seconds == 120.0 for item in stocks)
+    assert {
+        item.symbol for item in stocks if item.dividend_strategy == QUARTERLY_DIVIDEND_STRATEGY
+    } == set(QUARTERLY_STOCK_DIVIDEND_SYMBOLS)
+    assert INSTRUMENTS["SPCX:USD"].name == "Space Exploration Technologies Corp."
+    assert "June 2026" in INSTRUMENTS["SPCX:USD"].description
 
 
 def test_every_bond_has_a_yield_strategy() -> None:

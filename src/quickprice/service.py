@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from threading import RLock
 from typing import Any
 
-from .analytics import boxx_yield, calculate_changes, qqqm_dividend, sgov_yield
+from .analytics import boxx_yield, calculate_changes, quarterly_dividend, sgov_yield
 from .cache import HistoryCache, SnapshotStore
 from .config import Settings
 from .domain import (
@@ -465,7 +465,7 @@ class QuickPriceService:
             instrument.dividend_strategy == "latest_regular_cash_annualized_x4"
             and event is not None
         ):
-            dividend = qqqm_dividend(event, quote.price)
+            dividend = quarterly_dividend(event, quote.price)
         if (
             instrument.yield_strategy is YieldStrategy.LATEST_DISTRIBUTION_ANNUALIZED
             and event is not None
