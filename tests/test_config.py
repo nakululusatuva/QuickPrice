@@ -98,6 +98,15 @@ def test_staking_market_fallback_window_rejects_less_than_seven_days(monkeypatch
         Settings.from_env()
 
 
+def test_dashboard_log_stream_limit_is_configurable_and_positive(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_DASHBOARD_MAX_LOG_STREAMS", "12")
+    assert Settings.from_env().dashboard_max_log_streams == 12
+
+    monkeypatch.setenv("QUICKPRICE_DASHBOARD_MAX_LOG_STREAMS", "0")
+    with pytest.raises(ValueError, match="must be >= 1"):
+        Settings.from_env()
+
+
 def test_alpaca_trading_clock_defaults_to_paper_and_is_configurable(monkeypatch) -> None:
     monkeypatch.delenv("QUICKPRICE_ALPACA_TRADING_BASE_URL", raising=False)
     assert Settings.from_env().alpaca_trading_base_url == ("https://paper-api.alpaca.markets/v2")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Hashable, Mapping, Sequence
@@ -21,6 +22,8 @@ from .base import (
     ProviderUnavailable,
     UnsupportedInstrument,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -81,6 +84,7 @@ class ProviderRouter:
         self._flights: dict[Hashable, asyncio.Task[Any]] = {}
         self._flights_lock = asyncio.Lock()
         self._fallbacks: dict[tuple[str, Capability, str], int] = defaultdict(int)
+        self._route_selections: dict[tuple[str, Capability], tuple[str, int]] = {}
         if routes:
             for (symbol, capability), providers in routes.items():
                 self.register(symbol, Capability(capability), providers)
@@ -233,7 +237,13 @@ class ProviderRouter:
                     result = await method(symbol, **kwargs)
             except TimeoutError:
                 error: ProviderError = ProviderUnavailable(name, "timeout")
-                self._record_failure(circuit)
+                self._record_failure(
+                    circuit,
+                    provider=name,
+                    symbol=symbol,
+                    capability=capability,
+                    error_type="TimeoutError",
+                )
                 attempts.append((name, error.message))
                 continue
             except UnsupportedInstrument as error:
@@ -241,15 +251,32 @@ class ProviderRouter:
                 attempts.append((name, error.message))
                 continue
             except (ProviderRateLimited, ProviderError) as error:
-                self._record_failure(circuit)
+                self._record_failure(
+                    circuit,
+                    provider=name,
+                    symbol=symbol,
+                    capability=capability,
+                    error_type=type(error).__name__,
+                )
                 attempts.append((name, error.message))
                 continue
             except Exception as error:  # Keep malformed adapters from killing collectors.
-                self._record_failure(circuit)
+                self._record_failure(
+                    circuit,
+                    provider=name,
+                    symbol=symbol,
+                    capability=capability,
+                    error_type=type(error).__name__,
+                )
                 attempts.append((name, type(error).__name__))
                 continue
 
-            self._record_success(circuit)
+            self._record_success(
+                circuit,
+                provider=name,
+                symbol=symbol,
+                capability=capability,
+            )
             if capability is Capability.DIVIDEND and result is None:
                 attempts.append((name, "no_data"))
                 continue
@@ -263,19 +290,36 @@ class ProviderRouter:
                 ) and not self._history_covers_start(attached, kwargs):
                     history_segments.append(attached)
                     if fallback_level:
-                        self._fallbacks[(symbol, capability, name)] += 1
+                        self._record_route_selection(
+                            symbol,
+                            capability,
+                            name,
+                            fallback_level,
+                        )
                     attempts.append((name, "incomplete_prefix"))
                     continue
                 if history_segments:
                     history_segments.append(attached)
-                    if fallback_level:
-                        self._fallbacks[(symbol, capability, name)] += 1
+                    self._record_route_selection(
+                        symbol,
+                        capability,
+                        name,
+                        fallback_level,
+                    )
                     return self._merge_history(history_segments, kwargs.get("limit"))
-                if fallback_level:
-                    self._fallbacks[(symbol, capability, name)] += 1
+                self._record_route_selection(
+                    symbol,
+                    capability,
+                    name,
+                    fallback_level,
+                )
                 return attached
-            if fallback_level:
-                self._fallbacks[(symbol, capability, name)] += 1
+            self._record_route_selection(
+                symbol,
+                capability,
+                name,
+                fallback_level,
+            )
             return self._attach_fallback(result, fallback_level)
 
         if history_segments:
@@ -324,11 +368,20 @@ class ProviderRouter:
         circuit.probing = True
         return True
 
-    def _record_failure(self, circuit: _Circuit) -> None:
+    def _record_failure(
+        self,
+        circuit: _Circuit,
+        *,
+        provider: str,
+        symbol: str,
+        capability: Capability,
+        error_type: str,
+    ) -> None:
         circuit.probing = False
         circuit.consecutive_failures += 1
         if circuit.consecutive_failures < self.failure_threshold and circuit.open_until <= 0:
             return
+        was_previously_opened = circuit.open_count > 0
         circuit.open_count += 1
         exponent = max(0, circuit.open_count - 1)
         delay = min(
@@ -336,13 +389,68 @@ class ProviderRouter:
             self.half_open_after_seconds * (2**exponent),
         )
         circuit.open_until = self._clock() + delay
+        state = "reopened" if was_previously_opened else "opened"
+        _LOGGER.warning(
+            "Provider circuit %s provider=%s symbol=%s capability=%s "
+            "error_type=%s retry_in_seconds=%.0f",
+            state,
+            provider,
+            symbol,
+            capability.value,
+            error_type,
+            delay,
+        )
 
     @staticmethod
-    def _record_success(circuit: _Circuit) -> None:
+    def _record_success(
+        circuit: _Circuit,
+        *,
+        provider: str,
+        symbol: str,
+        capability: Capability,
+    ) -> None:
+        recovered = circuit.open_count > 0
         circuit.consecutive_failures = 0
         circuit.open_count = 0
         circuit.open_until = 0.0
         circuit.probing = False
+        if recovered:
+            _LOGGER.info(
+                "Provider circuit recovered provider=%s symbol=%s capability=%s",
+                provider,
+                symbol,
+                capability.value,
+            )
+
+    def _record_route_selection(
+        self,
+        symbol: str,
+        capability: Capability,
+        provider: str,
+        fallback_level: int,
+    ) -> None:
+        key = (symbol, capability)
+        selected = (provider, fallback_level)
+        previous = self._route_selections.get(key)
+        self._route_selections[key] = selected
+        if fallback_level:
+            self._fallbacks[(symbol, capability, provider)] += 1
+            if previous != selected:
+                _LOGGER.warning(
+                    "Provider fallback selected provider=%s symbol=%s capability=%s "
+                    "fallback_level=%d",
+                    provider,
+                    symbol,
+                    capability.value,
+                    fallback_level,
+                )
+        elif previous is not None and previous[1] > 0:
+            _LOGGER.info(
+                "Provider primary recovered provider=%s symbol=%s capability=%s",
+                provider,
+                symbol,
+                capability.value,
+            )
 
     @staticmethod
     def _attach_fallback(value: Any, fallback_level: int) -> Any:

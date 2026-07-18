@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="QuickPrice market data operations dashboard">
+  <title>QuickPrice Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/assets/dashboard.css">
+  <script src="/dashboard/assets/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="app-header">
+    <div class="brand" aria-label="QuickPrice">
+      <span class="brand-mark" aria-hidden="true">QP</span>
+      <span>
+        <strong>QuickPrice</strong>
+        <small>Market data console</small>
+      </span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button id="market-tab" class="tab is-active" type="button" role="tab" data-tab="market" aria-controls="market-panel" aria-selected="true">Market</button>
+      <button id="logs-tab" class="tab" type="button" role="tab" data-tab="logs" aria-controls="logs-panel" aria-selected="false" tabindex="-1">Service logs</button>
+    </nav>
+    <div class="header-actions">
+      <span id="connection-badge" class="status-badge status-neutral">Not connected</span>
+      <button id="theme-toggle" class="icon-button" type="button" aria-label="Toggle color theme">Theme</button>
+    </div>
+  </header>
+
+  <main id="main-content" class="page-shell">
+    <section id="market-panel" class="tab-panel" role="tabpanel" aria-labelledby="market-tab market-title">
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">Live portfolio intelligence</p>
+          <h1 id="market-title">Market overview</h1>
+          <p>One operational view across every registered instrument and provider.</p>
+        </div>
+        <div class="as-of-block">
+          <span>Last refresh</span>
+          <strong id="last-refresh">Never</strong>
+        </div>
+      </div>
+
+      <form id="credential-form" class="credential-panel">
+        <div>
+          <label for="api-key">API key</label>
+          <p>Held in this tab's session storage only.</p>
+        </div>
+        <div class="credential-input">
+          <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Enter your QuickPrice API key" required>
+          <button class="button button-primary" type="submit">Connect</button>
+          <button id="forget-key" class="button button-secondary" type="button">Forget</button>
+        </div>
+      </form>
+
+      <div class="kpi-grid" aria-label="Market summary">
+        <article class="kpi-card">
+          <span>Registered</span>
+          <strong id="kpi-registered">0</strong>
+          <small>Instruments</small>
+        </article>
+        <article class="kpi-card">
+          <span>Priced</span>
+          <strong id="kpi-priced">0</strong>
+          <small>Current snapshots</small>
+        </article>
+        <article class="kpi-card">
+          <span>Open</span>
+          <strong id="kpi-open">0</strong>
+          <small>Active markets</small>
+        </article>
+        <article class="kpi-card">
+          <span>Stale</span>
+          <strong id="kpi-stale">0</strong>
+          <small>Needs attention</small>
+        </article>
+      </div>
+
+      <section class="data-panel" aria-label="Instrument quotes">
+        <div class="toolbar">
+          <label class="search-field">
+            <span>Search</span>
+            <input id="market-search" type="search" placeholder="Symbol, name, type, provider">
+          </label>
+          <label>
+            <span>Asset class</span>
+            <select id="asset-filter"><option value="">All classes</option></select>
+          </label>
+          <label>
+            <span>Market status</span>
+            <select id="status-filter">
+              <option value="">All statuses</option>
+              <option value="open">Open</option>
+              <option value="closed">Closed</option>
+              <option value="unknown">Unknown</option>
+              <option value="unavailable">Unavailable</option>
+            </select>
+          </label>
+          <label>
+            <span>Sort</span>
+            <select id="sort-field">
+              <option value="symbol">Symbol</option>
+              <option value="price">Price</option>
+              <option value="change1d">1D change</option>
+              <option value="updated">Updated</option>
+              <option value="assetClass">Asset class</option>
+            </select>
+          </label>
+          <button id="sort-direction" class="button button-secondary compact" type="button" aria-label="Reverse sort order">Ascending</button>
+          <button id="refresh-market" class="button button-primary compact" type="button">Refresh</button>
+        </div>
+
+        <div id="market-notice" class="notice" role="status" aria-live="polite">Enter an API key to load market data.</div>
+        <div class="table-scroll">
+          <table class="market-table">
+            <thead>
+              <tr>
+                <th scope="col">Instrument</th>
+                <th scope="col">Price</th>
+                <th scope="col">1H</th>
+                <th scope="col">4H</th>
+                <th scope="col">1D</th>
+                <th scope="col">1W</th>
+                <th scope="col">1M</th>
+                <th scope="col">1Y</th>
+                <th scope="col">Income</th>
+                <th scope="col">Market</th>
+                <th scope="col">Source</th>
+                <th scope="col"><span class="sr-only">Details</span></th>
+              </tr>
+            </thead>
+            <tbody id="market-body"></tbody>
+          </table>
+        </div>
+        <div id="market-empty" class="empty-state" hidden>No instruments match the current filters.</div>
+        <div class="panel-footer">
+          <span id="result-count">0 instruments</span>
+          <span>Rolling changes use unadjusted market prices.</span>
+        </div>
+      </section>
+    </section>
+
+    <section id="logs-panel" class="tab-panel" role="tabpanel" aria-labelledby="logs-tab logs-title" hidden>
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">Runtime telemetry</p>
+          <h1 id="logs-title">Service logs</h1>
+          <p>Live, redacted application events delivered over an authenticated stream.</p>
+        </div>
+        <span id="log-stream-badge" class="status-badge status-neutral">Disconnected</span>
+      </div>
+
+      <section class="data-panel log-panel" aria-label="Service log stream">
+        <div class="toolbar log-toolbar">
+          <label>
+            <span>Minimum level</span>
+            <select id="log-level">
+              <option value="DEBUG">Debug</option>
+              <option value="INFO" selected>Info</option>
+              <option value="WARNING">Warning</option>
+              <option value="ERROR">Error</option>
+              <option value="CRITICAL">Critical</option>
+            </select>
+          </label>
+          <label class="search-field">
+            <span>Search logs</span>
+            <input id="log-search" type="search" placeholder="Logger or message">
+          </label>
+          <button id="pause-logs" class="button button-secondary compact" type="button">Pause</button>
+          <button id="clear-logs" class="button button-secondary compact" type="button">Clear</button>
+          <button id="reconnect-logs" class="button button-primary compact" type="button">Reconnect</button>
+        </div>
+        <div id="log-notice" class="notice" role="status" aria-live="polite">Connect with an API key to open the log stream.</div>
+        <ol id="log-list" class="log-list" aria-label="Live log entries"></ol>
+        <div id="log-empty" class="empty-state">No log events received.</div>
+        <div class="panel-footer">
+          <span id="log-count">0 events</span>
+          <span id="paused-count">Live view</span>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <span>QuickPrice private market data service</span>
+    <span>Credentials never leave session storage except in authenticated requests.</span>
+  </footer>
+</body>
+</html>

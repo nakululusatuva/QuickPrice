@@ -88,6 +88,42 @@ async def test_fallback_is_labeled_and_counted():
 
 
 @pytest.mark.asyncio
+async def test_fallback_logging_is_transition_based_and_sanitized(caplog):
+    secret = "api_key=must-not-appear"
+    primary = ScriptedProvider(
+        "primary",
+        [
+            ProviderUnavailable("primary", secret),
+            ProviderUnavailable("primary", secret),
+            fixed_quote("primary", "11"),
+        ],
+    )
+    backup = ScriptedProvider("backup", [fixed_quote("backup")])
+    router = ProviderRouter({("BTC:USDC", Capability.QUOTE): [primary, backup]})
+
+    with caplog.at_level("INFO", logger="quickprice.providers.router"):
+        assert (await router.get_quote("BTC:USDC")).provider == "backup"
+        assert (await router.get_quote("BTC:USDC")).provider == "backup"
+        assert (await router.get_quote("BTC:USDC")).provider == "primary"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert (
+        messages.count(
+            "Provider fallback selected provider=backup symbol=BTC:USDC "
+            "capability=quote fallback_level=1"
+        )
+        == 1
+    )
+    assert (
+        messages.count(
+            "Provider primary recovered provider=primary symbol=BTC:USDC capability=quote"
+        )
+        == 1
+    )
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_non_json_representable_primary_price_triggers_fallback():
     primary = OutOfRangeProvider()
     backup = ScriptedProvider("backup", [fixed_quote("backup")])
@@ -183,14 +219,15 @@ async def test_timeout_falls_back_without_leaking_cancelled_task():
 
 
 @pytest.mark.asyncio
-async def test_three_failures_open_breaker_then_half_open_success_resets_it():
+async def test_three_failures_open_breaker_then_half_open_success_resets_it(caplog):
     clock = [100.0]
+    secret = "access_token=must-not-appear"
     primary = ScriptedProvider(
         "primary",
         [
-            ProviderUnavailable("primary", "down"),
-            ProviderUnavailable("primary", "down"),
-            ProviderUnavailable("primary", "down"),
+            ProviderUnavailable("primary", secret),
+            ProviderUnavailable("primary", secret),
+            ProviderUnavailable("primary", secret),
             fixed_quote("primary", "11"),
         ],
     )
@@ -200,19 +237,35 @@ async def test_three_failures_open_breaker_then_half_open_success_resets_it():
         clock=lambda: clock[0],
     )
 
-    for _ in range(3):
-        assert (await router.get_quote("BTC:USDC")).provider == "backup"
-    assert primary.calls == 3
-    assert router.circuit_snapshots()[0].state == "open"
+    with caplog.at_level("INFO", logger="quickprice.providers.router"):
+        for _ in range(3):
+            assert (await router.get_quote("BTC:USDC")).provider == "backup"
+        assert primary.calls == 3
+        assert router.circuit_snapshots()[0].state == "open"
 
-    await router.get_quote("BTC:USDC")
-    assert primary.calls == 3
+        await router.get_quote("BTC:USDC")
+        assert primary.calls == 3
 
-    clock[0] += 60
-    result = await router.get_quote("BTC:USDC")
+        clock[0] += 60
+        result = await router.get_quote("BTC:USDC")
     assert result.provider == "primary"
     assert result.fallback_level == 0
     assert router.circuit_snapshots()[0].state == "closed"
+    messages = [record.getMessage() for record in caplog.records]
+    assert (
+        messages.count(
+            "Provider circuit opened provider=primary symbol=BTC:USDC capability=quote "
+            "error_type=ProviderUnavailable retry_in_seconds=60"
+        )
+        == 1
+    )
+    assert (
+        messages.count(
+            "Provider circuit recovered provider=primary symbol=BTC:USDC capability=quote"
+        )
+        == 1
+    )
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio

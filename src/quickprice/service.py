@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from threading import RLock
@@ -29,6 +30,8 @@ from .registry import InstrumentRegistry, build_registry
 from .runtime import FreeThreadedStatus, inspect_free_threaded_runtime
 from .schemas import QualityModel, QuoteModel, snapshot_to_wire
 from .staking import estimate_from_staking_metric
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DataUnavailableError(Exception):
@@ -111,6 +114,7 @@ class QuickPriceService:
 
     async def _start_storage(self) -> None:
         """Import lazily so storage remains independently contract-testable."""
+        stage = "initialize"
         try:
             from .storage import SQLiteStorage
 
@@ -119,20 +123,30 @@ class QuickPriceService:
                 batch_size=self.settings.sqlite_batch_size,
                 batch_interval_ms=self.settings.sqlite_batch_ms,
             )
+            stage = "start"
             result = self._storage.start()
             if asyncio.iscoroutine(result):
                 await result
+            stage = "restore"
             restore = getattr(self._storage, "restore", None)
             if restore is not None:
                 restored = restore()
                 if asyncio.iscoroutine(restored):
                     restored = await restored
+                stage = "apply_restore"
                 await self._apply_restored_state(restored)
             self._storage_ready = True
-        except Exception:
+        except Exception as exc:
             # The API can still serve an already-populated memory cache, but
             # readiness exposes the failed durability invariant.
             self._storage_ready = False
+            # Exception messages can contain database paths or upstream values.
+            # Keep the dashboard event diagnostic but deliberately message-free.
+            _LOGGER.error(
+                "Storage startup failed stage=%s error_type=%s",
+                stage,
+                type(exc).__name__,
+            )
 
     async def _apply_restored_state(self, restored: Any) -> None:
         if restored is None:
@@ -248,11 +262,44 @@ class QuickPriceService:
             self._coordinator = MarketDataCoordinator(self, self.settings, self.registry)
             await self._coordinator.start()
             self._collector_start_error = None
+            self._tasks.append(
+                asyncio.create_task(
+                    self._monitor_collector_run(self._coordinator),
+                    name="collector-runtime-monitor",
+                )
+            )
         except Exception as exc:
             # Missing credentials are expected during first boot; readiness lists
             # the unavailable instruments instead of fabricating data.
             self._coordinator = None
             self._collector_start_error = exc
+            # Do not include exception text: plugin/provider exceptions may embed
+            # authenticated URLs or credential-bearing configuration values.
+            _LOGGER.error(
+                "Collector startup failed error_type=%s",
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    async def _monitor_collector_run(coordinator: Any) -> None:
+        """Report one terminal coordinator failure without exposing its message."""
+
+        supervisor = getattr(coordinator, "_supervisor", None)
+        if not isinstance(supervisor, asyncio.Task):
+            return
+        failure: BaseException | None = None
+        try:
+            await asyncio.shield(supervisor)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failure = exc
+        failure = getattr(coordinator, "fatal_error", None) or failure
+        if failure is not None:
+            _LOGGER.error(
+                "Collector runtime failed error_type=%s",
+                type(failure).__name__,
+            )
 
     async def _monitor_event_loop(self) -> None:
         interval = 1.0

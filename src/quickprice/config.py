@@ -114,6 +114,7 @@ class Settings:
     request_burst: int = 20
     invalid_requests_per_minute: int = 30
     invalid_request_burst: int = 10
+    dashboard_max_log_streams: int = 8
     provider_timeout_seconds: float = 8.0
     circuit_failure_threshold: int = 3
     circuit_open_seconds: float = 60.0
@@ -177,6 +178,7 @@ class Settings:
                 "QUICKPRICE_INVALID_REQUESTS_PER_MINUTE", 30, minimum=1
             ),
             invalid_request_burst=_int("QUICKPRICE_INVALID_REQUEST_BURST", 10, minimum=1),
+            dashboard_max_log_streams=_int("QUICKPRICE_DASHBOARD_MAX_LOG_STREAMS", 8, minimum=1),
             provider_timeout_seconds=_float(
                 "QUICKPRICE_PROVIDER_TIMEOUT_SECONDS", 8.0, minimum=0.1
             ),

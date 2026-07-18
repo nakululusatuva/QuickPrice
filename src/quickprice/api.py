@@ -2,23 +2,45 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import __version__
 from .auth import AuthenticationError, Authenticator, RateLimitError
 from .config import Settings
+from .dashboard_logs import DashboardLogBroker, DashboardLogCapacityError
 from .domain import utc_now
 from .registry import InstrumentRegistry, build_registry, normalize_symbol
 from .schemas import EnvelopeModel, ErrorModel, instrument_to_wire
 from .service import DataUnavailableError, QuickPriceService
+
+_LOGGER = logging.getLogger(__name__)
+_DASHBOARD_ROOT = Path(__file__).with_name("dashboard")
+_LOG_STREAM_PATH = "/internal/logs/stream"
+_CONTENT_SECURITY_POLICY = "; ".join(
+    (
+        "default-src 'self'",
+        "base-uri 'none'",
+        "connect-src 'self'",
+        "font-src 'self'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        "img-src 'self' data:",
+        "object-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+    )
+)
 
 
 class APIError(Exception):
@@ -41,6 +63,21 @@ class APIError(Exception):
 
 def _request_id() -> str:
     return str(uuid.uuid7())
+
+
+def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
+    return (
+        *settings.api_key_hashes,
+        settings.alpaca_api_key,
+        settings.alpaca_api_secret,
+        settings.twelve_data_api_key,
+        settings.alpha_vantage_api_key,
+        settings.coingecko_api_key,
+        settings.fred_api_key,
+        settings.binance_api_key,
+        settings.binance_api_secret,
+        *settings.ethereum_rpc_urls,
+    )
 
 
 def _envelope(
@@ -76,18 +113,47 @@ def create_app(
             registry = build_registry(settings.enabled_plugins)
         service = QuickPriceService(settings, registry)
     authenticator = Authenticator(settings)
+    dashboard_logs = DashboardLogBroker(
+        max_subscribers=settings.dashboard_max_log_streams,
+        redacted_values=_dashboard_redacted_values(settings),
+    )
+    dashboard_logger = logging.getLogger("quickprice")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        await service.start()
+        previous_level = dashboard_logger.level
+        level_changed = dashboard_logger.getEffectiveLevel() > logging.INFO
+        if level_changed:
+            dashboard_logger.setLevel(logging.INFO)
+        dashboard_logger.addHandler(dashboard_logs)
         try:
-            yield
+            _LOGGER.info("QuickPrice startup initiated")
+            try:
+                await service.start()
+            except Exception as exc:
+                _LOGGER.error("QuickPrice startup failed error_type=%s", type(exc).__name__)
+                raise
+            _LOGGER.info("QuickPrice startup complete")
+            try:
+                yield
+            finally:
+                _LOGGER.info("QuickPrice shutdown initiated")
+                try:
+                    await service.stop()
+                except Exception as exc:
+                    _LOGGER.error("QuickPrice shutdown failed error_type=%s", type(exc).__name__)
+                    raise
+                finally:
+                    _LOGGER.info("QuickPrice shutdown complete")
         finally:
-            await service.stop()
+            dashboard_logger.removeHandler(dashboard_logs)
+            if level_changed:
+                dashboard_logger.setLevel(previous_level)
+            dashboard_logs.close()
 
     app = FastAPI(
         title="QuickPrice",
-        version="1.1.0",
+        version=__version__,
         docs_url="/docs" if settings.docs_enabled else None,
         redoc_url=None,
         openapi_url="/openapi.json" if settings.docs_enabled else None,
@@ -97,6 +163,7 @@ def create_app(
     app.state.service = service
     app.state.registry = registry
     app.state.authenticator = authenticator
+    app.state.dashboard_logs = dashboard_logs
     readiness_cache: tuple[float, bool, dict[str, Any]] | None = None
 
     def cached_readiness_details() -> tuple[bool, dict[str, Any]]:
@@ -153,9 +220,24 @@ def create_app(
                 "/v1/{unmatched}" if path == "/v1" or path.startswith("/v1/") else "/{unmatched}"
             )
         service.metrics.observe_request(route_template, response.status_code, elapsed_ms)
+        if path != _LOG_STREAM_PATH:
+            _LOGGER.info(
+                "HTTP %s %s returned %d in %.2f ms request_id=%s",
+                request.method,
+                route_template,
+                response.status_code,
+                elapsed_ms,
+                request.state.request_id,
+            )
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Cache-Control"] = "no-store"
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers["Content-Security-Policy"] = _CONTENT_SECURITY_POLICY
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=()"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
         return response
 
     @app.exception_handler(APIError)
@@ -199,13 +281,40 @@ def create_app(
         return JSONResponse(content, status_code=exc.status_code, headers=headers)
 
     @app.exception_handler(Exception)
-    async def unhandled_error_handler(request: Request, _: Exception) -> JSONResponse:
+    async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        route_template = getattr(request.scope.get("route"), "path", "/{unmatched}")
+        _LOGGER.error(
+            "Unhandled server error route=%s error_type=%s",
+            route_template,
+            type(exc).__name__,
+        )
         content = _envelope(
             request,
             data=None,
             errors=[ErrorModel(code="internal_error", message="unexpected server error")],
         )
         return JSONResponse(content, status_code=500)
+
+    dashboard_html = (_DASHBOARD_ROOT / "index.html").read_text(encoding="utf-8")
+
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
+    async def dashboard() -> HTMLResponse:
+        return HTMLResponse(dashboard_html)
+
+    @app.get("/dashboard/assets/dashboard.css", include_in_schema=False)
+    async def dashboard_stylesheet() -> FileResponse:
+        return FileResponse(
+            _DASHBOARD_ROOT / "assets" / "dashboard.css",
+            media_type="text/css",
+        )
+
+    @app.get("/dashboard/assets/dashboard.js", include_in_schema=False)
+    async def dashboard_script() -> FileResponse:
+        return FileResponse(
+            _DASHBOARD_ROOT / "assets" / "dashboard.js",
+            media_type="text/javascript",
+        )
 
     @app.get("/health/live", include_in_schema=False)
     async def live() -> dict[str, Any]:
@@ -227,6 +336,43 @@ def create_app(
     @app.get("/internal/metrics", include_in_schema=False)
     async def metrics_endpoint(request: Request) -> dict[str, Any]:
         return _envelope(request, data=service.operational_metrics())
+
+    @app.get(_LOG_STREAM_PATH, include_in_schema=False)
+    async def dashboard_log_stream(request: Request) -> StreamingResponse:
+        raw_last_event_id = request.headers.get("Last-Event-ID")
+        after_id: int | None = None
+        if raw_last_event_id:
+            try:
+                after_id = int(raw_last_event_id)
+            except ValueError as exc:
+                raise APIError(
+                    400,
+                    "invalid_last_event_id",
+                    "Last-Event-ID must be a non-negative integer",
+                ) from exc
+            if after_id < 0:
+                raise APIError(
+                    400,
+                    "invalid_last_event_id",
+                    "Last-Event-ID must be a non-negative integer",
+                )
+        try:
+            log_events = dashboard_logs.stream(after_id=after_id)
+        except DashboardLogCapacityError as exc:
+            raise APIError(
+                429,
+                "log_stream_limit_reached",
+                "dashboard log stream capacity is currently exhausted",
+                headers={"Retry-After": "5"},
+            ) from exc
+        return StreamingResponse(
+            log_events,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/v1/instruments")
     async def instruments(request: Request) -> dict[str, Any]:
