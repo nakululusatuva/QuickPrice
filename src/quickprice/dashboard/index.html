@@ -116,14 +116,19 @@
           <label>
             <span>Sort</span>
             <select id="sort-field">
-              <option value="symbol">Symbol</option>
+              <option value="instrument">Instrument</option>
               <option value="price">Price</option>
-              <option value="change1d">1D change</option>
-              <option value="updated">Updated</option>
-              <option value="assetClass">Asset class</option>
+              <option value="1h">1H change</option>
+              <option value="4h">4H change</option>
+              <option value="1d">1D change</option>
+              <option value="1w">1W change</option>
+              <option value="1m">1M change</option>
+              <option value="1y">1Y change</option>
+              <option value="market">Market</option>
+              <option value="source">Source</option>
             </select>
           </label>
-          <button id="sort-direction" class="button button-secondary compact" type="button" aria-label="Reverse sort order">Ascending</button>
+          <button id="sort-direction" class="button button-secondary compact" type="button" aria-label="Sort descending; current order ascending">Ascending</button>
           <button id="refresh-market" class="button button-primary compact" type="button">Refresh</button>
         </div>
 
@@ -132,17 +137,17 @@
           <table class="market-table">
             <thead>
               <tr>
-                <th scope="col">Instrument</th>
-                <th scope="col">Price</th>
-                <th scope="col">1H</th>
-                <th scope="col">4H</th>
-                <th scope="col">1D</th>
-                <th scope="col">1W</th>
-                <th scope="col">1M</th>
-                <th scope="col">1Y</th>
+                <th scope="col" aria-sort="ascending"><button class="sort-header is-active" type="button" data-sort-field="instrument"><span>Instrument</span><span class="sort-indicator" data-sort-indicator aria-hidden="true">&#8593;</span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="price"><span>Price</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="1h"><span>1H</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="4h"><span>4H</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="1d"><span>1D</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="1w"><span>1W</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="1m"><span>1M</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="1y"><span>1Y</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
                 <th scope="col">Income</th>
-                <th scope="col">Market</th>
-                <th scope="col">Source</th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="market"><span>Market</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
+                <th scope="col"><button class="sort-header" type="button" data-sort-field="source"><span>Source</span><span class="sort-indicator" data-sort-indicator aria-hidden="true"></span></button></th>
                 <th scope="col"><span class="sr-only">Details</span></th>
               </tr>
             </thead>

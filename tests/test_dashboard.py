@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -89,6 +90,39 @@ def test_dashboard_static_files_are_installed_package_resources() -> None:
     assert root.joinpath("index.html").is_file()
     assert root.joinpath("assets", "dashboard.css").is_file()
     assert root.joinpath("assets", "dashboard.js").is_file()
+
+
+def test_dashboard_sort_controls_offer_all_fields_and_accessible_headers(client) -> None:
+    response = client.get("/dashboard")
+    expected_fields = [
+        "instrument",
+        "price",
+        "1h",
+        "4h",
+        "1d",
+        "1w",
+        "1m",
+        "1y",
+        "market",
+        "source",
+    ]
+
+    select = response.text.split('<select id="sort-field">', 1)[1].split("</select>", 1)[0]
+    assert re.findall(r'<option value="([^"]+)">', select) == expected_fields
+
+    header_fields = re.findall(
+        r'<button class="sort-header(?: is-active)?" type="button" '
+        r'data-sort-field="([^"]+)">',
+        response.text,
+    )
+    assert header_fields == expected_fields
+    assert response.text.count('aria-sort="ascending"') == 1
+    assert 'aria-sort="descending"' not in response.text
+    assert (
+        '<th scope="col" aria-sort="ascending"><button class="sort-header is-active" '
+        'type="button" data-sort-field="instrument">'
+    ) in response.text
+    assert response.text.count('data-sort-indicator aria-hidden="true"') == len(expected_fields)
 
 
 def test_log_stream_requires_authentication(client) -> None:
@@ -329,6 +363,274 @@ assertExpansion("ETH:USDC", false, "Inspect");
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-e", helpers + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_sorting_supports_all_fields_with_deterministic_missing_values() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function finiteNumber") : source.index("\n\nfunction updateSortControls")
+    ]
+    assertions = r"""
+function assertEqual(actual, expected, label) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function row(symbol, quote = {}) {
+  return { instrument: { symbol }, quote };
+}
+
+function order(items, field, ascending) {
+  return [...items]
+    .sort((left, right) => compareRows(left, right, field, ascending))
+    .map((item) => item.instrument.symbol);
+}
+
+const expectedFields = [
+  "instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "market", "source",
+];
+assertEqual(Object.keys(SORT_FIELDS), expectedFields, "sort field registry");
+
+const instruments = [row("ZETA"), row("ALPHA"), row("BETA")];
+assertEqual(order(instruments, "instrument", true), ["ALPHA", "BETA", "ZETA"], "instrument asc");
+assertEqual(order(instruments, "instrument", false), ["ZETA", "BETA", "ALPHA"], "instrument desc");
+
+const prices = [
+  row("HIGH", { price: 5 }),
+  row("MISSING"),
+  row("LOW", { price: -2 }),
+  row("ZERO", { price: 0 }),
+  row("INVALID", { price: Number.POSITIVE_INFINITY }),
+];
+assertEqual(
+  order(prices, "price", true),
+  ["LOW", "ZERO", "HIGH", "INVALID", "MISSING"],
+  "price asc with missing last",
+);
+assertEqual(
+  order(prices, "price", false),
+  ["HIGH", "ZERO", "LOW", "INVALID", "MISSING"],
+  "price desc with missing last",
+);
+
+for (const field of ["1h", "4h", "1d", "1w", "1m", "1y"]) {
+  const windowName = field === "1m" ? "1mo" : field;
+  const changes = (value) => ({
+    [windowName]: { percent: value },
+    ...(field === "1m" ? { "1m": { percent: -value } } : {}),
+  });
+  const items = [
+    row("HIGH", { changes: changes(5) }),
+    row("MISSING", { changes: {} }),
+    row("LOW", { changes: changes(-2) }),
+    row("ZERO", { changes: changes(0) }),
+    row("INVALID", { changes: changes(Number.NaN) }),
+  ];
+  assertEqual(
+    order(items, field, true),
+    ["LOW", "ZERO", "HIGH", "INVALID", "MISSING"],
+    `${field} asc with missing last`,
+  );
+  assertEqual(
+    order(items, field, false),
+    ["HIGH", "ZERO", "LOW", "INVALID", "MISSING"],
+    `${field} desc with missing last`,
+  );
+}
+
+const markets = [
+  row("UNKNOWN", { market_status: "unknown", as_of: "2026-07-20T08:00:00Z" }),
+  row("OPEN_OLD", { market_status: "open", as_of: "2026-07-20T07:00:00Z" }),
+  row("UNAVAILABLE", null),
+  row("CLOSED", { market_status: "closed", as_of: "2026-07-20T08:00:00Z" }),
+  row("OPEN_NEW", { market_status: "open", as_of: "2026-07-20T09:00:00Z" }),
+];
+assertEqual(
+  order(markets, "market", true),
+  ["OPEN_NEW", "OPEN_OLD", "CLOSED", "UNKNOWN", "UNAVAILABLE"],
+  "market asc",
+);
+assertEqual(
+  order(markets, "market", false),
+  ["UNAVAILABLE", "UNKNOWN", "CLOSED", "OPEN_NEW", "OPEN_OLD"],
+  "market desc",
+);
+
+const sources = [
+  row("ALPHA_FALLBACK", {
+    source: { provider: "Alpha", feed: "iex", fallback_level: 2 }, quality: { stale: false },
+  }),
+  row("BETA", {
+    source: { provider: "Beta", feed: "spot", fallback_level: 0 }, quality: { stale: false },
+  }),
+  row("MISSING", { source: { feed: "unknown" } }),
+  row("ALPHA_STALE", {
+    source: { provider: "Alpha", feed: "iex", fallback_level: 0 }, quality: { stale: true },
+  }),
+  row("ALPHA_CURRENT", {
+    source: { provider: "Alpha", feed: "iex", fallback_level: 0 }, quality: { stale: false },
+  }),
+  row("ALPHA_SIP", {
+    source: { provider: "Alpha", feed: "sip", fallback_level: 0 }, quality: { stale: false },
+  }),
+];
+const alphaQualityOrder = ["ALPHA_CURRENT", "ALPHA_STALE", "ALPHA_FALLBACK"];
+assertEqual(
+  order(sources, "source", true),
+  [...alphaQualityOrder, "ALPHA_SIP", "BETA", "MISSING"],
+  "source asc",
+);
+assertEqual(
+  order(sources, "source", false),
+  ["BETA", "ALPHA_SIP", ...alphaQualityOrder, "MISSING"],
+  "source desc",
+);
+
+const tied = [row("BETA", { price: 10 }), row("ALPHA", { price: 10 })];
+assertEqual(order(tied, "price", true), ["ALPHA", "BETA"], "ascending tie breaker");
+assertEqual(order(tied, "price", false), ["ALPHA", "BETA"], "descending tie breaker");
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helpers + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_sort_header_accessibility_tracks_the_active_sort() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helper = source[
+        source.index("function updateSortControls") : source.index("\n\nfunction selectSortField")
+    ]
+    assertions = r"""
+function assertCondition(condition, label) {
+  if (!condition) throw new Error(label);
+}
+
+function sortHeader(field) {
+  const attributes = new Map();
+  const indicator = { textContent: "stale" };
+  const tableHeader = {
+    setAttribute(name, value) { attributes.set(name, value); },
+    removeAttribute(name) { attributes.delete(name); },
+  };
+  return {
+    dataset: { sortField: field },
+    classList: { toggle(_name, active) { this.active = active; } },
+    closest(selector) { return selector === "th" ? tableHeader : null; },
+    querySelector(selector) { return selector === "[data-sort-indicator]" ? indicator : null; },
+    attributes,
+    indicator,
+  };
+}
+
+const fields = ["instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "market", "source"];
+const headers = fields.map(sortHeader);
+const ui = {
+  sortField: { value: "" },
+  sortDirection: {
+    textContent: "",
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, value); },
+  },
+  sortHeaders: headers,
+};
+const state = { sortField: "1m", ascending: false };
+
+updateSortControls();
+assertCondition(ui.sortField.value === "1m", "select is synchronized");
+assertCondition(ui.sortDirection.textContent === "Descending", "direction is synchronized");
+assertCondition(
+  ui.sortDirection.attributes.get("aria-label") ===
+    "Sort ascending; current order descending",
+  "direction control describes current and next order",
+);
+for (const header of headers) {
+  const active = header.dataset.sortField === "1m";
+  assertCondition(header.classList.active === active, `${header.dataset.sortField} active class`);
+  assertCondition(
+    header.attributes.get("aria-sort") === (active ? "descending" : undefined),
+    `${header.dataset.sortField} aria-sort`,
+  );
+  assertCondition(
+    header.indicator.textContent === (active ? "\u2193" : ""),
+    `${header.dataset.sortField} indicator`,
+  );
+}
+assertCondition(
+  headers.filter((header) => header.attributes.has("aria-sort")).length === 1,
+  "exactly one header owns aria-sort",
+);
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helper + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_sort_selection_resets_new_fields_and_preserves_expansion() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helper = source[
+        source.index("function selectSortField") : source.index("\n\nfunction visibleRows")
+    ]
+    assertions = r"""
+function assertCondition(condition, label) {
+  if (!condition) throw new Error(label);
+}
+
+const SORT_FIELDS = { instrument: {}, price: {}, market: {} };
+const state = {
+  sortField: "instrument",
+  ascending: false,
+  expandedSymbols: new Set(["BTC:USDC", "ETH:USDC"]),
+};
+let controlUpdates = 0;
+let renders = 0;
+function updateSortControls() { controlUpdates += 1; }
+function renderMarket() { renders += 1; }
+
+selectSortField("price");
+assertCondition(state.sortField === "price", "new field is selected");
+assertCondition(state.ascending === true, "new field starts ascending");
+selectSortField("price", { toggleIfActive: true });
+assertCondition(state.ascending === false, "active header toggles direction");
+selectSortField("market", { toggleIfActive: true });
+assertCondition(state.sortField === "market" && state.ascending, "new header starts ascending");
+selectSortField("unsupported", { toggleIfActive: true });
+assertCondition(controlUpdates === 3 && renders === 3, "unsupported fields are ignored");
+assertCondition(
+  [...state.expandedSymbols].join() === "BTC:USDC,ETH:USDC",
+  "sorting preserves expanded instruments",
+);
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helper + assertions],
         check=False,
         capture_output=True,
         text=True,

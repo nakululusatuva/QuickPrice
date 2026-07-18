@@ -20,7 +20,7 @@ const state = {
   quotes: new Map(),
   quoteErrors: new Map(),
   expandedSymbols: new Set(),
-  sortField: "symbol",
+  sortField: "instrument",
   ascending: true,
   refreshing: false,
   refreshTimer: null,
@@ -52,6 +52,7 @@ const ui = {
   statusFilter: element("status-filter"),
   sortField: element("sort-field"),
   sortDirection: element("sort-direction"),
+  sortHeaders: [...document.querySelectorAll(".sort-header[data-sort-field]")],
   refreshMarket: element("refresh-market"),
   fixtureWarning: element("fixture-warning"),
   fixtureWarningMessage: element("fixture-warning-message"),
@@ -220,16 +221,161 @@ function setInstrumentExpanded(symbol, expanded) {
   return instrumentExpansion(symbol);
 }
 
-function sortValue(item) {
-  const quote = item.quote;
-  const values = {
-    symbol: item.instrument.symbol,
-    price: quote?.price ?? null,
-    change1d: quote?.changes?.["1d"]?.percent ?? null,
-    updated: quote?.as_of ? new Date(quote.as_of).getTime() : null,
-    assetClass: item.instrument.asset_class,
-  };
-  return values[state.sortField];
+function finiteNumber(value) {
+  return Number.isFinite(value) ? value : null;
+}
+
+function textValue(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function changePercent(item, windowName) {
+  return finiteNumber(item.quote?.changes?.[windowName]?.percent);
+}
+
+function marketStatus(item) {
+  return textValue(item.quote?.market_status)?.toLowerCase() ?? "unavailable";
+}
+
+const MARKET_STATUS_ORDER = Object.freeze({
+  open: 0,
+  closed: 1,
+  unknown: 2,
+  unavailable: 3,
+});
+
+const SORT_FIELDS = Object.freeze({
+  instrument: { kind: "text", read: (item) => textValue(item.instrument.symbol) },
+  price: { kind: "number", read: (item) => finiteNumber(item.quote?.price) },
+  "1h": { kind: "number", read: (item) => changePercent(item, "1h") },
+  "4h": { kind: "number", read: (item) => changePercent(item, "4h") },
+  "1d": { kind: "number", read: (item) => changePercent(item, "1d") },
+  "1w": { kind: "number", read: (item) => changePercent(item, "1w") },
+  "1m": { kind: "number", read: (item) => changePercent(item, "1mo") },
+  "1y": { kind: "number", read: (item) => changePercent(item, "1y") },
+  market: {
+    kind: "market",
+    read: marketStatus,
+  },
+  source: {
+    kind: "source",
+    read: (item) => {
+      const provider = textValue(item.quote?.source?.provider);
+      if (provider === null) return null;
+      return { provider, feed: textValue(item.quote?.source?.feed) ?? "" };
+    },
+  },
+});
+
+function sortValue(item, field) {
+  return (SORT_FIELDS[field] ?? SORT_FIELDS.instrument).read(item);
+}
+
+function compareText(left, right) {
+  const insensitive = left.localeCompare(right, "en", { numeric: true, sensitivity: "base" });
+  if (insensitive !== 0) return insensitive;
+  return left.localeCompare(right, "en", { numeric: true, sensitivity: "variant" });
+}
+
+function comparePrimaryValues(left, right, field) {
+  const kind = (SORT_FIELDS[field] ?? SORT_FIELDS.instrument).kind;
+  if (kind === "number") return left - right;
+  if (kind === "market") {
+    const leftRank = MARKET_STATUS_ORDER[left] ?? 4;
+    const rightRank = MARKET_STATUS_ORDER[right] ?? 4;
+    return leftRank - rightRank || compareText(left, right);
+  }
+  if (kind === "source") {
+    return compareText(left.provider, right.provider) || compareText(left.feed, right.feed);
+  }
+  return compareText(left, right);
+}
+
+function timestampValue(value) {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function compareOptionalNumbers(left, right) {
+  if (left === null) return right === null ? 0 : 1;
+  if (right === null) return -1;
+  return left - right;
+}
+
+function compareOptionalNumbersDescending(left, right) {
+  if (left === null) return right === null ? 0 : 1;
+  if (right === null) return -1;
+  return right - left;
+}
+
+function compareFixedFieldQuality(left, right, field) {
+  if (field === "market") {
+    const leftTime = timestampValue(left.quote?.as_of);
+    const rightTime = timestampValue(right.quote?.as_of);
+    return compareOptionalNumbersDescending(leftTime, rightTime);
+  }
+  if (field === "source") {
+    const fallbackOrder = compareOptionalNumbers(
+      finiteNumber(left.quote?.source?.fallback_level),
+      finiteNumber(right.quote?.source?.fallback_level),
+    );
+    if (fallbackOrder !== 0) return fallbackOrder;
+    return Number(Boolean(left.quote?.quality?.stale))
+      - Number(Boolean(right.quote?.quality?.stale));
+  }
+  return 0;
+}
+
+function compareSymbols(left, right) {
+  return compareText(left.instrument.symbol, right.instrument.symbol);
+}
+
+function compareRows(left, right, field, ascending) {
+  const leftValue = sortValue(left, field);
+  const rightValue = sortValue(right, field);
+  const leftMissing = leftValue === null;
+  const rightMissing = rightValue === null;
+  if (leftMissing || rightMissing) {
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+    return compareSymbols(left, right);
+  }
+  const primaryOrder = comparePrimaryValues(leftValue, rightValue, field);
+  if (primaryOrder !== 0) return ascending ? primaryOrder : -primaryOrder;
+  const qualityOrder = compareFixedFieldQuality(left, right, field);
+  return qualityOrder || compareSymbols(left, right);
+}
+
+function updateSortControls() {
+  ui.sortField.value = state.sortField;
+  ui.sortDirection.textContent = state.ascending ? "Ascending" : "Descending";
+  const currentDirection = state.ascending ? "ascending" : "descending";
+  const nextDirection = state.ascending ? "descending" : "ascending";
+  ui.sortDirection.setAttribute(
+    "aria-label",
+    `Sort ${nextDirection}; current order ${currentDirection}`,
+  );
+  for (const header of ui.sortHeaders) {
+    const active = header.dataset.sortField === state.sortField;
+    const tableHeader = header.closest("th");
+    const indicator = header.querySelector("[data-sort-indicator]");
+    header.classList.toggle("is-active", active);
+    if (indicator) indicator.textContent = active ? (state.ascending ? "\u2191" : "\u2193") : "";
+    if (active) tableHeader.setAttribute("aria-sort", state.ascending ? "ascending" : "descending");
+    else tableHeader.removeAttribute("aria-sort");
+  }
+}
+
+function selectSortField(field, { toggleIfActive = false } = {}) {
+  if (!Object.hasOwn(SORT_FIELDS, field)) return;
+  if (field === state.sortField) {
+    if (toggleIfActive) state.ascending = !state.ascending;
+  } else {
+    state.sortField = field;
+    state.ascending = true;
+  }
+  updateSortControls();
+  renderMarket();
 }
 
 function visibleRows() {
@@ -246,19 +392,12 @@ function visibleRows() {
       item.quote?.source?.provider,
       item.quote?.source?.feed,
     ].filter(Boolean).join(" ").toLowerCase();
-    const itemStatus = item.quote?.market_status || "unavailable";
+    const itemStatus = marketStatus(item);
     return (!query || haystack.includes(query))
       && (!assetClass || item.instrument.asset_class === assetClass)
       && (!status || itemStatus === status);
   });
-  filtered.sort((left, right) => {
-    const a = sortValue(left);
-    const b = sortValue(right);
-    if (a === null || a === undefined) return b === null || b === undefined ? 0 : 1;
-    if (b === null || b === undefined) return -1;
-    const order = typeof a === "string" ? a.localeCompare(b) : a - b;
-    return state.ascending ? order : -order;
-  });
+  filtered.sort((left, right) => compareRows(left, right, state.sortField, state.ascending));
   return filtered;
 }
 
@@ -289,7 +428,7 @@ function buildDetails(item) {
     ["Asset type", instrument.asset_type],
     ["Price basis", quote?.price_basis || instrument.price_basis],
     ["Change basis", instrument.change_basis],
-    ["Market status", quote?.market_status || "unavailable"],
+    ["Market status", marketStatus(item)],
     ["As of", dateTime(quote?.as_of)],
     ["Provider", quote?.source?.provider],
     ["Feed", quote?.source?.feed],
@@ -320,7 +459,7 @@ function buildDetails(item) {
 
 function marketCell(item) {
   const cell = document.createElement("td");
-  const status = item.quote?.market_status || "unavailable";
+  const status = marketStatus(item);
   const statusNode = textNode("span", status.toUpperCase(), "market-state");
   if (item.quote?.quality?.stale) statusNode.classList.add("is-stale");
   cell.append(statusNode, textNode("small", dateTime(item.quote?.as_of), "source-feed"));
@@ -696,14 +835,18 @@ for (const control of [ui.search, ui.assetFilter, ui.statusFilter]) {
   control.addEventListener("input", renderMarket);
 }
 ui.sortField.addEventListener("change", () => {
-  state.sortField = ui.sortField.value;
-  renderMarket();
+  selectSortField(ui.sortField.value);
 });
 ui.sortDirection.addEventListener("click", () => {
   state.ascending = !state.ascending;
-  ui.sortDirection.textContent = state.ascending ? "Ascending" : "Descending";
+  updateSortControls();
   renderMarket();
 });
+for (const header of ui.sortHeaders) {
+  header.addEventListener("click", () => {
+    selectSortField(header.dataset.sortField, { toggleIfActive: true });
+  });
+}
 ui.refreshMarket.addEventListener("click", refreshQuotes);
 ui.logLevel.addEventListener("change", renderLogs);
 ui.logSearch.addEventListener("input", renderLogs);
@@ -727,6 +870,7 @@ ui.reconnectLogs.addEventListener("click", connectLogStream);
 window.addEventListener("beforeunload", stopLogStream);
 
 initializeTheme();
+updateSortControls();
 ui.apiKey.value = state.apiKey;
 updateSummary();
 renderMarket();
