@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.14.6"
+          - os: ubuntu-latest
+            python: "3.14.6t"
+          - os: windows-latest
+            python: "3.14.6"
+          - os: windows-latest
+            python: "3.14.6t"
+          - os: macos-latest
+            python: "3.14.6"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+          version: "0.11.29"
+      - run: uv sync --locked --all-extras --python "${{ matrix.python }}"
+      - run: uv run --frozen --python "${{ matrix.python }}" ruff check .
+      - run: uv run --frozen --python "${{ matrix.python }}" ruff format --check .
+      - run: uv run --frozen --python "${{ matrix.python }}" pytest
+      - name: Assert production free-threaded runtime
+        if: matrix.python == '3.14.6t'
+        run: >-
+          uv run --frozen --python "${{ matrix.python }}" python -c
+          "import sys,sysconfig,aiohttp,fastapi,pydantic,uvicorn,quickprice.api,quickprice.providers,quickprice.storage;
+          assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1;
+          assert sys._is_gil_enabled() is False"
+
+  native-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          python-version: "3.14.6"
+          version: "0.11.29"
+      - run: uv sync --locked --all-extras --python 3.14.6
+      - name: Check shell scripts
+        run: |
+          shellcheck examples/quickprice.sh scripts/build_python314t.sh
+          bash -n examples/quickprice.sh scripts/build_python314t.sh
+      - name: Check repository text and native-only policy
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          paths = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          non_ascii = []
+          blocked_technology = "dock" + "er"
+          prohibited_artifacts = []
+          invalid_references = []
+          allowed_phrases = (
+              f"{blocked_technology} is not supported",
+              f"{blocked_technology} is intentionally unsupported",
+              f"without using {blocked_technology}",
+          )
+          prohibited_names = {
+              blocked_technology + "file",
+              "." + blocked_technology + "ignore",
+              "compose.yml",
+              "compose.yaml",
+          }
+          for raw_path in paths:
+              path = Path(raw_path)
+              lowered_name = path.name.lower()
+              if lowered_name in prohibited_names:
+                  prohibited_artifacts.append(raw_path)
+              data = path.read_bytes()
+              if b"\0" in data:
+                  continue
+              try:
+                  content = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+              if not content.isascii():
+                  non_ascii.append(raw_path)
+              for number, line in enumerate(content.splitlines(), 1):
+                  lowered = line.lower()
+                  if blocked_technology in lowered and not any(
+                      phrase in lowered for phrase in allowed_phrases
+                  ):
+                      invalid_references.append(f"{raw_path}:{number}: {line}")
+          failures = {
+              "non-ASCII text": non_ascii,
+              f"{blocked_technology.title()} artifacts": prohibited_artifacts,
+              f"unsupported {blocked_technology.title()} references": invalid_references,
+          }
+          failed = False
+          for label, items in failures.items():
+              if items:
+                  failed = True
+                  print(f"{label}:")
+                  print("\n".join(f"  {item}" for item in items))
+          raise SystemExit(1 if failed else 0)
+          PY
+      - name: Validate systemd service
+        run: |
+          sudo install -d /opt/quickprice/.venv/bin
+          sudo install -m 0755 /usr/bin/true /opt/quickprice/.venv/bin/quickprice
+          systemd-analyze verify deploy/systemd/quickprice.service
+      - name: Validate native Caddy configuration
+        env:
+          QUICKPRICE_DOMAIN: price.example.com
+          ACME_EMAIL: ci@example.com
+        run: |
+          go install github.com/caddyserver/caddy/v2/cmd/caddy@v2.11.4
+          "$HOME/go/bin/caddy" validate --config Caddyfile --adapter caddyfile

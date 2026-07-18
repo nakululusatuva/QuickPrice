@@ -1,0 +1,45 @@
+[Unit]
+Description=QuickPrice market data service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quickprice
+Group=quickprice
+WorkingDirectory=/opt/quickprice
+EnvironmentFile=/etc/quickprice/quickprice.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/quickprice/.venv/bin/quickprice serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGINT
+LimitNOFILE=65536
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/quickprice
+
+[Install]
+WantedBy=multi-user.target
