@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +91,8 @@ def _int(name: str, default: int, *, minimum: int = 0) -> int:
 
 def _float(name: str, default: float, *, minimum: float = 0) -> float:
     value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
     return value
@@ -187,6 +190,7 @@ class Settings:
     invalid_request_burst: int = 10
     dashboard_max_log_streams: int = 8
     provider_timeout_seconds: float = 8.0
+    catalog_warm_timeout_seconds: float = 180.0
     provider_proxy_url: str | None = None
     provider_proxy_names: tuple[str, ...] = ()
     circuit_failure_threshold: int = 3
@@ -203,6 +207,8 @@ class Settings:
     twelve_calls_per_minute: int = 8
     twelve_rate_gate_timeout_seconds: float = 5.0
     alpha_vantage_daily_credits: int = 25
+    alpaca_stream_symbol_limit: int = 30
+    alpaca_rest_calls_per_minute: int = 180
     finnhub_calls_per_minute: int = 60
     coingecko_monthly_credits: int = 9000
     high_frequency_publish_ms: int = 250
@@ -296,6 +302,9 @@ class Settings:
             provider_timeout_seconds=_float(
                 "QUICKPRICE_PROVIDER_TIMEOUT_SECONDS", 8.0, minimum=0.1
             ),
+            catalog_warm_timeout_seconds=_float(
+                "QUICKPRICE_CATALOG_WARM_TIMEOUT_SECONDS", 180.0, minimum=1.0
+            ),
             provider_proxy_url=provider_proxy_url,
             provider_proxy_names=provider_proxy_names,
             circuit_failure_threshold=_int("QUICKPRICE_CIRCUIT_FAILURE_THRESHOLD", 3, minimum=1),
@@ -315,6 +324,10 @@ class Settings:
             ),
             alpha_vantage_daily_credits=_int(
                 "QUICKPRICE_ALPHA_VANTAGE_DAILY_CREDITS", 25, minimum=1
+            ),
+            alpaca_stream_symbol_limit=_int("QUICKPRICE_ALPACA_STREAM_SYMBOL_LIMIT", 30, minimum=0),
+            alpaca_rest_calls_per_minute=_int(
+                "QUICKPRICE_ALPACA_REST_CALLS_PER_MINUTE", 180, minimum=1
             ),
             finnhub_calls_per_minute=_int("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", 60, minimum=1),
             coingecko_monthly_credits=_int(

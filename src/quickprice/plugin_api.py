@@ -20,6 +20,7 @@ class AssetClass(StrEnum):
 class YieldStrategy(StrEnum):
     LATEST_DISTRIBUTION_ANNUALIZED = "latest_distribution_annualized"
     TREASURY_3M_PROXY_MINUS_EXPENSE = "treasury_3m_proxy_minus_expense"
+    TREASURY_PROXY_MINUS_EXPENSE = "treasury_proxy_minus_expense"
     STAKING_PROVIDER_METRIC = "staking_provider_metric"
 
 

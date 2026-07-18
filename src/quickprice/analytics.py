@@ -127,3 +127,30 @@ def boxx_yield(metric: YieldMetric) -> YieldEstimate:
             "net_expense_percent": float(BOXX_NET_EXPENSE_PERCENT),
         },
     )
+
+
+def treasury_proxy_yield(metric: YieldMetric) -> YieldEstimate:
+    """Project an already expense-adjusted, controlled FRED Treasury proxy."""
+
+    if metric.method != "treasury_series_proxy_minus_expense":
+        raise ValueError("generic Treasury proxy metric has an unexpected method")
+    if not metric.components:
+        raise ValueError("generic Treasury proxy metric is missing its FRED component")
+    component = metric.components[0]
+    expense = component.price - metric.value
+    if expense < 0:
+        raise ValueError("generic Treasury proxy expense cannot be negative")
+    return YieldEstimate(
+        percent=metric.value,
+        as_of=metric.as_of,
+        method=metric.method,
+        provider=metric.provider,
+        is_proxy=True,
+        components=metric.components,
+        fallback_level=metric.fallback_level,
+        inputs={
+            "fred_series": component.symbol,
+            "treasury_percent": float(component.price),
+            "net_expense_percent": float(expense),
+        },
+    )

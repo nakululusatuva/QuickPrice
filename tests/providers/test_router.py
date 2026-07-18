@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from quickprice.domain import PricePoint, ProviderQuote
+from quickprice.domain import DividendEvent, PricePoint, ProviderQuote, YieldMetric
 from quickprice.providers.base import AllProvidersFailed, Capability, ProviderUnavailable
 from quickprice.providers.router import ProviderRouter
 
@@ -36,6 +36,15 @@ class ScriptedProvider:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class CloseTrackedProvider(ScriptedProvider):
+    def __init__(self, name: str):
+        super().__init__(name, [fixed_quote(name)])
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 class OutOfRangeProvider:
@@ -74,6 +83,17 @@ class HistoryProviderFixture:
         return self.points
 
 
+class YieldProviderFixture:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+        self.calls = 0
+
+    async def get_yield(self, symbol):
+        self.calls += 1
+        return self.value
+
+
 @pytest.mark.asyncio
 async def test_fallback_is_labeled_and_counted():
     first = ScriptedProvider("primary", [ProviderUnavailable("primary", "down")])
@@ -85,6 +105,126 @@ async def test_fallback_is_labeled_and_counted():
     assert result.provider == "backup"
     assert result.fallback_level == 1
     assert router.fallback_counts() == {"BTC:USDC|quote|backup": 1}
+
+
+@pytest.mark.asyncio
+async def test_wrong_symbol_quote_results_are_failures_at_primary_and_fallback_levels():
+    primary = ScriptedProvider(
+        "primary",
+        [
+            ProviderQuote(
+                symbol="ETH:USDC",
+                price=Decimal("20"),
+                as_of=datetime(2026, 7, 20, tzinfo=UTC),
+                provider="primary",
+                feed="fixture",
+            )
+        ],
+    )
+    fallback = ScriptedProvider(
+        "fallback",
+        [
+            ProviderQuote(
+                symbol="btc:usdc",
+                price=Decimal("15"),
+                as_of=datetime(2026, 7, 20, tzinfo=UTC),
+                provider="fallback",
+                feed="fixture",
+            )
+        ],
+    )
+    final = ScriptedProvider("final", [fixed_quote("final")])
+    router = ProviderRouter({("BTC:USDC", Capability.QUOTE): [primary, fallback, final]})
+
+    result = await router.get_quote("BTC:USDC")
+
+    assert result.provider == "final"
+    assert result.fallback_level == 2
+    assert primary.calls == fallback.calls == final.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_wrong_symbol_history_point_is_rejected_before_merging_fallbacks():
+    observed_at = datetime(2026, 7, 20, tzinfo=UTC)
+    primary = HistoryProviderFixture(
+        "primary",
+        (PricePoint("ETH:USDC", observed_at, Decimal("20"), "primary"),),
+    )
+    fallback = HistoryProviderFixture(
+        "fallback",
+        (PricePoint("BTC:USDC", observed_at, Decimal("10"), "fallback"),),
+    )
+    router = ProviderRouter({("BTC:USDC", Capability.HISTORY): [primary, fallback]})
+
+    result = await router.get_history(
+        "BTC:USDC",
+        interval="1m",
+        start=observed_at - timedelta(minutes=1),
+        end=observed_at,
+    )
+
+    assert result == fallback.points
+    assert router.fallback_counts() == {"BTC:USDC|history|fallback": 1}
+    assert primary.calls == fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_wrong_symbol_dividend_is_rejected_before_metadata_fallback():
+    wrong = DividendEvent(
+        symbol="SGOV:USD",
+        ex_date=date(2026, 7, 1),
+        payment_date=date(2026, 7, 7),
+        amount=Decimal("0.30"),
+        currency="USD",
+        frequency="quarterly",
+        provider="primary",
+    )
+    expected = DividendEvent(
+        symbol="QQQM:USD",
+        ex_date=date(2026, 7, 1),
+        payment_date=date(2026, 7, 7),
+        amount=Decimal("0.30"),
+        currency="USD",
+        frequency="quarterly",
+        provider="fallback",
+    )
+    primary = DividendProviderFixture("primary", wrong)
+    fallback = DividendProviderFixture("fallback", expected)
+    router = ProviderRouter({("QQQM:USD", Capability.DIVIDEND): [primary, fallback]})
+
+    result = await router.get_latest_dividend("QQQM:USD")
+
+    assert result is not None
+    assert result.symbol == "QQQM:USD"
+    assert primary.calls == fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_wrong_symbol_yield_is_rejected_before_metadata_fallback():
+    observed_at = datetime(2026, 7, 20, tzinfo=UTC)
+    wrong = YieldMetric(
+        symbol="STETH:USDC",
+        value=Decimal("2.5"),
+        as_of=observed_at,
+        method="fixture",
+        provider="primary",
+    )
+    expected = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("2.3"),
+        as_of=observed_at,
+        method="fixture",
+        provider="fallback",
+    )
+    primary = YieldProviderFixture("primary", wrong)
+    fallback = YieldProviderFixture("fallback", expected)
+    router = ProviderRouter({("WBETH:USDC", Capability.YIELD): [primary, fallback]})
+
+    result = await router.get_yield("WBETH:USDC")
+
+    assert result.symbol == "WBETH:USDC"
+    assert result.fallback_level == 1
+    assert primary.calls == fallback.calls == 1
 
 
 @pytest.mark.asyncio
@@ -315,6 +455,24 @@ def test_duplicate_route_registration_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="duplicate provider route"):
         router.register("BTC:USDC", Capability.QUOTE, [provider])
+
+
+@pytest.mark.asyncio
+async def test_close_can_transfer_provider_ownership_without_leaking_flights() -> None:
+    retained = CloseTrackedProvider("retained")
+    retired = CloseTrackedProvider("retired")
+    router = ProviderRouter(
+        {
+            ("BTC:USDC", Capability.QUOTE): [retained],
+            ("ETH:USDC", Capability.QUOTE): [retired],
+        }
+    )
+
+    await router.close(exclude_providers=(retained,))
+
+    assert retained.close_calls == 0
+    assert retired.close_calls == 1
+    assert router._flights == {}
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from datetime import time as datetime_time
 from decimal import Decimal
@@ -22,6 +22,43 @@ from .base import (
     require_sequence,
 )
 from .quota import rolling_month_safe_daily_budget
+
+# CoinGecko documents comma-separated IDs but no hard ID-count ceiling for
+# /simple/price. These conservative transport bounds keep both the number of
+# IDs and the encoded query component comfortably finite across proxies.
+COINGECKO_SIMPLE_PRICE_IDS_PER_REQUEST = 250
+COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST = 3_500
+
+
+def coingecko_simple_price_id_batches(
+    coin_ids: Sequence[str],
+) -> tuple[tuple[str, ...], ...]:
+    """Partition unique IDs by count and joined-query character length."""
+
+    normalized = tuple(
+        sorted({str(coin_id).strip() for coin_id in coin_ids if str(coin_id).strip()})
+    )
+    batches: list[tuple[str, ...]] = []
+    current: list[str] = []
+    current_characters = 0
+    for coin_id in normalized:
+        if len(coin_id) > COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST:
+            raise ValueError("CoinGecko coin ID exceeds the safe query length")
+        added_characters = len(coin_id) + (1 if current else 0)
+        if current and (
+            len(current) >= COINGECKO_SIMPLE_PRICE_IDS_PER_REQUEST
+            or current_characters + added_characters
+            > COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST
+        ):
+            batches.append(tuple(current))
+            current = []
+            current_characters = 0
+            added_characters = len(coin_id)
+        current.append(coin_id)
+        current_characters += added_characters
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
 
 
 class CoinGeckoProvider(HttpProvider):
@@ -79,6 +116,8 @@ class CoinGeckoProvider(HttpProvider):
         api_key: str | None = None,
         *,
         coin_ids: Mapping[str, str] | None = None,
+        history_symbols: Sequence[str] | None = None,
+        component_skew_limits: Mapping[str, timedelta] | None = None,
         cache_ttl_seconds: float = 300.0,
         maximum_error_cache_ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
@@ -88,7 +127,25 @@ class CoinGeckoProvider(HttpProvider):
         super().__init__(**kwargs)
         self.api_key = api_key
         self.coin_ids = {
-            key.strip().upper(): value for key, value in (coin_ids or type(self).coin_ids).items()
+            key.strip().upper(): value
+            for key, value in (type(self).coin_ids if coin_ids is None else coin_ids).items()
+        }
+        configured_history_symbols = (
+            type(self).history_symbols if history_symbols is None else history_symbols
+        )
+        self.history_symbols = frozenset(
+            symbol.strip().upper()
+            for symbol in configured_history_symbols
+            if symbol.strip().upper() in self.coin_ids
+        )
+        self.component_skew_limits = {
+            symbol.strip().upper(): value
+            for symbol, value in (
+                type(self).component_skew_limits
+                if component_skew_limits is None
+                else component_skew_limits
+            ).items()
+            if symbol.strip().upper() in self.coin_ids
         }
         self._cache_ttl_seconds = max(1.0, cache_ttl_seconds)
         self._maximum_error_cache_ttl_seconds = max(
@@ -123,53 +180,68 @@ class CoinGeckoProvider(HttpProvider):
 
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
+        quote_asset = normalized.partition(":")[2]
+        if quote_asset not in {"USD", "USDC"}:
+            raise UnsupportedInstrument(
+                self.name,
+                f"unsupported quote asset {quote_asset}",
+            )
         coin_id = self._coin(normalized)
         document = await self._simple_prices()
         try:
             asset = require_mapping(document[coin_id], self.name, coin_id)
-            usdc = require_mapping(document["usd-coin"], self.name, "usd-coin")
             asset_price = decimal_value(asset["usd"])
-            usdc_price = decimal_value(usdc["usd"])
             asset_time = utc_datetime(asset["last_updated_at"])
-            usdc_time = utc_datetime(usdc["last_updated_at"])
-            skew_limit = self.component_skew_limits.get(normalized)
-            if skew_limit is not None and abs(asset_time - usdc_time) > skew_limit:
-                raise MalformedResponse(
-                    self.name,
-                    "staking-token and USDC component timestamps exceed the configured limit",
-                )
-            result_price = asset_price / usdc_price
+            if quote_asset == "USDC":
+                usdc = require_mapping(document["usd-coin"], self.name, "usd-coin")
+                usdc_price = decimal_value(usdc["usd"])
+                usdc_time = utc_datetime(usdc["last_updated_at"])
+                skew_limit = self.component_skew_limits.get(normalized)
+                if skew_limit is not None and abs(asset_time - usdc_time) > skew_limit:
+                    raise MalformedResponse(
+                        self.name,
+                        "staking-token and USDC component timestamps exceed the configured limit",
+                    )
+                result_price = asset_price / usdc_price
+            else:
+                result_price = asset_price
+                usdc_price = None
+                usdc_time = None
         except MalformedResponse:
             raise
         except (KeyError, ValueError, ZeroDivisionError) as exc:
             raise MalformedResponse(self.name, "invalid simple-price response") from exc
         components = (
-            component(
-                symbol=f"{normalized.split(':', 1)[0]}:USD",
-                provider=self.name,
-                price=asset_price,
-                as_of=asset_time,
-                feed=self.feed,
-                role="numerator",
-            ),
-            component(
-                symbol="USDC:USD",
-                provider=self.name,
-                price=usdc_price,
-                as_of=usdc_time,
-                feed=self.feed,
-                role="denominator",
-            ),
+            (
+                component(
+                    symbol=f"{normalized.split(':', 1)[0]}:USD",
+                    provider=self.name,
+                    price=asset_price,
+                    as_of=asset_time,
+                    feed=self.feed,
+                    role="numerator",
+                ),
+                component(
+                    symbol="USDC:USD",
+                    provider=self.name,
+                    price=usdc_price,
+                    as_of=usdc_time,
+                    feed=self.feed,
+                    role="denominator",
+                ),
+            )
+            if usdc_price is not None and usdc_time is not None
+            else ()
         )
         return quote(
             symbol=normalized,
             price=result_price,
-            as_of=min(asset_time, usdc_time),
+            as_of=min(asset_time, usdc_time) if usdc_time is not None else asset_time,
             provider=self.name,
             feed=self.feed,
-            price_basis="aggregated_spot_ratio",
+            price_basis=("aggregated_spot_ratio" if quote_asset == "USDC" else "aggregated_spot"),
             market_status="open",
-            is_derived=True,
+            is_derived=quote_asset == "USDC",
             components=components,
             fallback_level=0,
             license_scope="personal_internal",
@@ -201,19 +273,22 @@ class CoinGeckoProvider(HttpProvider):
             self._cache_expires_at = now + self._cache_ttl_seconds
             self._price_cache = None
             self._refresh_error = None
-            ids = sorted({*self.coin_ids.values(), "usd-coin"})
+            id_batches = coingecko_simple_price_id_batches((*self.coin_ids.values(), "usd-coin"))
             try:
-                payload = await self._request_json(
-                    "GET",
-                    f"{self.base_url}/simple/price",
-                    params={
-                        "ids": ",".join(ids),
-                        "vs_currencies": "usd",
-                        "include_last_updated_at": "true",
-                    },
-                    headers=self._headers,
-                )
-                document = require_mapping(payload, self.name)
+                merged: dict[str, object] = {}
+                for ids in id_batches:
+                    payload = await self._request_json(
+                        "GET",
+                        f"{self.base_url}/simple/price",
+                        params={
+                            "ids": ",".join(ids),
+                            "vs_currencies": "usd",
+                            "include_last_updated_at": "true",
+                        },
+                        headers=self._headers,
+                    )
+                    document = require_mapping(payload, self.name)
+                    merged.update(document)
             except Exception as exc:
                 self._consecutive_refresh_failures += 1
                 exponent = min(self._consecutive_refresh_failures - 1, 10)
@@ -224,10 +299,10 @@ class CoinGeckoProvider(HttpProvider):
                 self._cache_expires_at = self._clock() + error_ttl
                 self._refresh_error = str(exc) or type(exc).__name__
                 raise
-            self._price_cache = document
+            self._price_cache = merged
             self._refresh_error = None
             self._consecutive_refresh_failures = 0
-            return document
+            return merged
 
     async def get_history(
         self,
@@ -239,6 +314,12 @@ class CoinGeckoProvider(HttpProvider):
         limit: int | None = None,
     ):
         normalized = symbol.strip().upper()
+        quote_asset = normalized.partition(":")[2]
+        if quote_asset not in {"USD", "USDC"}:
+            raise UnsupportedInstrument(
+                self.name,
+                f"unsupported quote asset {quote_asset}",
+            )
         if normalized not in self.history_symbols:
             raise UnsupportedInstrument(
                 self.name,
@@ -275,7 +356,7 @@ class CoinGeckoProvider(HttpProvider):
         )
         document = require_mapping(payload, self.name)
         prices = require_sequence(document.get("prices"), self.name, "historical prices")
-        quoted_in_usdc = normalized.endswith(":USDC")
+        quoted_in_usdc = quote_asset == "USDC"
         current_usdc_usd = (
             await self._history_usdc_normalization_price() if quoted_in_usdc else decimal_value(1)
         )

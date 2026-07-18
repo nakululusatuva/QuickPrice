@@ -132,6 +132,18 @@ def test_alpaca_trading_clock_defaults_to_paper_and_is_configurable(monkeypatch)
     assert Settings.from_env().alpaca_trading_base_url == "https://clock.example.invalid/v2"
 
 
+def test_alpaca_capacity_and_catalog_warm_limits_are_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_ALPACA_STREAM_SYMBOL_LIMIT", "50")
+    monkeypatch.setenv("QUICKPRICE_ALPACA_REST_CALLS_PER_MINUTE", "220")
+    monkeypatch.setenv("QUICKPRICE_CATALOG_WARM_TIMEOUT_SECONDS", "900")
+
+    settings = Settings.from_env()
+
+    assert settings.alpaca_stream_symbol_limit == 50
+    assert settings.alpaca_rest_calls_per_minute == 220
+    assert settings.catalog_warm_timeout_seconds == 900
+
+
 def test_finnhub_key_and_minute_quota_are_configurable(monkeypatch) -> None:
     monkeypatch.setenv("FINNHUB_API_KEY", " legacy-finnhub-key ")
     monkeypatch.setenv("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", "42")
@@ -162,6 +174,14 @@ def test_twelve_rate_gate_timeout_must_be_positive(monkeypatch) -> None:
     monkeypatch.setenv("QUICKPRICE_TWELVE_RATE_GATE_TIMEOUT_SECONDS", "0")
 
     with pytest.raises(ValueError, match=r"must be >= 0\.1"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_float_settings_must_be_finite(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("QUICKPRICE_PROVIDER_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ValueError, match="must be finite"):
         Settings.from_env()
 
 

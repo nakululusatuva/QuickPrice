@@ -21,6 +21,7 @@ from .base import (
     UnsupportedInstrument,
     require_mapping,
 )
+from .quota import SlidingWindowRateGate
 
 
 class AlpacaProvider(HttpProvider):
@@ -32,7 +33,14 @@ class AlpacaProvider(HttpProvider):
     feed = "iex"
     stream_poll_suppression_seconds = 120.0
     closed_market_quote_poll_seconds = 900.0
+    # Alpaca Basic accounts have a bounded real-time subscription surface.
+    # Keep the streaming set deterministic and let the quota-paced scheduler
+    # collect every remaining binding over REST instead of reconnecting an
+    # oversized WebSocket subscription forever.
+    default_stream_symbol_limit = 30
+    default_rest_calls_per_minute = 180
     symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
+    stream_symbols: ClassVar[tuple[str, ...]] = tuple(symbols)[:default_stream_symbol_limit]
     _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
     _frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
     _intervals: ClassVar[dict[str, str]] = {
@@ -49,11 +57,59 @@ class AlpacaProvider(HttpProvider):
         api_secret: str,
         *,
         trading_base_url: str | None = None,
+        symbol_bindings: Mapping[str, str] | None = None,
+        dividend_frequencies: Mapping[str, str] | None = None,
+        stream_symbols: Sequence[str] | None = None,
+        stream_symbol_limit: int = default_stream_symbol_limit,
+        rest_calls_per_minute: int = default_rest_calls_per_minute,
+        rest_gate: SlidingWindowRateGate | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.api_key = api_key
         self.api_secret = api_secret
+        self.symbols = {
+            symbol.strip().upper(): ticker.strip().upper()
+            for symbol, ticker in (
+                type(self).symbols if symbol_bindings is None else symbol_bindings
+            ).items()
+        }
+        if len(set(self.symbols.values())) != len(self.symbols):
+            raise ValueError("Alpaca tickers must be unique")
+        self._reverse_symbols = {ticker: symbol for symbol, ticker in self.symbols.items()}
+        if stream_symbol_limit < 0:
+            raise ValueError("stream_symbol_limit cannot be negative")
+        if rest_calls_per_minute <= 0:
+            raise ValueError("rest_calls_per_minute must be positive")
+        requested_stream_symbols = (
+            tuple(self.symbols)[:stream_symbol_limit]
+            if stream_symbols is None
+            else tuple(dict.fromkeys(symbol.strip().upper() for symbol in stream_symbols))
+        )
+        if len(requested_stream_symbols) > stream_symbol_limit:
+            raise ValueError("Alpaca stream symbol limit is exceeded")
+        if any(symbol not in self.symbols for symbol in requested_stream_symbols):
+            raise ValueError("Alpaca stream symbol is not present in symbol bindings")
+        self.stream_symbols = requested_stream_symbols
+        # Reserve ten percent for clock, history, and dividend calls.  The
+        # coordinator also suppresses REST quote polling while a fresh stream
+        # observation exists, so this floor principally controls overflow.
+        usable_quote_calls = max(1.0, rest_calls_per_minute * 0.9)
+        # Size the floor for a complete WebSocket outage, not only the normal
+        # overflow set. Every symbol may need a REST probe while reconnecting.
+        rest_quote_symbols = max(1, len(self.symbols))
+        self.minimum_quote_poll_seconds = max(
+            20.0,
+            rest_quote_symbols * 60.0 / usable_quote_calls,
+        )
+        self._rest_gate = rest_gate or SlidingWindowRateGate(rest_calls_per_minute, 60.0)
+        self._frequencies = {
+            symbol.strip().upper(): frequency.strip().lower()
+            for symbol, frequency in (
+                type(self)._frequencies if dividend_frequencies is None else dividend_frequencies
+            ).items()
+            if symbol.strip().upper() in self.symbols
+        }
         resolved_trading_url = (
             type(self).trading_base_url if trading_base_url is None else trading_base_url
         ).strip()
@@ -64,6 +120,12 @@ class AlpacaProvider(HttpProvider):
         self._market_status_observed_at: datetime | None = None
         self._market_status_expires = 0.0
         self._market_status_lock = asyncio.Lock()
+
+    async def _request_json(self, *args: Any, **kwargs: Any) -> Any:
+        """Pace every Alpaca REST operation through one process-local gate."""
+
+        await self._rest_gate.acquire()
+        return await super()._request_json(*args, **kwargs)
 
     @property
     def _headers(self) -> dict[str, str]:

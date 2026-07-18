@@ -45,6 +45,8 @@ class FinnhubProvider(HttpProvider):
         self,
         api_key: str,
         *,
+        symbol_bindings: Mapping[str, str] | None = None,
+        stream_symbols: Sequence[str] | None = None,
         quote_cache_ttl_seconds: float | None = None,
         quote_cache_clock: Callable[[], float] = time.monotonic,
         burst_gate: SlidingWindowRateGate | None = None,
@@ -56,6 +58,23 @@ class FinnhubProvider(HttpProvider):
         kwargs.setdefault("quota", minute_budget(60))
         super().__init__(**kwargs)
         self.api_key = normalized_key
+        self.symbols = {
+            symbol.strip().upper(): ticker.strip().upper()
+            for symbol, ticker in (
+                type(self).symbols if symbol_bindings is None else symbol_bindings
+            ).items()
+        }
+        if len(set(self.symbols.values())) != len(self.symbols):
+            raise ValueError("Finnhub tickers must be unique")
+        self._reverse_symbols = {ticker: symbol for symbol, ticker in self.symbols.items()}
+        requested_stream_symbols = (
+            tuple(self.symbols)[:50] if stream_symbols is None else stream_symbols
+        )
+        self.stream_symbols = tuple(
+            dict.fromkeys(symbol.strip().upper() for symbol in requested_stream_symbols)
+        )
+        if any(symbol not in self.symbols for symbol in self.stream_symbols):
+            raise ValueError("Finnhub stream symbol is not present in symbol bindings")
         quota_limit = self.quota.limit if self.quota is not None else 60
         # Leave meaningful headroom below the upstream minute ceiling. The
         # dynamic floor also scales safely if the canonical catalog grows.

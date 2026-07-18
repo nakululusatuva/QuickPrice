@@ -11,8 +11,15 @@ from quickprice.analytics import (
     qqqm_dividend,
     quarterly_dividend,
     sgov_yield,
+    treasury_proxy_yield,
 )
-from quickprice.domain import DividendEvent, PricePoint, ProviderQuote, YieldMetric
+from quickprice.domain import (
+    DividendEvent,
+    PricePoint,
+    ProviderQuote,
+    SourceComponent,
+    YieldMetric,
+)
 
 UTC = UTC
 
@@ -134,3 +141,35 @@ def test_boxx_treasury_proxy_subtracts_net_expense_percentage_points():
     assert estimate.percent == Decimal("4.0551")
     assert estimate.method == "treasury_3m_proxy_minus_expense"
     assert estimate.is_proxy is True
+
+
+def test_generic_treasury_proxy_preserves_series_and_configured_expense() -> None:
+    as_of = datetime(2026, 7, 19, tzinfo=UTC)
+    estimate = treasury_proxy_yield(
+        YieldMetric(
+            "BOND:USD",
+            Decimal("4.15"),
+            as_of,
+            "treasury_series_proxy_minus_expense",
+            "fred",
+            True,
+            components=(
+                SourceComponent(
+                    "DGS10",
+                    "fred",
+                    Decimal("4.25"),
+                    as_of,
+                    "fred_daily",
+                    "treasury_yield_percent",
+                ),
+            ),
+        )
+    )
+
+    assert estimate.percent == Decimal("4.15")
+    assert estimate.method == "treasury_series_proxy_minus_expense"
+    assert estimate.inputs == {
+        "fred_series": "DGS10",
+        "treasury_percent": 4.25,
+        "net_expense_percent": 0.1,
+    }

@@ -17,7 +17,12 @@ from quickprice.domain import (
     YieldMetric,
     YieldRateType,
 )
-from quickprice.providers.base import Capability, MalformedResponse, ProviderUnavailable
+from quickprice.providers.base import (
+    Capability,
+    MalformedResponse,
+    ProviderUnavailable,
+    UnsupportedInstrument,
+)
 from quickprice.providers.router import ProviderRouter
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
@@ -150,8 +155,9 @@ async def test_ethereum_wbeth_exchange_rate_history_produces_trailing_apy():
 
     provider._rpc = AsyncMock(side_effect=rpc)
 
-    metric = await provider.get_yield("WBETH:USDC")
+    metric = await provider.get_yield("WBETH:USD")
 
+    assert metric.symbol == "WBETH:USD"
     assert metric.method == "onchain_exchange_rate_trailing_apy"
     assert metric.rate_type is YieldRateType.APY
     assert metric.accrual_mode is RewardAccrualMode.VALUE_ACCRUING
@@ -407,8 +413,9 @@ async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
         }
     )
 
-    metric = await provider.get_yield("WBETH:USDC")
+    metric = await provider.get_yield("WBETH:USD")
 
+    assert metric.symbol == "WBETH:USD"
     assert metric.value == Decimal("2.300")
     assert metric.rate_type is YieldRateType.APR
     assert metric.method == "binance_wbeth_rate_history_apr"
@@ -466,6 +473,8 @@ async def test_binance_wbeth_rate_rejects_negative_vendor_apr():
     (
         ("STETH:USDC", RewardAccrualMode.REBASING_BALANCE),
         ("WSTETH:USDC", RewardAccrualMode.VALUE_ACCRUING),
+        ("STETH:USD", RewardAccrualMode.REBASING_BALANCE),
+        ("WSTETH:USD", RewardAccrualMode.VALUE_ACCRUING),
     ),
 )
 async def test_lido_official_sma_apr_preserves_token_accrual_mode(
@@ -559,7 +568,7 @@ async def test_generic_market_ratio_is_a_low_confidence_30_day_proxy():
                 staking_pair="LST:USD",
                 underlying_pair="BASE:USD",
                 underlying_asset="BASE",
-                accrual_mode=RewardAccrualMode.REBASING_BALANCE,
+                accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
             ),
         ),
         clock=lambda: now,
@@ -572,7 +581,7 @@ async def test_generic_market_ratio_is_a_low_confidence_30_day_proxy():
     assert metric.is_estimate is True
     assert metric.fallback_level == 0
     assert metric.rate_type is YieldRateType.APY
-    assert metric.accrual_mode is RewardAccrualMode.REBASING_BALANCE
+    assert metric.accrual_mode is RewardAccrualMode.VALUE_ACCRUING
     assert metric.observation_window_days == Decimal("30.5")
     assert metric.accrual_index is not None
     assert metric.accrual_index.kind == "market_price_ratio"
@@ -631,7 +640,7 @@ async def test_market_ratio_alignment_never_uses_a_future_underlying_price():
                 staking_pair="LST:USD",
                 underlying_pair="BASE:USD",
                 underlying_asset="BASE",
-                accrual_mode=RewardAccrualMode.CLAIMABLE_REWARDS,
+                accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
             ),
         ),
         clock=lambda: now,
@@ -648,7 +657,7 @@ async def test_market_ratio_alignment_never_uses_a_future_underlying_price():
         reference - timedelta(hours=2),
         now - timedelta(hours=2),
     ]
-    assert metric.accrual_mode is RewardAccrualMode.CLAIMABLE_REWARDS
+    assert metric.accrual_mode is RewardAccrualMode.VALUE_ACCRUING
     assert metric.is_proxy is True
     assert metric.quality is not None and metric.quality.confidence == "low"
 
@@ -662,3 +671,25 @@ def test_market_ratio_requires_the_same_quote_asset():
             underlying_asset="BASE",
             accrual_mode=RewardAccrualMode.CLAIMABLE_REWARDS,
         )
+
+
+def test_market_ratio_rejects_non_value_accruing_tokens() -> None:
+    with pytest.raises(ValueError, match="only valid for value-accruing"):
+        StakingMarketRatioSpec(
+            symbol="LST:USD",
+            staking_pair="LST:USD",
+            underlying_pair="BASE:USD",
+            underlying_asset="BASE",
+            accrual_mode=RewardAccrualMode.REBASING_BALANCE,
+        )
+
+
+def test_ethereum_exchange_rate_spec_rebinds_only_the_quote_currency() -> None:
+    provider = EthereumExchangeRateYieldProvider("https://ethereum.invalid")
+
+    spec = provider._spec("WBETH:USD")
+
+    assert spec.symbol == "WBETH:USD"
+    assert spec.index_symbol == "WBETH:ETH"
+    with pytest.raises(UnsupportedInstrument):
+        provider._spec("WSTETH:USD")

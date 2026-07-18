@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
+import asyncio
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, ClassVar
@@ -17,6 +18,14 @@ from .base import (
     UnsupportedInstrument,
     require_sequence,
 )
+
+# Binance documents 1,024 streams per connection and 300 connection attempts
+# per five minutes per IP. Smaller shards bound the combined-stream request URI;
+# ten shards still cover the managed catalog's 2,000-instrument ceiling while
+# keeping a full reconnect well below the provider's connection-attempt limit.
+BINANCE_STREAMS_PER_CONNECTION = 250
+BINANCE_STREAM_PATH_MAX_CHARACTERS = 8_000
+BINANCE_MAX_STREAM_CONNECTIONS = 10
 
 
 class BinanceProvider(HttpProvider):
@@ -52,11 +61,30 @@ class BinanceProvider(HttpProvider):
     def __init__(
         self,
         *args,
+        symbol_bindings: Mapping[str, str] | None = None,
+        midpoint_symbols: Sequence[str] | None = None,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         maximum_relative_book_spread: Decimal = Decimal("0.005"),
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self.symbols = {
+            symbol.strip().upper(): vendor_symbol.strip().upper()
+            for symbol, vendor_symbol in (
+                type(self).symbols if symbol_bindings is None else symbol_bindings
+            ).items()
+        }
+        if len(set(self.symbols.values())) != len(self.symbols):
+            raise ValueError("Binance vendor symbols must be unique")
+        self._reverse_symbols = {value: key for key, value in self.symbols.items()}
+        configured_midpoints = (
+            type(self)._midpoint_symbols if midpoint_symbols is None else midpoint_symbols
+        )
+        self._midpoint_symbols = frozenset(
+            symbol.strip().upper()
+            for symbol in configured_midpoints
+            if symbol.strip().upper() in self.symbols
+        )
         self._wall_clock = wall_clock
         self.maximum_relative_book_spread = decimal_value(maximum_relative_book_spread)
         if self.maximum_relative_book_spread <= 0:
@@ -68,6 +96,38 @@ class BinanceProvider(HttpProvider):
             return self.symbols[normalized]
         except KeyError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}") from exc
+
+    def stream_connection_batches(
+        self,
+        symbols: Sequence[str],
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return bounded canonical-symbol shards for combined WebSockets."""
+
+        normalized = tuple(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        batches: list[tuple[str, ...]] = []
+        current: list[str] = []
+        current_path_characters = 0
+        for symbol in normalized:
+            stream_name = f"{self._exchange_symbol(symbol).lower()}@trade"
+            added_characters = len(stream_name) + (1 if current else 0)
+            if current and (
+                len(current) >= BINANCE_STREAMS_PER_CONNECTION
+                or current_path_characters + added_characters > BINANCE_STREAM_PATH_MAX_CHARACTERS
+            ):
+                batches.append(tuple(current))
+                current = []
+                current_path_characters = 0
+                added_characters = len(stream_name)
+            current.append(symbol)
+            current_path_characters += added_characters
+        if current:
+            batches.append(tuple(current))
+        if len(batches) > BINANCE_MAX_STREAM_CONNECTIONS:
+            raise ProviderUnavailable(
+                self.name,
+                "stream subscription exceeds the safe connection-shard limit",
+            )
+        return tuple(batches)
 
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
@@ -213,9 +273,8 @@ class BinanceProvider(HttpProvider):
                 raise MalformedResponse(self.name, "invalid kline value") from exc
         return tuple(result)
 
-    async def stream_quotes(self, symbols: Sequence[str]) -> AsyncIterator[Any]:
-        normalized = tuple(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
-        exchange_symbols = [self._exchange_symbol(symbol) for symbol in normalized]
+    async def _stream_quote_batch(self, symbols: Sequence[str]) -> AsyncIterator[Any]:
+        exchange_symbols = [self._exchange_symbol(symbol) for symbol in symbols]
         streams = "/".join(f"{symbol.lower()}@trade" for symbol in exchange_symbols)
         session = await self._ensure_session()
         try:
@@ -265,3 +324,47 @@ class BinanceProvider(HttpProvider):
             from .base import ProviderUnavailable
 
             raise ProviderUnavailable(self.name, type(exc).__name__) from None
+
+    async def stream_quotes(self, symbols: Sequence[str]) -> AsyncIterator[Any]:
+        """Merge a bounded number of combined-stream connections."""
+
+        batches = self.stream_connection_batches(symbols)
+        if not batches:
+            return
+        if len(batches) == 1:
+            async for item in self._stream_quote_batch(batches[0]):
+                yield item
+            return
+
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=1_024)
+
+        async def consume(batch: tuple[str, ...]) -> None:
+            try:
+                async for item in self._stream_quote_batch(batch):
+                    await queue.put(("quote", item))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await queue.put(("error", exc))
+            else:
+                await queue.put(("closed", None))
+
+        tasks = [
+            asyncio.create_task(consume(batch), name=f"binance-stream-shard:{index}")
+            for index, batch in enumerate(batches)
+        ]
+        try:
+            while True:
+                event, value = await queue.get()
+                if event == "quote":
+                    yield value
+                elif event == "error":
+                    raise value
+                else:
+                    # Reconnect the complete shard set together. Otherwise a
+                    # normally closed connection could remain silently absent.
+                    return
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

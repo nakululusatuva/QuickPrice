@@ -125,8 +125,9 @@ async def test_okx_beth_yield_is_provider_reported_apr_in_percent(fixture_json) 
     provider = OkxBethYieldProvider(clock=lambda: latest + timedelta(hours=1))
     provider._request_json = AsyncMock(return_value=fixture_json("okx_beth_apy.json"))
 
-    metric = await provider.get_yield("BETH:USDC")
+    metric = await provider.get_yield("BETH:USD")
 
+    assert metric.symbol == "BETH:USD"
     assert metric.value == Decimal("2.11669700")
     assert metric.as_of == latest
     assert metric.method == "okx_beth_provider_reported_apr"

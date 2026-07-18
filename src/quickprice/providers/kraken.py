@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
@@ -16,6 +17,13 @@ from .base import (
     UnsupportedInstrument,
     require_mapping,
 )
+
+# Kraken recommends multiple public-feed subscriptions on one connection and
+# does not publish a fixed pair-count ceiling. Chunking subscription messages
+# prevents oversized frames; four messages per second stays conservative when
+# Kraken dynamically lowers its per-connection message-rate limit under load.
+KRAKEN_SYMBOLS_PER_SUBSCRIPTION = 100
+KRAKEN_SUBSCRIPTION_MESSAGE_INTERVAL_SECONDS = 0.25
 
 
 class KrakenProvider(HttpProvider):
@@ -50,11 +58,30 @@ class KrakenProvider(HttpProvider):
     def __init__(
         self,
         *args,
+        symbol_bindings: Mapping[str, str | tuple[str, str]] | None = None,
         max_quote_ages: Mapping[str, timedelta] | None = None,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        raw_bindings = type(self).symbols if symbol_bindings is None else symbol_bindings
+        normalized_bindings: dict[str, tuple[str, str]] = {}
+        for raw_symbol, raw_pair in raw_bindings.items():
+            symbol = raw_symbol.strip().upper()
+            if isinstance(raw_pair, str):
+                rest_pair = raw_pair.strip().upper()
+                base, quote = symbol.split(":", 1)
+                websocket_pair = f"{base}/{quote}"
+            else:
+                rest_pair, websocket_pair = raw_pair
+                rest_pair = rest_pair.strip().upper()
+                websocket_pair = websocket_pair.strip().upper()
+            normalized_bindings[symbol] = (rest_pair, websocket_pair)
+        websocket_symbols = [pair[1] for pair in normalized_bindings.values()]
+        if len(set(websocket_symbols)) != len(websocket_symbols):
+            raise ValueError("Kraken WebSocket symbols must be unique")
+        self.symbols = normalized_bindings
+        self._ws_reverse = {websocket: symbol for symbol, (_, websocket) in self.symbols.items()}
         self.max_quote_ages = {
             symbol.strip().upper(): age for symbol, age in (max_quote_ages or {}).items()
         }
@@ -66,6 +93,19 @@ class KrakenProvider(HttpProvider):
             return self.symbols[normalized]
         except KeyError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}") from exc
+
+    def stream_subscription_batches(
+        self,
+        symbols: Sequence[str],
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return bounded WebSocket-symbol groups for one public connection."""
+
+        normalized = tuple(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        websocket_symbols = tuple(self._pair(symbol)[1] for symbol in normalized)
+        return tuple(
+            websocket_symbols[index : index + KRAKEN_SYMBOLS_PER_SUBSCRIPTION]
+            for index in range(0, len(websocket_symbols), KRAKEN_SYMBOLS_PER_SUBSCRIPTION)
+        )
 
     def _result(self, payload: Any) -> Mapping[str, Any]:
         document = require_mapping(payload, self.name)
@@ -178,8 +218,9 @@ class KrakenProvider(HttpProvider):
         return tuple(result)
 
     async def stream_quotes(self, symbols: Sequence[str]) -> AsyncIterator[Any]:
-        normalized = tuple(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
-        ws_symbols = [self._pair(symbol)[1] for symbol in normalized]
+        subscription_batches = self.stream_subscription_batches(symbols)
+        if not subscription_batches:
+            return
         session = await self._ensure_session()
         try:
             async with session.ws_connect(
@@ -188,12 +229,19 @@ class KrakenProvider(HttpProvider):
                 receive_timeout=60,
                 **self._proxy_request_options(),
             ) as websocket:
-                await websocket.send_json(
-                    {
-                        "method": "subscribe",
-                        "params": {"channel": "trade", "symbol": ws_symbols, "snapshot": False},
-                    }
-                )
+                for index, ws_symbols in enumerate(subscription_batches):
+                    await websocket.send_json(
+                        {
+                            "method": "subscribe",
+                            "params": {
+                                "channel": "trade",
+                                "symbol": list(ws_symbols),
+                                "snapshot": False,
+                            },
+                        }
+                    )
+                    if index + 1 < len(subscription_batches):
+                        await asyncio.sleep(KRAKEN_SUBSCRIPTION_MESSAGE_INTERVAL_SECONDS)
                 async for message in websocket:
                     if message.type is not aiohttp.WSMsgType.TEXT:
                         if message.type in {
@@ -207,6 +255,15 @@ class KrakenProvider(HttpProvider):
                         payload = message.json()
                     except ValueError as exc:
                         raise MalformedResponse(self.name, "invalid stream JSON") from exc
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("method") == "subscribe"
+                        and payload.get("success") is False
+                    ):
+                        raise ProviderUnavailable(
+                            self.name,
+                            "stream subscription was rejected",
+                        )
                     if not isinstance(payload, dict) or payload.get("channel") != "trade":
                         continue
                     data = payload.get("data", ())

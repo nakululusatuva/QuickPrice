@@ -55,6 +55,8 @@ class TwelveDataProvider(HttpProvider):
         self,
         api_key: str,
         *,
+        symbol_bindings: Mapping[str, str] | None = None,
+        fx_symbols: Sequence[str] | None = None,
         usd_cnh_quote_ttl_seconds: float = 240.0,
         usd_hkd_quote_ttl_seconds: float = 900.0,
         fx_quote_ttl_seconds: Mapping[str, float] | None = None,
@@ -68,13 +70,41 @@ class TwelveDataProvider(HttpProvider):
         kwargs.setdefault("quota", daily_budget(790))
         super().__init__(**kwargs)
         self.api_key = api_key
+        self.symbols = {
+            symbol.strip().upper(): vendor_symbol.strip().upper()
+            for symbol, vendor_symbol in (
+                type(self).symbols if symbol_bindings is None else symbol_bindings
+            ).items()
+        }
+        requested_fx_symbols = (
+            FX_HUB_SYMBOLS
+            if fx_symbols is None and symbol_bindings is None
+            else (
+                tuple(
+                    symbol for symbol, vendor_symbol in self.symbols.items() if "/" in vendor_symbol
+                )
+                if fx_symbols is None
+                else fx_symbols
+            )
+        )
+        self.fx_symbols = frozenset(symbol.strip().upper() for symbol in requested_fx_symbols)
+        if any(symbol not in self.symbols for symbol in self.fx_symbols):
+            raise ValueError("Twelve Data FX symbol is not present in symbol bindings")
+        self.equity_symbols = frozenset(self.symbols) - self.fx_symbols
+        self.fx_quote_ttl_floors_seconds = MappingProxyType(
+            {symbol: 240.0 if symbol == "USD:CNH" else 900.0 for symbol in self.fx_symbols}
+        )
         if rate_gate_timeout_seconds <= 0:
             raise ValueError("rate_gate_timeout_seconds must be positive")
         self.rate_gate_timeout_seconds = float(rate_gate_timeout_seconds)
         self.routing_timeout_seconds = self.rate_gate_timeout_seconds + self.request_timeout + 1.0
         self._rate_gate = rate_gate or SlidingWindowRateGate(calls_per_minute, 60.0)
-        requested_ttls = {symbol: usd_hkd_quote_ttl_seconds for symbol in FX_HUB_SYMBOLS}
-        requested_ttls["USD:CNH"] = usd_cnh_quote_ttl_seconds
+        requested_ttls = {
+            symbol: (
+                usd_cnh_quote_ttl_seconds if symbol == "USD:CNH" else usd_hkd_quote_ttl_seconds
+            )
+            for symbol in self.fx_symbols
+        }
         if fx_quote_ttl_seconds is not None:
             normalized_ttls = {
                 symbol.strip().upper(): float(ttl) for symbol, ttl in fx_quote_ttl_seconds.items()
@@ -88,7 +118,7 @@ class TwelveDataProvider(HttpProvider):
         # other four spokes. All 30 public pairs reuse these cache entries.
         self.quote_cache_ttl_seconds = {
             symbol: max(self.fx_quote_ttl_floors_seconds[symbol], requested_ttls[symbol])
-            for symbol in FX_HUB_SYMBOLS
+            for symbol in self.fx_symbols
         }
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
         self._wall_clock = wall_clock
@@ -127,7 +157,7 @@ class TwelveDataProvider(HttpProvider):
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
         ttl_seconds = self.quote_cache_ttl_seconds.get(normalized)
-        if ttl_seconds is None and normalized in LISTED_TICKERS:
+        if ttl_seconds is None and normalized in self.equity_symbols:
             ttl_seconds = seconds_until_next_us_equity_open(self._wall_clock())
         if ttl_seconds is not None:
             try:
@@ -146,13 +176,13 @@ class TwelveDataProvider(HttpProvider):
 
     async def _get_quote_uncached(self, normalized: str):
         vendor_symbol = self._vendor_symbol(normalized)
-        if normalized in FX_HUB_SYMBOLS:
+        if normalized in self.fx_symbols:
             return await self._get_latest_fx_bar(normalized, vendor_symbol)
         payload = await self._request_json(
             "GET",
             f"{self.base_url}/quote",
             params={"symbol": vendor_symbol, "apikey": self.api_key, "timezone": "UTC"},
-            allow_quota_reserve=normalized in FX_HUB_SYMBOLS,
+            allow_quota_reserve=normalized in self.fx_symbols,
         )
         document = self._document(payload)
         try:
@@ -171,7 +201,7 @@ class TwelveDataProvider(HttpProvider):
             as_of=as_of,
             provider=self.name,
             feed=self.feed,
-            price_basis="exchange_rate" if normalized in FX_HUB_SYMBOLS else "last",
+            price_basis="exchange_rate" if normalized in self.fx_symbols else "last",
             market_status=market_status,
             is_derived=False,
             components=(),
@@ -270,7 +300,7 @@ class TwelveDataProvider(HttpProvider):
                 "timezone": "UTC",
                 "apikey": self.api_key,
             },
-            allow_quota_reserve=normalized in FX_HUB_SYMBOLS,
+            allow_quota_reserve=normalized in self.fx_symbols,
         )
         document = self._document(payload)
         rows = document.get("values")

@@ -204,7 +204,7 @@ async def test_wbeth_ratio_only_route_remains_level_zero() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lido_failure_assigns_ratio_route_level_one() -> None:
+async def test_wrapped_lido_failure_assigns_ratio_route_level_one() -> None:
     settings = Settings(
         require_free_threaded=False,
         background_enabled=False,
@@ -214,10 +214,10 @@ async def test_lido_failure_assigns_ratio_route_level_one() -> None:
         side_effect=ProviderUnavailable("lido", "unavailable")
     )
     graph.providers["staking_market_ratio_proxy"].get_yield = AsyncMock(
-        return_value=_market_ratio_metric("STETH:USDC")
+        return_value=_market_ratio_metric("WSTETH:USDC")
     )
     try:
-        metric = await graph.router.get_yield("STETH:USDC")
+        metric = await graph.router.get_yield("WSTETH:USDC")
     finally:
         await graph.close()
 
@@ -242,12 +242,15 @@ async def test_lido_tokens_use_coingecko_prices_and_official_apr_before_ratio_fa
             assert len(quote_chain) == len(history_chain) == 1
             assert isinstance(quote_chain[0], CoinGeckoProvider)
             assert history_chain[0] is quote_chain[0]
-            assert tuple(type(provider) for provider in yield_chain) == (
-                LidoAprProvider,
-                StakingMarketRatioYieldProvider,
+            expected = (
+                (LidoAprProvider,)
+                if symbol == "STETH:USDC"
+                else (LidoAprProvider, StakingMarketRatioYieldProvider)
             )
-            assert yield_chain[-1].lookback_days == 30
-        for internal_symbol in ("ETH:USD", "STETH:USD", "WSTETH:USD"):
+            assert tuple(type(provider) for provider in yield_chain) == expected
+            if symbol == "WSTETH:USDC":
+                assert yield_chain[-1].lookback_days == 30
+        for internal_symbol in ("ETH:USD", "WSTETH:USD"):
             assert graph.router.providers_for(internal_symbol, Capability.HISTORY) == (
                 graph.providers["coingecko"],
             )

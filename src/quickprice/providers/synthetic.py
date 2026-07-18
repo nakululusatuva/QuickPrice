@@ -180,6 +180,65 @@ def synthesize_division(
     )
 
 
+def synthesize_inverse(
+    symbol: str,
+    source: ProviderQuote,
+    *,
+    now: datetime | None = None,
+    maximum_age: timedelta | None = None,
+    provider_name: str = "synthetic",
+):
+    """Return the reciprocal of one positive component observation."""
+
+    source_time = source.as_of.astimezone(UTC)
+    check_time = (now or datetime.now(UTC)).astimezone(UTC)
+    if source_time > check_time + timedelta(seconds=5):
+        raise SyntheticComponentError(provider_name, "component timestamp is in the future")
+    if maximum_age is not None and check_time - source_time > maximum_age:
+        raise SyntheticComponentError(provider_name, "component is stale")
+    try:
+        price = Decimal(1) / source.price
+    except (ArithmeticError, ZeroDivisionError) as exc:
+        raise SyntheticComponentError(provider_name, "invalid component arithmetic") from exc
+    if price <= 0:
+        raise SyntheticComponentError(provider_name, "synthetic price is not positive")
+    components = (
+        component(
+            symbol=source.symbol,
+            provider=source.provider,
+            price=source.price,
+            as_of=source.as_of,
+            feed=source.feed,
+            role="denominator",
+        ),
+        *(
+            component(
+                symbol=child.symbol,
+                provider=child.provider,
+                price=child.price,
+                as_of=child.as_of,
+                feed=child.feed,
+                role=f"denominator_{child.role or 'component'}",
+            )
+            for child in source.components
+        ),
+    )
+    return quote(
+        symbol=symbol.strip().upper(),
+        price=price,
+        as_of=source_time,
+        provider=provider_name,
+        feed=source.feed,
+        price_basis="synthetic_inverse",
+        market_status=source.market_status,
+        is_derived=True,
+        components=components,
+        fallback_level=source.fallback_level,
+        license_scope=source.license_scope,
+        coverage="derived_from_components",
+    )
+
+
 def synthesize_wbeth(
     wbeth_eth: ProviderQuote,
     eth_usdc: ProviderQuote,
@@ -231,7 +290,7 @@ class SyntheticRecipe:
     symbol: str
     left_symbol: str
     right_symbol: str
-    operation: Literal["multiply", "divide"]
+    operation: Literal["inverse", "multiply", "divide"]
     max_skew: timedelta
     left_max_age: timedelta | None = None
     right_max_age: timedelta | None = None
@@ -333,6 +392,15 @@ class SyntheticQuoteProvider:
             recipe = self._recipes[normalized]
         except KeyError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}") from exc
+        if recipe.operation == "inverse":
+            source = await self._resolver(recipe.left_symbol)
+            return synthesize_inverse(
+                normalized,
+                source,
+                now=self._clock(),
+                maximum_age=recipe.left_max_age,
+                provider_name=recipe.provider_name,
+            )
         left, right = await asyncio.gather(
             self._resolver(recipe.left_symbol),
             self._resolver(recipe.right_symbol),
@@ -373,6 +441,28 @@ def synthesize_history(
     from ._models import point
 
     left_ordered = sorted(left_points, key=lambda item: item.timestamp)
+    if recipe.operation == "inverse":
+        result = []
+        for source in left_ordered:
+            try:
+                price_value = Decimal(1) / source.price
+            except ArithmeticError, ZeroDivisionError:
+                continue
+            if price_value <= 0:
+                continue
+            result.append(
+                point(
+                    symbol=recipe.symbol,
+                    timestamp=source.timestamp,
+                    price=price_value,
+                    provider=recipe.provider_name,
+                    interval=interval,
+                    is_derived=True,
+                )
+            )
+        if limit is not None:
+            result = result[-max(0, limit) :]
+        return tuple(result)
     right_ordered = sorted(right_points, key=lambda item: item.timestamp)
     result = []
     right_index = 0
@@ -437,22 +527,32 @@ class SyntheticHistoryProvider:
             recipe = self._recipes[normalized]
         except KeyError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}") from exc
-        left_points, right_points = await asyncio.gather(
-            self._resolver(
+        if recipe.operation == "inverse":
+            left_points = await self._resolver(
                 recipe.left_symbol,
                 interval=interval,
                 start=start,
                 end=end,
                 limit=limit,
-            ),
-            self._resolver(
-                recipe.right_symbol,
-                interval=interval,
-                start=start - recipe.max_skew,
-                end=end,
-                limit=None if limit is None else limit + 1,
-            ),
-        )
+            )
+            right_points = ()
+        else:
+            left_points, right_points = await asyncio.gather(
+                self._resolver(
+                    recipe.left_symbol,
+                    interval=interval,
+                    start=start,
+                    end=end,
+                    limit=limit,
+                ),
+                self._resolver(
+                    recipe.right_symbol,
+                    interval=interval,
+                    start=start - recipe.max_skew,
+                    end=end,
+                    limit=None if limit is None else limit + 1,
+                ),
+            )
         result = synthesize_history(
             recipe,
             left_points,
@@ -460,7 +560,7 @@ class SyntheticHistoryProvider:
             interval=interval,
             limit=limit,
         )
-        if left_points and right_points and not result:
+        if left_points and (right_points or recipe.operation == "inverse") and not result:
             raise SyntheticComponentError(
                 recipe.provider_name,
                 "historical component timestamps have no valid overlap",

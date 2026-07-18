@@ -41,6 +41,9 @@ class AlphaVantageProvider(HttpProvider):
         self,
         api_key: str,
         *,
+        equity_symbol_bindings: Mapping[str, str] | None = None,
+        fx_symbol_bindings: Mapping[str, str | tuple[str, str]] | None = None,
+        dividend_frequencies: Mapping[str, str] | None = None,
         fx_quote_ttl_seconds: float = 21_600.0,
         quote_cache_clock: Callable[[], float] = monotonic_time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -49,6 +52,36 @@ class AlphaVantageProvider(HttpProvider):
         kwargs.setdefault("quota", daily_budget(25))
         super().__init__(**kwargs)
         self.api_key = api_key
+        self.equity_symbols = {
+            symbol.strip().upper(): ticker.strip().upper()
+            for symbol, ticker in (
+                type(self).equity_symbols
+                if equity_symbol_bindings is None
+                else equity_symbol_bindings
+            ).items()
+        }
+        raw_fx_symbols = type(self).fx_symbols if fx_symbol_bindings is None else fx_symbol_bindings
+        self.fx_symbols = {}
+        for raw_symbol, raw_pair in raw_fx_symbols.items():
+            symbol = raw_symbol.strip().upper()
+            if isinstance(raw_pair, str):
+                parts = tuple(
+                    part.strip().upper() for part in raw_pair.replace(":", "/").split("/")
+                )
+            else:
+                parts = tuple(part.strip().upper() for part in raw_pair)
+            if len(parts) != 2:
+                raise ValueError("Alpha Vantage FX binding must contain one currency pair")
+            self.fx_symbols[symbol] = (parts[0], parts[1])
+        self.dividend_frequencies = {
+            symbol.strip().upper(): frequency.strip().lower()
+            for symbol, frequency in (
+                type(self).dividend_frequencies
+                if dividend_frequencies is None
+                else dividend_frequencies
+            ).items()
+            if symbol.strip().upper() in self.equity_symbols
+        }
         self.fx_quote_ttl_seconds = max(21_600.0, fx_quote_ttl_seconds)
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
         self._wall_clock = wall_clock

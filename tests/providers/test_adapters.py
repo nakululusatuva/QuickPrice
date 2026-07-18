@@ -20,11 +20,21 @@ from quickprice.providers.base import (
     ProviderUnavailable,
     UnsupportedInstrument,
 )
-from quickprice.providers.binance import BinanceProvider
-from quickprice.providers.coingecko import CoinGeckoProvider
+from quickprice.providers.binance import (
+    BINANCE_MAX_STREAM_CONNECTIONS,
+    BINANCE_STREAM_PATH_MAX_CHARACTERS,
+    BINANCE_STREAMS_PER_CONNECTION,
+    BinanceProvider,
+)
+from quickprice.providers.coingecko import (
+    COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST,
+    COINGECKO_SIMPLE_PRICE_IDS_PER_REQUEST,
+    CoinGeckoProvider,
+    coingecko_simple_price_id_batches,
+)
 from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fred import FredProvider
-from quickprice.providers.kraken import KrakenProvider
+from quickprice.providers.kraken import KRAKEN_SYMBOLS_PER_SUBSCRIPTION, KrakenProvider
 from quickprice.providers.router import ProviderRouter
 from quickprice.providers.twelve_data import TwelveDataProvider
 
@@ -142,6 +152,22 @@ async def test_binance_rejects_xmr_without_a_supported_market():
         await provider.get_quote("XMR:USDC")
 
 
+def test_binance_shards_two_thousand_dynamic_stream_bindings_safely() -> None:
+    bindings = {f"B{index:04d}:USDC": f"B{index:04d}USDC" for index in range(2_000)}
+    provider = BinanceProvider(symbol_bindings=bindings)
+
+    batches = provider.stream_connection_batches(tuple(bindings))
+
+    assert len(batches) <= BINANCE_MAX_STREAM_CONNECTIONS
+    assert tuple(symbol for batch in batches for symbol in batch) == tuple(bindings)
+    for batch in batches:
+        assert len(batch) <= BINANCE_STREAMS_PER_CONNECTION
+        stream_path = "/".join(
+            f"{provider._exchange_symbol(symbol).lower()}@trade" for symbol in batch
+        )
+        assert len(stream_path) <= BINANCE_STREAM_PATH_MAX_CHARACTERS
+
+
 @pytest.mark.asyncio
 async def test_kraken_trade_contract(fixture_json):
     provider = KrakenProvider()
@@ -192,6 +218,21 @@ def test_kraken_bnb_uses_canonical_usdc_pair() -> None:
     assert KrakenProvider.symbols["BNB:USDC"] == ("BNBUSDC", "BNB/USDC")
 
 
+def test_kraken_batches_two_thousand_subscriptions_on_one_connection() -> None:
+    bindings = {
+        f"K{index:04d}:USDC": (f"K{index:04d}USDC", f"K{index:04d}/USDC") for index in range(2_000)
+    }
+    provider = KrakenProvider(symbol_bindings=bindings)
+
+    batches = provider.stream_subscription_batches(tuple(bindings))
+
+    assert len(batches) == 2_000 // KRAKEN_SYMBOLS_PER_SUBSCRIPTION
+    assert all(len(batch) <= KRAKEN_SYMBOLS_PER_SUBSCRIPTION for batch in batches)
+    assert tuple(symbol for batch in batches for symbol in batch) == tuple(
+        pair[1] for pair in bindings.values()
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("symbol", ["POL:USDC", "TRX:USDC"])
 async def test_kraken_rejects_assets_without_usdc_markets(symbol: str) -> None:
@@ -211,6 +252,27 @@ async def test_coingecko_quote_is_usdc_ratio_with_components(fixture_json):
     assert result.price == Decimal("4125.0") / Decimal("0.9998")
     assert result.is_derived is True
     assert [item.role for item in result.components] == ["numerator", "denominator"]
+
+
+@pytest.mark.asyncio
+async def test_coingecko_quote_supports_direct_usd_without_usdc_normalization():
+    provider = CoinGeckoProvider(
+        "demo",
+        coin_ids={"AVAX:USD": "avalanche-2"},
+    )
+    provider._request_json = AsyncMock(
+        return_value={
+            "avalanche-2": {"usd": "42.25", "last_updated_at": 1_768_000_000},
+            "usd-coin": {"usd": "0.999", "last_updated_at": 1_768_000_000},
+        }
+    )
+
+    result = await provider.get_quote("AVAX:USD")
+
+    assert result.price == Decimal("42.25")
+    assert result.price_basis == "aggregated_spot"
+    assert result.is_derived is False
+    assert result.components == ()
 
 
 @pytest.mark.asyncio
@@ -377,6 +439,31 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "wrapped-steth",
         "usd-coin",
     }
+
+
+@pytest.mark.asyncio
+async def test_coingecko_batches_and_merges_two_thousand_dynamic_ids_without_network() -> None:
+    coin_ids = {f"C{index:04d}:USDC": f"coin-{index:04d}" for index in range(2_000)}
+    expected_ids = {*coin_ids.values(), "usd-coin"}
+    provider = CoinGeckoProvider("key", coin_ids=coin_ids, clock=lambda: 10.0)
+
+    async def request_json(*_args, **kwargs):
+        requested = kwargs["params"]["ids"].split(",")
+        return {coin_id: {"usd": 1, "last_updated_at": 1_768_000_000} for coin_id in requested}
+
+    provider._request_json = AsyncMock(side_effect=request_json)
+
+    document = await provider._simple_prices()
+    batches = coingecko_simple_price_id_batches(tuple(expected_ids))
+
+    assert set(document) == expected_ids
+    assert provider._request_json.await_count == len(batches)
+    assert len(batches) == 9
+    assert all(len(batch) <= COINGECKO_SIMPLE_PRICE_IDS_PER_REQUEST for batch in batches)
+    assert all(
+        len(",".join(batch)) <= COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST
+        for batch in batches
+    )
 
 
 @pytest.mark.asyncio
@@ -655,6 +742,25 @@ async def test_finnhub_rejects_an_unmapped_instrument_before_request():
 
 
 @pytest.mark.asyncio
+async def test_finnhub_keeps_two_thousand_bindings_with_rest_overflow_after_stream_cap() -> None:
+    bindings = {f"F{index:04d}:USD": f"F{index:04d}" for index in range(2_000)}
+    provider = FinnhubProvider("key", symbol_bindings=bindings)
+    provider._request_json = AsyncMock(return_value={"c": 10, "t": 1_784_561_400})
+
+    assert len(provider.symbols) == 2_000
+    assert len(provider.stream_symbols) == 50
+    overflow_symbol = tuple(bindings)[-1]
+    assert overflow_symbol not in provider.stream_symbols
+
+    result = await provider.get_quote(overflow_symbol)
+
+    assert result.symbol == overflow_symbol
+    assert provider._request_json.await_args.kwargs["params"] == {
+        "symbol": bindings[overflow_symbol]
+    }
+
+
+@pytest.mark.asyncio
 async def test_finnhub_all_zero_quote_fails_closed():
     provider = FinnhubProvider("key")
     provider._request_json = AsyncMock(
@@ -894,6 +1000,74 @@ async def test_alpaca_excludes_return_of_capital_from_regular_dividend():
 
     assert event is not None
     assert event.amount == Decimal("0.32")
+
+
+def test_alpaca_bounds_dynamic_stream_symbols_and_paces_rest_overflow():
+    bindings = {f"TEST{index}:USD": f"TEST{index}" for index in range(75)}
+    provider = AlpacaProvider(
+        "key",
+        "secret",
+        symbol_bindings=bindings,
+        stream_symbol_limit=30,
+        rest_calls_per_minute=180,
+    )
+
+    assert provider.stream_symbols == tuple(bindings)[:30]
+    assert len(provider.stream_symbols) == 30
+    assert provider.minimum_quote_poll_seconds >= 20
+
+    with pytest.raises(ValueError, match="stream symbol limit"):
+        AlpacaProvider(
+            "key",
+            "secret",
+            symbol_bindings=bindings,
+            stream_symbols=tuple(bindings)[:31],
+            stream_symbol_limit=30,
+        )
+
+
+def test_alpaca_rest_floor_remains_safe_for_two_thousand_symbol_stream_outage():
+    bindings = {f"T{index:04d}:USD": f"T{index:04d}" for index in range(2_000)}
+    provider = AlpacaProvider(
+        "key",
+        "secret",
+        symbol_bindings=bindings,
+        stream_symbol_limit=30,
+        rest_calls_per_minute=180,
+    )
+
+    assert len(provider.stream_symbols) == 30
+    assert provider.minimum_quote_poll_seconds >= 2_000 * 60 / (180 * 0.9)
+
+
+@pytest.mark.asyncio
+async def test_alpaca_applies_one_shared_rate_gate_to_all_rest_requests(monkeypatch):
+    class Gate:
+        calls = 0
+
+        async def acquire(self):
+            self.calls += 1
+
+    gate = Gate()
+    upstream = AsyncMock(
+        side_effect=[
+            {"trade": {"p": "123.45", "t": "2026-07-20T15:30:00Z"}},
+            {"is_open": True, "timestamp": "2026-07-20T15:30:00Z"},
+        ]
+    )
+    monkeypatch.setattr(HttpProvider, "_request_json", upstream)
+    provider = AlpacaProvider(
+        "key",
+        "secret",
+        symbol_bindings={"TEST:USD": "TEST"},
+        rest_gate=gate,
+    )
+
+    result = await provider.get_quote("TEST:USD")
+
+    assert result.price == Decimal("123.45")
+    assert gate.calls == 2
+    assert upstream.await_count == 2
 
 
 @pytest.mark.asyncio

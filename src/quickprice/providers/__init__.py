@@ -23,6 +23,13 @@ from .base import (
 )
 from .binance import BinanceProvider
 from .coingecko import CoinGeckoProvider
+from .compiler import (
+    CompiledRoutePlan,
+    RouteCompileError,
+    build_compiled_provider_graph,
+    compile_catalog_route_plan,
+)
+from .descriptors import provider_catalog_snapshot, search_provider_symbols
 from .finnhub import FinnhubProvider
 from .fred import FredProvider
 from .kraken import KrakenProvider
@@ -44,6 +51,7 @@ from .synthetic import (
     synthesize_division,
     synthesize_history,
     synthesize_hkd_cnh,
+    synthesize_inverse,
     synthesize_multiplication,
     synthesize_wbeth,
 )
@@ -61,6 +69,7 @@ __all__ = [
     "BinanceWbethYieldProvider",
     "Capability",
     "CoinGeckoProvider",
+    "CompiledRoutePlan",
     "DividendProvider",
     "EthereumExchangeRateSpec",
     "EthereumExchangeRateYieldProvider",
@@ -77,6 +86,7 @@ __all__ = [
     "ProviderRouter",
     "ProviderUnavailable",
     "QuoteProvider",
+    "RouteCompileError",
     "StakingMarketRatioSpec",
     "StakingMarketRatioYieldProvider",
     "SyntheticHistoryProvider",
@@ -85,10 +95,15 @@ __all__ = [
     "TwelveDataProvider",
     "UnsupportedInstrument",
     "YieldProvider",
+    "build_compiled_provider_graph",
     "build_provider_graph",
+    "compile_catalog_route_plan",
+    "provider_catalog_snapshot",
+    "search_provider_symbols",
     "synthesize_division",
     "synthesize_history",
     "synthesize_hkd_cnh",
+    "synthesize_inverse",
     "synthesize_multiplication",
     "synthesize_wbeth",
 ]

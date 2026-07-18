@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from importlib import import_module
@@ -28,7 +29,6 @@ from .okx import OkxBethYieldProvider, OkxMarketProvider
 from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
 from .router import ProviderRouter
 from .staking import (
-    STETH_MARKET_RATIO_SPEC,
     WBETH_MARKET_RATIO_SPEC,
     WSTETH_MARKET_RATIO_SPEC,
     BinanceWbethYieldProvider,
@@ -45,8 +45,8 @@ class ProviderGraph:
     router: ProviderRouter
     providers: dict[str, Any]
 
-    async def close(self) -> None:
-        await self.router.close()
+    async def close(self, *, exclude_providers: Iterable[Any] = ()) -> None:
+        await self.router.close(exclude_providers=exclude_providers)
 
 
 def _proxy_options(settings: Settings, provider_name: str) -> dict[str, str]:
@@ -109,7 +109,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             router.register(symbol, Capability.HISTORY, [coingecko])
         # Internal USD histories keep the 30-day token/ETH yield proxy on a
         # common quote currency without exposing implementation-only symbols.
-        for symbol in ("ETH:USD", "STETH:USD", "WSTETH:USD"):
+        for symbol in ("ETH:USD", "WSTETH:USD"):
             router.register(symbol, Capability.HISTORY, [coingecko])
 
     # Internal component symbols are intentionally not part of the public
@@ -165,7 +165,6 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
         router,
         specs=(
             WBETH_MARKET_RATIO_SPEC,
-            STETH_MARKET_RATIO_SPEC,
             WSTETH_MARKET_RATIO_SPEC,
         ),
         lookback_days=settings.staking_yield_market_fallback_days,
@@ -228,8 +227,12 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
         request_timeout=settings.provider_timeout_seconds,
         **_proxy_options(settings, "lido"),
     )
-    for symbol in ("STETH:USDC", "WSTETH:USDC"):
-        router.register(symbol, Capability.YIELD, [lido, market_ratio_yield])
+    router.register("STETH:USDC", Capability.YIELD, [lido])
+    router.register(
+        "WSTETH:USDC",
+        Capability.YIELD,
+        [lido, market_ratio_yield],
+    )
 
     alpaca = None
     if settings.alpaca_api_key and settings.alpaca_api_secret:
@@ -237,6 +240,8 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             settings.alpaca_api_key,
             settings.alpaca_api_secret,
             trading_base_url=settings.alpaca_trading_base_url,
+            stream_symbol_limit=settings.alpaca_stream_symbol_limit,
+            rest_calls_per_minute=settings.alpaca_rest_calls_per_minute,
             **_proxy_options(settings, "alpaca"),
         )
     finnhub = None

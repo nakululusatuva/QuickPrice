@@ -8,7 +8,7 @@ import hmac
 import math
 from bisect import bisect_right
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar
@@ -47,6 +47,14 @@ WBETH_ETHEREUM_ADDRESS = "0xa2e3356610840701bdf5611a53974510ae27e2e1"
 WBETH_EXCHANGE_RATE_CALL = "0x3ba0b9a9"
 WBETH_EXCHANGE_RATE_EVENT = "0x0b4e9390054347e2a16d95fd8376311b0d2deedecba526e9742bcaa40b059f0b"
 LIDO_STETH_ADDRESS = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
+
+
+def _canonical_staking_symbol(symbol: str, base: str, provider: str) -> str:
+    normalized = symbol.strip().upper()
+    parts = normalized.split(":")
+    if len(parts) != 2 or parts[0] != base or not parts[1]:
+        raise UnsupportedInstrument(provider, f"unsupported yield symbol {normalized}")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,12 +194,16 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
 
     def _spec(self, symbol: str) -> EthereumExchangeRateSpec:
         normalized = symbol.strip().upper()
-        try:
-            return self.specs[normalized]
-        except KeyError as exc:
-            raise UnsupportedInstrument(
-                self.name, f"unsupported yield symbol {normalized}"
-            ) from exc
+        exact = self.specs.get(normalized)
+        if exact is not None:
+            return exact
+        base = normalized.partition(":")[0]
+        matching = tuple(
+            spec for spec in self.specs.values() if spec.symbol.partition(":")[0] == base
+        )
+        if len(matching) == 1 and normalized.count(":") == 1 and normalized.partition(":")[2]:
+            return replace(matching[0], symbol=normalized)
+        raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
 
     async def get_accrual_index(self, symbol: str) -> AccrualIndexPoint:
         spec = self._spec(symbol)
@@ -606,9 +618,7 @@ class BinanceWbethYieldProvider(HttpProvider):
         self.recv_window_ms = recv_window_ms
 
     async def get_yield(self, symbol: str) -> YieldMetric:
-        normalized = symbol.strip().upper()
-        if normalized != "WBETH:USDC":
-            raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
+        normalized = _canonical_staking_symbol(symbol, "WBETH", self.name)
         now = ensure_utc(self._clock())
         rows = await self._rows(now - timedelta(days=30), now)
         if not rows:
@@ -668,9 +678,7 @@ class BinanceWbethYieldProvider(HttpProvider):
         start: datetime,
         end: datetime,
     ) -> Sequence[AccrualIndexPoint]:
-        normalized = symbol.strip().upper()
-        if normalized != "WBETH:USDC":
-            raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
+        _canonical_staking_symbol(symbol, "WBETH", self.name)
         rows = await self._rows(ensure_utc(start), ensure_utc(end))
         return tuple(
             AccrualIndexPoint(
@@ -737,8 +745,8 @@ class LidoAprProvider(HttpProvider):
     base_url = "https://eth-api.lido.fi"
     path = "/v1/protocol/steth/apr/sma"
     _accrual_modes: ClassVar[dict[str, RewardAccrualMode]] = {
-        "STETH:USDC": RewardAccrualMode.REBASING_BALANCE,
-        "WSTETH:USDC": RewardAccrualMode.VALUE_ACCRUING,
+        "STETH": RewardAccrualMode.REBASING_BALANCE,
+        "WSTETH": RewardAccrualMode.VALUE_ACCRUING,
     }
 
     def __init__(
@@ -753,8 +761,15 @@ class LidoAprProvider(HttpProvider):
     async def get_yield(self, symbol: str) -> YieldMetric:
         normalized = symbol.strip().upper()
         try:
-            accrual_mode = self._accrual_modes[normalized]
+            base, quote_asset = normalized.split(":", 1)
+            if not quote_asset:
+                raise ValueError
+            accrual_mode = self._accrual_modes[base]
         except KeyError as exc:
+            raise UnsupportedInstrument(
+                self.name, f"unsupported yield symbol {normalized}"
+            ) from exc
+        except ValueError as exc:
             raise UnsupportedInstrument(
                 self.name, f"unsupported yield symbol {normalized}"
             ) from exc
@@ -822,6 +837,7 @@ class StakingMarketRatioSpec:
     underlying_pair: str
     underlying_asset: str
     accrual_mode: RewardAccrualMode
+    lookback_days: int | None = None
 
     def __post_init__(self) -> None:
         staking_parts = self.staking_pair.split(":")
@@ -832,6 +848,10 @@ class StakingMarketRatioSpec:
             raise ValueError("market-ratio pairs must share a quote asset")
         if underlying_parts[0].upper() != self.underlying_asset.upper():
             raise ValueError("underlying pair must match the configured underlying asset")
+        if self.accrual_mode is not RewardAccrualMode.VALUE_ACCRUING:
+            raise ValueError("market-ratio yield is only valid for value-accruing tokens")
+        if self.lookback_days is not None and not 7 <= self.lookback_days <= 365:
+            raise ValueError("market-ratio lookback must be between 7 and 365 days")
 
 
 WBETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
@@ -840,14 +860,6 @@ WBETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
     underlying_pair="ETH:USDC",
     underlying_asset="ETH",
     accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
-)
-
-STETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
-    symbol="STETH:USDC",
-    staking_pair="STETH:USD",
-    underlying_pair="ETH:USD",
-    underlying_asset="ETH",
-    accrual_mode=RewardAccrualMode.REBASING_BALANCE,
 )
 
 WSTETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
@@ -903,7 +915,8 @@ class StakingMarketRatioYieldProvider:
                 self.name, f"unsupported yield symbol {normalized}"
             ) from exc
         now = ensure_utc(self._clock())
-        start = now - timedelta(days=self.lookback_days + self.padding_days)
+        lookback_days = spec.lookback_days or self.lookback_days
+        start = now - timedelta(days=lookback_days + self.padding_days)
         staking_points, underlying_points = await asyncio.gather(
             self.history_provider.get_history(
                 spec.staking_pair,
@@ -923,7 +936,7 @@ class StakingMarketRatioYieldProvider:
         observations = self._observations(spec, staking_points, underlying_points)
         if not observations:
             raise ProviderUnavailable(self.name, "no aligned market-ratio observations")
-        cutoff = now - timedelta(days=self.lookback_days)
+        cutoff = now - timedelta(days=lookback_days)
         reference = next(
             (item for item in reversed(observations) if item.index.as_of <= cutoff),
             None,
@@ -937,7 +950,7 @@ class StakingMarketRatioYieldProvider:
             symbol=spec.symbol,
             value=percent,
             as_of=current.index.as_of,
-            method="staking_market_ratio_30d_annualized",
+            method=f"staking_market_ratio_{lookback_days}d_annualized",
             provider=self.name,
             is_proxy=True,
             components=(

@@ -81,6 +81,8 @@ class OkxMarketProvider(HttpProvider):
     def __init__(
         self,
         *args: Any,
+        market_bindings: Mapping[str, str] | None = None,
+        internal_aliases: Mapping[str, str] | None = None,
         wall_clock: Callable[[], datetime] = _utc_now,
         monotonic_clock: Callable[[], float] = time.monotonic,
         minimum_request_interval_seconds: float = 0.125,
@@ -88,6 +90,23 @@ class OkxMarketProvider(HttpProvider):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._canonical_markets = {
+            symbol.strip().upper(): instrument_id.strip().upper()
+            for symbol, instrument_id in (
+                type(self)._canonical_markets if market_bindings is None else market_bindings
+            ).items()
+        }
+        self._internal_aliases = {
+            alias.strip().upper(): canonical.strip().upper()
+            for alias, canonical in (
+                type(self)._internal_aliases if internal_aliases is None else internal_aliases
+            ).items()
+        }
+        if any(
+            canonical not in self._canonical_markets
+            for canonical in self._internal_aliases.values()
+        ):
+            raise ValueError("OKX internal alias references an unknown market binding")
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
         self.minimum_request_interval_seconds = float(minimum_request_interval_seconds)
@@ -289,7 +308,8 @@ class OkxBethYieldProvider(HttpProvider):
 
     async def get_yield(self, symbol: str) -> YieldMetric:
         normalized = symbol.strip().upper()
-        if normalized != "BETH:USDC":
+        parts = normalized.split(":")
+        if len(parts) != 2 or parts[0] != "BETH" or not parts[1]:
             raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
         payload = await self._request_json(
             "GET",

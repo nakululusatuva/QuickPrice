@@ -1,0 +1,10 @@
+{
+  "symbols": [
+    {
+      "status": "TRADING",
+      "symbol": "ETHUSDC",
+      "baseAsset": "ETH",
+      "quoteAsset": "USDC"
+    }
+  ]
+}

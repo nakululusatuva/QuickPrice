@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, ClassVar
@@ -125,6 +125,36 @@ class ProviderRouter:
 
     def configured(self, symbol: str, capability: Capability | str) -> bool:
         return (self._symbol(symbol), Capability(capability)) in self._routes
+
+    def replace(
+        self,
+        symbol: str,
+        capability: Capability | str,
+        providers: Sequence[Any],
+    ) -> None:
+        """Replace one route while preserving the same validation as registration."""
+
+        key = (self._symbol(symbol), Capability(capability))
+        previous = self._routes.pop(key, None)
+        try:
+            self.register(key[0], key[1], providers)
+        except BaseException:
+            if previous is not None:
+                self._routes[key] = previous
+            raise
+
+    def remove(self, symbol: str, capability: Capability | str) -> None:
+        """Remove a route from a graph that has not yet been published."""
+
+        self._routes.pop((self._symbol(symbol), Capability(capability)), None)
+
+    def replace_provider_instance(self, old: Any, new: Any) -> None:
+        """Substitute an adapter in every route before a graph is activated."""
+
+        for key, chain in tuple(self._routes.items()):
+            if old not in chain:
+                continue
+            self._routes[key] = tuple(new if provider is old else provider for provider in chain)
 
     def providers_for(
         self,
@@ -251,6 +281,12 @@ class ProviderRouter:
                 else:
                     async with asyncio.timeout(float(routing_timeout)):
                         result = await method(symbol, **kwargs)
+                self._validate_result_identity(
+                    result,
+                    symbol=symbol,
+                    capability=capability,
+                    provider=name,
+                )
             except TimeoutError:
                 self._observe_operation(name, capability, "timeout", started)
                 error: ProviderError = ProviderUnavailable(name, "timeout")
@@ -364,6 +400,34 @@ class ProviderRouter:
         if history_segments:
             return self._merge_history(history_segments, kwargs.get("limit"))
         raise AllProvidersFailed(symbol, capability, attempts)
+
+    @staticmethod
+    def _validate_result_identity(
+        result: Any,
+        *,
+        symbol: str,
+        capability: Capability,
+        provider: str,
+    ) -> None:
+        """Reject adapters that return data for a different instrument."""
+
+        if capability is Capability.QUOTE:
+            values = (result,) if isinstance(result, ProviderQuote) else None
+        elif capability is Capability.HISTORY:
+            values = result if isinstance(result, Sequence) else None
+            if values is not None and not all(isinstance(item, PricePoint) for item in values):
+                values = None
+        elif capability is Capability.DIVIDEND:
+            if result is None:
+                return
+            values = (result,) if isinstance(result, DividendEvent) else None
+        else:
+            values = (result,) if isinstance(result, YieldMetric) else None
+
+        if values is None:
+            raise ProviderUnavailable(provider, f"invalid {capability.value} response type")
+        if any(item.symbol != symbol for item in values):
+            raise ProviderUnavailable(provider, f"{capability.value} response symbol mismatch")
 
     def _observe_operation(
         self,
@@ -555,7 +619,16 @@ class ProviderRouter:
             for (symbol, capability, provider), count in self._fallbacks.items()
         }
 
-    async def close(self) -> None:
+    async def close(self, *, exclude_providers: Iterable[Any] = ()) -> None:
+        """Close the router while leaving explicitly transferred adapters alive.
+
+        Catalog hot activation can transfer an unchanged provider instance to a
+        replacement route graph.  The retired router must still cancel its own
+        singleflight requests, but it must not close an adapter now owned by the
+        active graph.
+        """
+
+        excluded = {id(provider) for provider in exclude_providers}
         async with self._flights_lock:
             flights = tuple(set(self._flights.values()))
             self._flights.clear()
@@ -569,6 +642,8 @@ class ProviderRouter:
                 if id(provider) in seen:
                     continue
                 seen.add(id(provider))
+                if id(provider) in excluded:
+                    continue
                 close = getattr(provider, "close", None)
                 if callable(close):
                     result = close()
