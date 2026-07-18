@@ -19,8 +19,7 @@ environment.
   single-flight requests, circuit breakers, and explicit stale-data metadata.
 - Trusted Python entry-point plugins for instruments, provider routes,
   synthetic formulas, and income policies.
-- Native Windows, WSL2, Linux, and macOS development workflows. Docker is not
-  supported.
+- Native Windows, WSL2, Linux, and macOS development workflows; Docker is not supported.
 
 After importing the complete dependency graph, production readiness requires:
 
