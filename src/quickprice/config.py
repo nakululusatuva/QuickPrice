@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
+from urllib.parse import urlsplit
 
 _PROVIDER_SECRET_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -90,6 +91,41 @@ def _float(name: str, default: float, *, minimum: float = 0) -> float:
     return value
 
 
+def _provider_proxy_configuration() -> tuple[str | None, tuple[str, ...]]:
+    raw_url = os.getenv("QUICKPRICE_PROVIDER_PROXY_URL", "").strip()
+    raw_names = os.getenv("QUICKPRICE_PROVIDER_PROXY_NAMES", "")
+    names = tuple(
+        dict.fromkeys(item.strip().lower() for item in raw_names.split(",") if item.strip())
+    )
+
+    if not raw_url and not names:
+        return None, ()
+    if not raw_url:
+        raise ValueError("QUICKPRICE_PROVIDER_PROXY_NAMES requires QUICKPRICE_PROVIDER_PROXY_URL")
+    if not names:
+        names = ("*",)
+
+    parsed = urlsplit(raw_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("QUICKPRICE_PROVIDER_PROXY_URL has an invalid port") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or port is None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "QUICKPRICE_PROVIDER_PROXY_URL must be an HTTP(S) proxy URL with an explicit port"
+        )
+    if "*" in names and len(names) != 1:
+        raise ValueError("QUICKPRICE_PROVIDER_PROXY_NAMES wildcard must be used alone")
+    return raw_url, names
+
+
 def _secret(
     name: str,
     file_values: MappingProxyType[str, str],
@@ -117,6 +153,8 @@ class Settings:
     invalid_request_burst: int = 10
     dashboard_max_log_streams: int = 8
     provider_timeout_seconds: float = 8.0
+    provider_proxy_url: str | None = None
+    provider_proxy_names: tuple[str, ...] = ()
     circuit_failure_threshold: int = 3
     circuit_open_seconds: float = 60.0
     crypto_poll_seconds: float = 1.0
@@ -156,6 +194,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         provider_key_values = _provider_key_file_values()
+        provider_proxy_url, provider_proxy_names = _provider_proxy_configuration()
         raw_hashes = os.getenv("QUICKPRICE_API_KEY_HASHES", "")
         hashes = tuple(item.strip().lower() for item in raw_hashes.split(",") if item.strip())
         raw_plugins = os.getenv("QUICKPRICE_ENABLED_PLUGINS", "")
@@ -188,6 +227,8 @@ class Settings:
             provider_timeout_seconds=_float(
                 "QUICKPRICE_PROVIDER_TIMEOUT_SECONDS", 8.0, minimum=0.1
             ),
+            provider_proxy_url=provider_proxy_url,
+            provider_proxy_names=provider_proxy_names,
             circuit_failure_threshold=_int("QUICKPRICE_CIRCUIT_FAILURE_THRESHOLD", 3, minimum=1),
             circuit_open_seconds=_float("QUICKPRICE_CIRCUIT_OPEN_SECONDS", 60.0, minimum=1.0),
             crypto_poll_seconds=_float("QUICKPRICE_CRYPTO_POLL_SECONDS", 1.0, minimum=0.25),
@@ -252,6 +293,16 @@ class Settings:
             ),
             enabled_plugins=enabled_plugins,
         )
+
+    def proxy_url_for_provider(self, provider_name: str) -> str | None:
+        normalized = provider_name.strip().lower()
+        if self.provider_proxy_url and (
+            not self.provider_proxy_names
+            or "*" in self.provider_proxy_names
+            or normalized in self.provider_proxy_names
+        ):
+            return self.provider_proxy_url
+        return None
 
     @property
     def docs_enabled(self) -> bool:

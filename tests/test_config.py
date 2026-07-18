@@ -153,6 +153,61 @@ def test_twelve_rate_gate_timeout_must_be_positive(monkeypatch) -> None:
         Settings.from_env()
 
 
+def test_provider_proxy_defaults_to_all_providers(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_PROVIDER_PROXY_URL", "http://10.0.1.7:7890")
+    monkeypatch.delenv("QUICKPRICE_PROVIDER_PROXY_NAMES", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.provider_proxy_names == ("*",)
+    assert settings.proxy_url_for_provider("binance") == "http://10.0.1.7:7890"
+    assert settings.proxy_url_for_provider("future_plugin") == "http://10.0.1.7:7890"
+    assert (
+        Settings(provider_proxy_url="http://proxy.internal:8080").proxy_url_for_provider(
+            "future_plugin"
+        )
+        == "http://proxy.internal:8080"
+    )
+
+
+def test_provider_proxy_can_be_enabled_per_provider(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_PROVIDER_PROXY_URL", "http://10.0.1.7:7890")
+    monkeypatch.setenv(
+        "QUICKPRICE_PROVIDER_PROXY_NAMES",
+        " Binance, lido,binance ",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.provider_proxy_names == ("binance", "lido")
+    assert settings.proxy_url_for_provider("BINANCE") == "http://10.0.1.7:7890"
+    assert settings.proxy_url_for_provider("kraken") is None
+
+
+def test_provider_proxy_names_require_a_proxy_url(monkeypatch) -> None:
+    monkeypatch.delenv("QUICKPRICE_PROVIDER_PROXY_URL", raising=False)
+    monkeypatch.setenv("QUICKPRICE_PROVIDER_PROXY_NAMES", "binance")
+
+    with pytest.raises(ValueError, match="requires QUICKPRICE_PROVIDER_PROXY_URL"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    (
+        "socks5://10.0.1.7:7890",
+        "http://10.0.1.7",
+        "http://10.0.1.7:7890/path",
+    ),
+)
+def test_provider_proxy_rejects_unsupported_urls(monkeypatch, proxy_url: str) -> None:
+    monkeypatch.setenv("QUICKPRICE_PROVIDER_PROXY_URL", proxy_url)
+    monkeypatch.delenv("QUICKPRICE_PROVIDER_PROXY_NAMES", raising=False)
+
+    with pytest.raises(ValueError, match=r"HTTP\(S\) proxy URL"):
+        Settings.from_env()
+
+
 def test_finnhub_minute_quota_must_be_positive(monkeypatch) -> None:
     monkeypatch.setenv("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", "0")
 

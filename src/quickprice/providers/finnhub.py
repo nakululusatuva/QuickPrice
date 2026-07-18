@@ -146,6 +146,7 @@ class FinnhubProvider(HttpProvider):
                 params={"token": self.api_key},
                 heartbeat=20,
                 receive_timeout=60,
+                **self._proxy_request_options(),
             ) as websocket:
                 for ticker in tickers:
                     await websocket.send_json({"type": "subscribe", "symbol": ticker})

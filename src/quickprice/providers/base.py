@@ -147,12 +147,14 @@ class HttpProvider:
         quota: QuotaBudget | None = None,
         request_timeout: float = 10.0,
         user_agent: str = "QuickPrice/1.1",
+        proxy_url: str | None = None,
     ) -> None:
         self._session = session
         self._owns_session = session is None
         self.quota = quota
         self.request_timeout = request_timeout
         self.user_agent = user_agent
+        self.proxy_url = proxy_url
 
     async def __aenter__(self) -> Self:
         await self._ensure_session()
@@ -169,16 +171,22 @@ class HttpProvider:
     async def _ensure_session(self) -> Any:
         if self._session is None:
             timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers={"User-Agent": self.user_agent},
-            )
+            options: dict[str, Any] = {
+                "timeout": timeout,
+                "headers": {"User-Agent": self.user_agent},
+            }
+            if self.proxy_url:
+                options["proxy"] = self.proxy_url
+            self._session = aiohttp.ClientSession(**options)
         return self._session
 
     async def close(self) -> None:
         if self._owns_session and self._session is not None:
             await self._session.close()
             self._session = None
+
+    def _proxy_request_options(self) -> dict[str, str]:
+        return {"proxy": self.proxy_url} if self.proxy_url else {}
 
     async def _request_json(
         self,
@@ -205,6 +213,7 @@ class HttpProvider:
                 headers=headers,
                 json=json_body,
                 timeout=self.request_timeout,
+                **self._proxy_request_options(),
             ) as response:
                 status = response.status
                 if status == 429:

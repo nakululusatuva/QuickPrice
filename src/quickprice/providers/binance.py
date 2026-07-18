@@ -223,6 +223,7 @@ class BinanceProvider(HttpProvider):
                 f"{self.websocket_base_url}/stream?streams={streams}",
                 heartbeat=20,
                 receive_timeout=60,
+                **self._proxy_request_options(),
             ) as websocket:
                 async for message in websocket:
                     if message.type is aiohttp.WSMsgType.TEXT:

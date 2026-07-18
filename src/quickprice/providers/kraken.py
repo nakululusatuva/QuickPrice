@@ -183,7 +183,10 @@ class KrakenProvider(HttpProvider):
         session = await self._ensure_session()
         try:
             async with session.ws_connect(
-                self.websocket_url, heartbeat=20, receive_timeout=60
+                self.websocket_url,
+                heartbeat=20,
+                receive_timeout=60,
+                **self._proxy_request_options(),
             ) as websocket:
                 await websocket.send_json(
                     {

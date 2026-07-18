@@ -248,6 +248,27 @@ async def test_provider_graph_wires_fx_cache_cadences_and_alpaca_clock_url() -> 
 
 
 @pytest.mark.asyncio
+async def test_provider_graph_applies_the_proxy_provider_allowlist() -> None:
+    proxy_url = "http://10.0.1.7:7890"
+    graph = build_provider_graph(
+        Settings(
+            require_free_threaded=False,
+            background_enabled=False,
+            coingecko_api_key="coingecko-key",
+            provider_proxy_url=proxy_url,
+            provider_proxy_names=("binance", "lido"),
+        )
+    )
+    try:
+        assert graph.providers["binance"].proxy_url == proxy_url
+        assert graph.providers["lido"].proxy_url == proxy_url
+        assert graph.providers["kraken"].proxy_url is None
+        assert graph.providers["coingecko"].proxy_url is None
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
 async def test_default_twelve_quota_reserves_fx_budget() -> None:
     graph = build_provider_graph(
         Settings(

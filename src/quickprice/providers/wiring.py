@@ -47,6 +47,11 @@ class ProviderGraph:
         await self.router.close()
 
 
+def _proxy_options(settings: Settings, provider_name: str) -> dict[str, str]:
+    proxy_url = settings.proxy_url_for_provider(provider_name)
+    return {"proxy_url": proxy_url} if proxy_url else {}
+
+
 def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     """Install the provider graph owned by QuickPrice's built-in plugin."""
 
@@ -54,13 +59,17 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     router = context.router
     providers = context.providers
 
-    binance = providers["binance"] = BinanceProvider()
-    kraken = providers["kraken"] = KrakenProvider(max_quote_ages={"XMR:USDC": timedelta(minutes=5)})
+    binance = providers["binance"] = BinanceProvider(**_proxy_options(settings, "binance"))
+    kraken = providers["kraken"] = KrakenProvider(
+        max_quote_ages={"XMR:USDC": timedelta(minutes=5)},
+        **_proxy_options(settings, "kraken"),
+    )
     coingecko = None
     if settings.coingecko_api_key:
         coingecko = providers["coingecko"] = CoinGeckoProvider(
             settings.coingecko_api_key,
             quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
+            **_proxy_options(settings, "coingecko"),
         )
 
     for symbol in (
@@ -140,12 +149,14 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             settings.binance_api_key,
             settings.binance_api_secret,
             request_timeout=settings.provider_timeout_seconds,
+            **_proxy_options(settings, "binance_wbeth_rate"),
         )
         wbeth_yield_chain.append(binance_yield)
     if settings.ethereum_rpc_urls:
         ethereum_yield = providers["ethereum_exchange_rate"] = EthereumExchangeRateYieldProvider(
             settings.ethereum_rpc_urls,
             request_timeout=settings.provider_timeout_seconds,
+            **_proxy_options(settings, "ethereum_exchange_rate"),
         )
         wbeth_yield_chain.append(ethereum_yield)
     market_ratio_yield = providers["staking_market_ratio_proxy"] = StakingMarketRatioYieldProvider(
@@ -162,6 +173,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
 
     lido = providers["lido"] = LidoAprProvider(
         request_timeout=settings.provider_timeout_seconds,
+        **_proxy_options(settings, "lido"),
     )
     for symbol in ("STETH:USDC", "WSTETH:USDC"):
         router.register(symbol, Capability.YIELD, [lido, market_ratio_yield])
@@ -172,12 +184,14 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             settings.alpaca_api_key,
             settings.alpaca_api_secret,
             trading_base_url=settings.alpaca_trading_base_url,
+            **_proxy_options(settings, "alpaca"),
         )
     finnhub = None
     if settings.finnhub_api_key:
         finnhub = providers["finnhub"] = FinnhubProvider(
             settings.finnhub_api_key,
             quota=minute_budget(settings.finnhub_calls_per_minute),
+            **_proxy_options(settings, "finnhub"),
         )
     twelve = None
     if settings.twelve_data_api_key:
@@ -188,6 +202,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             calls_per_minute=settings.twelve_calls_per_minute,
             rate_gate_timeout_seconds=settings.twelve_rate_gate_timeout_seconds,
             request_timeout=settings.provider_timeout_seconds,
+            **_proxy_options(settings, "twelve_data"),
             quota=daily_budget(
                 settings.twelve_daily_credits,
                 reserve=min(
@@ -201,6 +216,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
         alpha = providers["alpha_vantage"] = AlphaVantageProvider(
             settings.alpha_vantage_api_key,
             quota=daily_budget(settings.alpha_vantage_daily_credits),
+            **_proxy_options(settings, "alpha_vantage"),
         )
 
     for symbol in LISTED_SYMBOLS:
@@ -237,7 +253,10 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             router.register(symbol, Capability.HISTORY, [synthetic_fx_history])
 
     if settings.fred_api_key:
-        fred = providers["fred"] = FredProvider(settings.fred_api_key)
+        fred = providers["fred"] = FredProvider(
+            settings.fred_api_key,
+            **_proxy_options(settings, "fred"),
+        )
         router.register("BOXX:USD", Capability.YIELD, [fred])
 
 

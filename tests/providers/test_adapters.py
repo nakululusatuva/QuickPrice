@@ -696,7 +696,11 @@ async def test_finnhub_stream_subscribes_once_and_normalizes_millisecond_trades(
             return self.websocket
 
     session = FakeSession()
-    provider = FinnhubProvider("secret-finnhub-key", session=session)
+    provider = FinnhubProvider(
+        "secret-finnhub-key",
+        session=session,
+        proxy_url="http://10.0.1.7:7890",
+    )
 
     stream = provider.stream_quotes(("QQQM:USD", "AAPL:USD", "QQQM:USD"))
     result = await anext(stream)
@@ -706,6 +710,7 @@ async def test_finnhub_stream_subscribes_once_and_normalizes_millisecond_trades(
     args, kwargs = session.connection
     assert args == ("wss://ws.finnhub.io",)
     assert kwargs["params"] == {"token": "secret-finnhub-key"}
+    assert kwargs["proxy"] == "http://10.0.1.7:7890"
     assert session.websocket.sent == [
         {"type": "subscribe", "symbol": "QQQM"},
         {"type": "subscribe", "symbol": "AAPL"},

@@ -77,6 +77,7 @@ def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
         settings.fred_api_key,
         settings.binance_api_key,
         settings.binance_api_secret,
+        settings.provider_proxy_url,
         *settings.ethereum_rpc_urls,
     )
 
