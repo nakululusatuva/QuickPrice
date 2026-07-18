@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .fx import FX_CURRENCY_NAMES, FX_SYMBOLS
 from .plugin_api import (
     AssetClass,
     InstrumentPlugin,
@@ -11,9 +12,32 @@ from .plugin_api import (
     YieldStrategy,
 )
 
+
+def _fx_instrument(symbol: str) -> InstrumentSpec:
+    base, _, counter = symbol.partition(":")
+    return InstrumentSpec(
+        symbol=symbol,
+        base=base,
+        quote=counter,
+        name=f"{FX_CURRENCY_NAMES[base]} / {FX_CURRENCY_NAMES[counter]}",
+        description=(
+            f"The value of one {FX_CURRENCY_NAMES[base]} expressed in {FX_CURRENCY_NAMES[counter]}."
+        ),
+        asset_class=AssetClass.FX,
+        asset_type="forex_pair",
+        price_basis="exchange_rate" if base == "USD" else "synthetic_cross",
+        market_calendar=MarketCalendar.FX_24X5,
+        stale_after_seconds=300.0 if symbol == "USD:CNH" else 1200.0,
+        quote_poll_seconds=240.0,
+    )
+
+
+FX_INSTRUMENTS = tuple(_fx_instrument(symbol) for symbol in FX_SYMBOLS)
+
+
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.1.0",
+    version="1.2.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -54,6 +78,42 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
             underlying_asset="ETH",
             quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="STETH:USDC",
+            base="STETH",
+            quote="USDC",
+            name="Lido Staked Ether",
+            description=(
+                "A rebasing liquid-staking token representing Ether staked through "
+                "the Lido protocol; rewards accrue through balance rebases."
+            ),
+            asset_class=AssetClass.CRYPTO,
+            asset_type="liquid_staking_token",
+            price_basis="aggregated_spot_ratio",
+            yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+            reward_accrual_mode=RewardAccrualMode.REBASING_BALANCE,
+            underlying_asset="ETH",
+            stale_after_seconds=1800.0,
+            quote_poll_seconds=660.0,
+        ),
+        InstrumentSpec(
+            symbol="WSTETH:USDC",
+            base="WSTETH",
+            quote="USDC",
+            name="Wrapped Lido Staked Ether",
+            description=(
+                "A non-rebasing wrapper around stETH whose unit value increases as "
+                "Lido staking rewards accrue."
+            ),
+            asset_class=AssetClass.CRYPTO,
+            asset_type="liquid_staking_token",
+            price_basis="aggregated_spot_ratio",
+            yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+            reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+            underlying_asset="ETH",
+            stale_after_seconds=1800.0,
+            quote_poll_seconds=660.0,
         ),
         InstrumentSpec(
             symbol="QQQM:USD",
@@ -97,32 +157,7 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             stale_after_seconds=120.0,
             quote_poll_seconds=5.0,
         ),
-        InstrumentSpec(
-            symbol="USD:CNH",
-            base="USD",
-            quote="CNH",
-            name="United States Dollar / Offshore Chinese Yuan",
-            description="The offshore Chinese yuan value of one United States dollar.",
-            asset_class=AssetClass.FX,
-            asset_type="forex_pair",
-            price_basis="mid",
-            market_calendar=MarketCalendar.FX_24X5,
-            stale_after_seconds=300.0,
-            quote_poll_seconds=130.0,
-        ),
-        InstrumentSpec(
-            symbol="HKD:CNH",
-            base="HKD",
-            quote="CNH",
-            name="Hong Kong Dollar / Offshore Chinese Yuan",
-            description="A synthetic offshore Chinese yuan price for one Hong Kong dollar.",
-            asset_class=AssetClass.FX,
-            asset_type="forex_pair",
-            price_basis="synthetic_cross",
-            market_calendar=MarketCalendar.FX_24X5,
-            stale_after_seconds=1200.0,
-            quote_poll_seconds=130.0,
-        ),
+        *FX_INSTRUMENTS,
     ),
 )
 

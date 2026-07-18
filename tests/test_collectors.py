@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from quickprice.builtin_plugin import FX_INSTRUMENTS
 from quickprice.collectors import MarketDataCoordinator, derive_cross_history
 from quickprice.config import Settings
 from quickprice.domain import PricePoint, ProviderQuote
+from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
 from quickprice.plugin_api import AssetClass, InstrumentPlugin, InstrumentSpec
 from quickprice.providers.base import Capability
 from quickprice.providers.wiring import build_provider_graph
@@ -77,6 +79,7 @@ def test_cross_history_aligns_and_divides_components():
     )
     assert len(result) == 1
     assert result[0].price == Decimal("7.2") / Decimal("7.8")
+    assert result[0].timestamp == now
     assert result[0].is_derived is True
 
 
@@ -92,6 +95,151 @@ def test_cross_history_rejects_excessive_component_skew():
         interval="1m",
     )
     assert result == ()
+
+
+def test_cross_history_never_uses_a_future_component():
+    now = datetime(2026, 7, 20, 4, tzinfo=UTC)
+    result = derive_cross_history(
+        "GBP:EUR",
+        [PricePoint("USD:EUR", now, Decimal("0.90"), "twelve")],
+        [
+            PricePoint("USD:GBP", now - timedelta(minutes=2), Decimal("0.75"), "twelve"),
+            PricePoint("USD:GBP", now + timedelta(minutes=1), Decimal("0.80"), "twelve"),
+        ],
+        operation="divide",
+        max_skew=timedelta(minutes=20),
+        provider="synthetic_fx",
+        interval="1m",
+    )
+
+    assert result[0].price == Decimal("0.90") / Decimal("0.75")
+    assert result[0].timestamp == now
+
+
+@pytest.mark.asyncio
+async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> None:
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-history-fixture",
+                version="1",
+                instruments=FX_INSTRUMENTS,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    prices = {
+        "USD:EUR": Decimal("0.90"),
+        "USD:GBP": Decimal("0.75"),
+        "USD:HKD": Decimal("7.80"),
+        "USD:SGD": Decimal("1.25"),
+        "USD:CNH": Decimal("7.20"),
+    }
+    timestamp = datetime(2026, 7, 20, 4, tzinfo=UTC)
+
+    class History:
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], list[PricePoint]] = {}
+
+        def points_for_interval(self, symbol: str, interval: str):
+            return tuple(self.values.get((symbol, interval), ()))
+
+        def add(self, points):
+            for item in points:
+                self.values.setdefault((item.symbol, item.interval), []).append(item)
+
+    class Service:
+        def __init__(self) -> None:
+            self.history = History()
+            self.published_sizes: list[int] = []
+            self.persist_flags: list[bool] = []
+
+        async def publish_history_async(self, points, *, persist=True):
+            self.published_sizes.append(len(points))
+            self.persist_flags.append(persist)
+            self.history.add(points)
+
+    service = Service()
+    coordinator = MarketDataCoordinator(
+        service,
+        Settings(background_enabled=False),
+        registry,
+    )
+    upstream_calls: list[str] = []
+
+    async def backfill(symbol: str) -> None:
+        upstream_calls.append(symbol)
+        service.history.add(
+            [
+                PricePoint(
+                    symbol,
+                    timestamp,
+                    prices[symbol],
+                    "twelve_data",
+                    interval=interval,
+                )
+                for interval in ("1m", "5m", "1d")
+            ]
+        )
+
+    coordinator._backfill_symbol = backfill
+    try:
+        await coordinator._backfill_history(include_fx=True)
+    finally:
+        await coordinator.graph.close()
+
+    assert set(upstream_calls) == set(FX_HUB_SYMBOLS)
+    assert len(upstream_calls) == len(FX_HUB_SYMBOLS)
+    for symbol in FX_SYMBOLS:
+        for interval in ("1m", "5m", "1d"):
+            assert service.history.points_for_interval(symbol, interval)
+    assert service.history.points_for_interval("GBP:CNH", "1d")[0].price == (
+        Decimal("7.20") / Decimal("0.75")
+    )
+    assert service.history.points_for_interval("EUR:USD", "1d")[0].price == (
+        Decimal(1) / Decimal("0.90")
+    )
+
+    await coordinator._materialize_builtin_fx_history()
+    assert len(service.published_sizes) == 2 * (len(FX_SYMBOLS) - len(FX_HUB_SYMBOLS))
+    assert sum(service.published_sizes[-25:]) == 75
+    assert service.persist_flags == [False] * len(service.persist_flags)
+
+
+@pytest.mark.asyncio
+async def test_fx_hub_history_refresh_repeats_once_per_day(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False, history_poll_seconds=3_600),
+        _large_registry(1, history_enabled=False),
+    )
+    now = 0.0
+    calls: list[bool] = []
+
+    async def backfill(*, include_fx: bool) -> None:
+        calls.append(include_fx)
+        if len(calls) == 26:
+            raise asyncio.CancelledError
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    coordinator._backfill_history = backfill
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: now)
+    monkeypatch.setattr(collectors.asyncio, "sleep", advance)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._history_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert calls[0] is True
+    assert calls[1:24] == [False] * 23
+    assert calls[24] is True
+    assert calls[25] is False
 
 
 @pytest.mark.asyncio

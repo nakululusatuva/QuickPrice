@@ -8,6 +8,8 @@ from datetime import UTC, datetime, time
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
+from quickprice.fx import FX_HUB_SYMBOLS
+
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
 from ._ttl import AsyncTtlCache
 from .base import (
@@ -31,8 +33,7 @@ class AlphaVantageProvider(HttpProvider):
         "SGOV:USD": "SGOV",
     }
     fx_symbols: ClassVar[dict[str, tuple[str, str]]] = {
-        "USD:CNH": ("USD", "CNH"),
-        "USD:HKD": ("USD", "HKD"),
+        symbol: tuple(symbol.split(":")) for symbol in FX_HUB_SYMBOLS
     }
     dividend_frequencies: ClassVar[dict[str, str]] = {
         "QQQM:USD": "quarterly",

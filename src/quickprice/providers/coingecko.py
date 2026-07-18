@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 
-from ._models import component, decimal_value, quote, utc_datetime
+from ._models import component, decimal_value, point, quote, utc_datetime
 from .base import (
     HttpProvider,
     MalformedResponse,
     ProviderUnavailable,
     UnsupportedInstrument,
     require_mapping,
+    require_sequence,
 )
 from .quota import rolling_month_safe_daily_budget
 
@@ -27,6 +28,25 @@ class CoinGeckoProvider(HttpProvider):
         "BTC:USDC": "bitcoin",
         "ETH:USDC": "ethereum",
         "WBETH:USDC": "wrapped-beacon-eth",
+        "STETH:USDC": "staked-ether",
+        "WSTETH:USDC": "wrapped-steth",
+        "ETH:USD": "ethereum",
+        "STETH:USD": "staked-ether",
+        "WSTETH:USD": "wrapped-steth",
+    }
+    history_symbols: ClassVar[frozenset[str]] = frozenset(
+        {
+            "STETH:USDC",
+            "WSTETH:USDC",
+            "ETH:USD",
+            "STETH:USD",
+            "WSTETH:USD",
+        }
+    )
+    component_skew_limits: ClassVar[dict[str, timedelta]] = {
+        "WBETH:USDC": timedelta(seconds=2),
+        "STETH:USDC": timedelta(seconds=60),
+        "WSTETH:USDC": timedelta(seconds=60),
     }
 
     def __init__(
@@ -73,10 +93,11 @@ class CoinGeckoProvider(HttpProvider):
             usdc_price = decimal_value(usdc["usd"])
             asset_time = utc_datetime(asset["last_updated_at"])
             usdc_time = utc_datetime(usdc["last_updated_at"])
-            if normalized == "WBETH:USDC" and abs(asset_time - usdc_time) > timedelta(seconds=2):
+            skew_limit = self.component_skew_limits.get(normalized)
+            if skew_limit is not None and abs(asset_time - usdc_time) > skew_limit:
                 raise MalformedResponse(
                     self.name,
-                    "WBETH and USDC component timestamps exceed two seconds",
+                    "staking-token and USDC component timestamps exceed the configured limit",
                 )
             result_price = asset_price / usdc_price
         except MalformedResponse:
@@ -169,8 +190,85 @@ class CoinGeckoProvider(HttpProvider):
         end: datetime,
         limit: int | None = None,
     ):
-        _ = (symbol, interval, start, end, limit)
-        raise UnsupportedInstrument(
-            self.name,
-            "CoinGecko fallback history does not guarantee QuickPrice intraday intervals",
+        normalized = symbol.strip().upper()
+        if normalized not in self.history_symbols:
+            raise UnsupportedInstrument(
+                self.name,
+                "CoinGecko history is enabled only for configured liquid-staking assets",
+            )
+        normalized_interval = interval.strip().lower()
+        if normalized_interval not in {"1m", "5m", "1d"}:
+            raise UnsupportedInstrument(
+                self.name,
+                f"unsupported interval {normalized_interval}",
+            )
+        start_utc = start.astimezone(UTC)
+        end_utc = end.astimezone(UTC)
+        if start_utc >= end_utc:
+            raise ValueError("history start must be before end")
+
+        coin_id = self._coin(normalized)
+        params: dict[str, str | int] = {
+            "vs_currency": "usd",
+            "from": int(start_utc.timestamp()),
+            "to": int(end_utc.timestamp()),
+            "precision": "full",
+        }
+        # Daily granularity is public. Intraday requests deliberately use
+        # automatic granularity because five-minute data is plan-dependent.
+        if normalized_interval == "1d":
+            params["interval"] = "daily"
+        payload = await self._request_json(
+            "GET",
+            f"{self.base_url}/coins/{coin_id}/market_chart/range",
+            params=params,
+            headers=self._headers,
         )
+        document = require_mapping(payload, self.name)
+        prices = require_sequence(document.get("prices"), self.name, "historical prices")
+        quoted_in_usdc = normalized.endswith(":USDC")
+        current_usdc_usd = (
+            await self._history_usdc_normalization_price() if quoted_in_usdc else decimal_value(1)
+        )
+
+        result = []
+        for row in prices:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                raise MalformedResponse(self.name, "invalid historical price row")
+            try:
+                timestamp = utc_datetime(row[0], milliseconds=True)
+                price_value = decimal_value(row[1]) / current_usdc_usd
+            except (ValueError, ZeroDivisionError) as exc:
+                raise MalformedResponse(self.name, "invalid historical price value") from exc
+            if start_utc <= timestamp <= end_utc:
+                result.append(
+                    point(
+                        symbol=normalized,
+                        timestamp=timestamp,
+                        price=price_value,
+                        provider=self.name,
+                        interval=normalized_interval,
+                        is_derived=quoted_in_usdc,
+                    )
+                )
+        if limit is not None:
+            result = result[-max(0, limit) :]
+        return tuple(result)
+
+    async def _history_usdc_normalization_price(self):
+        # Historical changes are invariant to a constant quote-currency
+        # normalization. Reuse the most recently observed USDC/USD value even
+        # after the live-price TTL expires so hourly backfills do not consume a
+        # second monthly credit stream. The first history request still obtains
+        # a real observation if no quote has populated the cache yet.
+        document = self._price_cache
+        if document is None:
+            document = await self._simple_prices()
+        try:
+            usdc = require_mapping(document["usd-coin"], self.name, "usd-coin")
+            value = decimal_value(usdc["usd"])
+            if value <= 0:
+                raise ValueError("USDC price must be positive")
+            return value
+        except (KeyError, ValueError) as exc:
+            raise MalformedResponse(self.name, "invalid USDC normalization price") from exc

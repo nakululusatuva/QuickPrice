@@ -204,6 +204,18 @@ class HistoryCache:
             merged = tuple(point for point in merged if point.timestamp < cutoff) + one
         return merged
 
+    def points_for_interval(self, symbol: str, interval: str) -> tuple[PricePoint, ...]:
+        """Return one complete ring without hiding overlaps from other intervals."""
+
+        with self._lock:
+            if interval == "1m":
+                return tuple(self._one_minute.get(symbol, ()))
+            if interval == "5m":
+                return tuple(self._five_minute.get(symbol, ()))
+            if interval == "1d":
+                return tuple(self._daily.get(symbol, ()))
+        raise ValueError(f"unsupported history interval: {interval}")
+
     def sizes(self) -> dict[str, dict[str, int]]:
         with self._lock:
             symbols = set(self._one_minute) | set(self._five_minute) | set(self._daily)

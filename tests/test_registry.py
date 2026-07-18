@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from quickprice.builtin_plugin import BUILTIN_PLUGIN
+from quickprice.fx import FX_SYMBOLS
 from quickprice.plugin_api import (
     AssetClass,
     InstrumentPlugin,
@@ -17,16 +18,18 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS == (
+    assert SYMBOLS[:8] == (
         "BTC:USDC",
         "ETH:USDC",
         "WBETH:USDC",
+        "STETH:USDC",
+        "WSTETH:USDC",
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
-        "USD:CNH",
-        "HKD:CNH",
     )
+    assert SYMBOLS[8:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 38
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND
@@ -55,6 +58,17 @@ def test_builtin_wbeth_declares_required_staking_income_semantics() -> None:
     assert wbeth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert wbeth.reward_accrual_mode is RewardAccrualMode.VALUE_ACCRUING
     assert wbeth.underlying_asset == "ETH"
+
+
+def test_lido_tokens_distinguish_rebasing_and_value_accrual() -> None:
+    steth = INSTRUMENTS["STETH:USDC"]
+    wsteth = INSTRUMENTS["WSTETH:USDC"]
+
+    assert steth.reward_accrual_mode is RewardAccrualMode.REBASING_BALANCE
+    assert wsteth.reward_accrual_mode is RewardAccrualMode.VALUE_ACCRUING
+    assert steth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
+    assert wsteth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
+    assert steth.underlying_asset == wsteth.underlying_asset == "ETH"
 
 
 @pytest.mark.parametrize(

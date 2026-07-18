@@ -76,8 +76,25 @@ async def test_coingecko_rejects_wbeth_components_more_than_two_seconds_apart(fi
     provider = CoinGeckoProvider("key")
     provider._request_json = AsyncMock(return_value=payload)
 
-    with pytest.raises(MalformedResponse, match="two seconds"):
+    with pytest.raises(MalformedResponse, match="configured limit"):
         await provider.get_quote("WBETH:USDC")
+
+
+@pytest.mark.asyncio
+async def test_coingecko_allows_slow_aggregated_staking_component_updates():
+    timestamp = 1_768_000_000
+    provider = CoinGeckoProvider("key")
+    provider._request_json = AsyncMock(
+        return_value={
+            "wrapped-steth": {"usd": 4800, "last_updated_at": timestamp - 12},
+            "usd-coin": {"usd": 1, "last_updated_at": timestamp},
+        }
+    )
+
+    result = await provider.get_quote("WSTETH:USDC")
+
+    assert result.price == Decimal("4800")
+    assert result.as_of == datetime.fromtimestamp(timestamp - 12, tz=UTC)
 
 
 @pytest.mark.asyncio
@@ -87,6 +104,8 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "bitcoin": {"usd": 100_000, "last_updated_at": timestamp},
         "ethereum": {"usd": 4_000, "last_updated_at": timestamp},
         "wrapped-beacon-eth": {"usd": 4_500, "last_updated_at": timestamp},
+        "staked-ether": {"usd": 3_990, "last_updated_at": timestamp},
+        "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
         "usd-coin": {"usd": 1, "last_updated_at": timestamp},
     }
     provider = CoinGeckoProvider("key", clock=lambda: 10.0)
@@ -96,15 +115,19 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         provider.get_quote("BTC:USDC"),
         provider.get_quote("ETH:USDC"),
         provider.get_quote("WBETH:USDC"),
+        provider.get_quote("STETH:USDC"),
+        provider.get_quote("WSTETH:USDC"),
     )
 
-    assert len(results) == 3
+    assert len(results) == 5
     assert provider._request_json.await_count == 1
     requested_ids = provider._request_json.await_args.kwargs["params"]["ids"].split(",")
     assert set(requested_ids) == {
         "bitcoin",
         "ethereum",
         "wrapped-beacon-eth",
+        "staked-ether",
+        "wrapped-steth",
         "usd-coin",
     }
 
@@ -113,13 +136,75 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
 async def test_coingecko_does_not_claim_intraday_history_support():
     provider = CoinGeckoProvider("key")
 
-    with pytest.raises(UnsupportedInstrument, match="does not guarantee"):
+    with pytest.raises(UnsupportedInstrument, match="only for configured"):
         await provider.get_history(
             "BTC:USDC",
             interval="1m",
             start=datetime(2026, 7, 1, tzinfo=UTC),
             end=datetime(2026, 7, 2, tzinfo=UTC),
         )
+
+
+@pytest.mark.asyncio
+async def test_coingecko_liquid_staking_history_is_normalized_to_usdc():
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(days=2)
+    timestamp = int((start + timedelta(hours=1)).timestamp())
+    provider = CoinGeckoProvider("key", clock=lambda: 10.0)
+    provider._request_json = AsyncMock(
+        side_effect=[
+            {
+                "prices": [
+                    [timestamp * 1000, 3000],
+                    [int(end.timestamp() * 1000), 3030],
+                ]
+            },
+            {
+                "staked-ether": {"usd": 3030, "last_updated_at": int(end.timestamp())},
+                "wrapped-steth": {"usd": 3600, "last_updated_at": int(end.timestamp())},
+                "usd-coin": {"usd": "0.999", "last_updated_at": int(end.timestamp())},
+            },
+        ]
+    )
+
+    points = await provider.get_history(
+        "STETH:USDC",
+        interval="5m",
+        start=start,
+        end=end,
+    )
+
+    assert [point.price for point in points] == [
+        Decimal("3000") / Decimal("0.999"),
+        Decimal("3030") / Decimal("0.999"),
+    ]
+    assert all(point.is_derived for point in points)
+    assert all(point.interval == "5m" for point in points)
+    market_call = provider._request_json.await_args_list[0]
+    assert market_call.kwargs["params"]["vs_currency"] == "usd"
+    assert "interval" not in market_call.kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_coingecko_internal_usd_history_does_not_consume_usdc_quote_refresh():
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    provider = CoinGeckoProvider("key")
+    provider._request_json = AsyncMock(
+        return_value={"prices": [[int(start.timestamp() * 1000), "3000"]]}
+    )
+
+    points = await provider.get_history(
+        "STETH:USD",
+        interval="1d",
+        start=start,
+        end=end,
+    )
+
+    assert len(points) == 1
+    assert points[0].price == Decimal("3000")
+    assert points[0].is_derived is False
+    assert provider._request_json.await_count == 1
 
 
 @pytest.mark.asyncio

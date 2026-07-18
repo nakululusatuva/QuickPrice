@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "quickprice"
-version = "1.1.0"
-description = "A private, cache-first market price API for Excel"
+version = "1.2.0"
+description = "A private, cache-first market data service for Excel Power Query"
 readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "Proprietary" }

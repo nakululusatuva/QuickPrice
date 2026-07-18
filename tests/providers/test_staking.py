@@ -14,6 +14,7 @@ from quickprice.providers.base import MalformedResponse, ProviderUnavailable
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
+    LidoAprProvider,
     StakingMarketRatioSpec,
     StakingMarketRatioYieldProvider,
 )
@@ -291,6 +292,71 @@ async def test_binance_wbeth_rate_keeps_vendor_apr_and_signs_request():
     assert signature == expected
     assert call.kwargs["headers"] == {"X-MBX-APIKEY": "read-only-key"}
     assert "secret" not in urlencode(call.kwargs["params"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("symbol", "expected_mode"),
+    (
+        ("STETH:USDC", RewardAccrualMode.REBASING_BALANCE),
+        ("WSTETH:USDC", RewardAccrualMode.VALUE_ACCRUING),
+    ),
+)
+async def test_lido_official_sma_apr_preserves_token_accrual_mode(
+    symbol: str,
+    expected_mode: RewardAccrualMode,
+):
+    now = datetime(2026, 7, 20, tzinfo=UTC)
+    provider = LidoAprProvider(clock=lambda: now)
+    provider._request_json = AsyncMock(
+        return_value={
+            "data": {
+                "aprs": [
+                    {"timeUnix": int((now - timedelta(days=1)).timestamp()), "apr": "2.1"},
+                    {"timeUnix": int((now - timedelta(hours=1)).timestamp()), "apr": "2.2"},
+                ],
+                "smaApr": "2.15",
+            },
+            "meta": {
+                "symbol": "stETH",
+                "address": "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84",
+                "chainId": 1,
+            },
+        }
+    )
+
+    metric = await provider.get_yield(symbol)
+
+    assert metric.value == Decimal("2.15")
+    assert metric.method == "lido_steth_apr_7d_sma"
+    assert metric.provider == "lido"
+    assert metric.rate_type is YieldRateType.APR
+    assert metric.observation_window_days == Decimal("7")
+    assert metric.accrual_mode is expected_mode
+    assert metric.underlying_asset == "ETH"
+    assert metric.is_proxy is False
+    assert metric.is_estimate is True
+    assert metric.quality is not None
+    assert metric.quality.confidence == "high"
+    assert metric.quality.stale is False
+
+
+@pytest.mark.asyncio
+async def test_lido_apr_rejects_unexpected_contract_metadata():
+    now = datetime(2026, 7, 20, tzinfo=UTC)
+    provider = LidoAprProvider(clock=lambda: now)
+    provider._request_json = AsyncMock(
+        return_value={
+            "data": {
+                "aprs": [{"timeUnix": int(now.timestamp()), "apr": "2.1"}],
+                "smaApr": "2.1",
+            },
+            "meta": {"symbol": "stETH", "address": "0x0", "chainId": 1},
+        }
+    )
+
+    with pytest.raises(MalformedResponse, match="unexpected Lido APR metadata"):
+        await provider.get_yield("STETH:USDC")
 
 
 class _HistoryFixture:

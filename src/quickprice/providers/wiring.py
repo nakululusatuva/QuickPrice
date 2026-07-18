@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import Any
 
 from quickprice.config import Settings
+from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
 from quickprice.plugin_api import ProviderInstallContext, YieldStrategy
 from quickprice.registry import InstrumentRegistry, build_registry
 
@@ -18,13 +19,17 @@ from .base import Capability
 from .binance import BinanceProvider
 from .coingecko import CoinGeckoProvider
 from .fred import FredProvider
+from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from .kraken import KrakenProvider
 from .quota import daily_budget, rolling_month_safe_daily_budget
 from .router import ProviderRouter
 from .staking import (
+    STETH_MARKET_RATIO_SPEC,
     WBETH_MARKET_RATIO_SPEC,
+    WSTETH_MARKET_RATIO_SPEC,
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
+    LidoAprProvider,
     StakingMarketRatioYieldProvider,
 )
 from .synthetic import SyntheticHistoryProvider, SyntheticQuoteProvider, SyntheticRecipe
@@ -64,6 +69,15 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
         router.register(symbol, Capability.QUOTE, quote_chain)
         router.register(symbol, Capability.HISTORY, history_chain)
 
+    if coingecko is not None:
+        for symbol in ("STETH:USDC", "WSTETH:USDC"):
+            router.register(symbol, Capability.QUOTE, [coingecko])
+            router.register(symbol, Capability.HISTORY, [coingecko])
+        # Internal USD histories keep the 30-day token/ETH yield proxy on a
+        # common quote currency without exposing implementation-only symbols.
+        for symbol in ("ETH:USD", "STETH:USD", "WSTETH:USD"):
+            router.register(symbol, Capability.HISTORY, [coingecko])
+
     # Internal component symbols are intentionally not part of the public
     # instrument registry. They can only be reached by the synthetic recipes.
     for symbol in ("WBETH:ETH", "WBETH:USDT", "USDC:USDT"):
@@ -97,27 +111,37 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     wbeth_history_chain = [wbeth_history_primary, wbeth_history_alternate]
     router.register("WBETH:USDC", Capability.HISTORY, wbeth_history_chain)
 
-    staking_yield_chain: list[Any] = []
+    wbeth_yield_chain: list[Any] = []
     if settings.ethereum_rpc_urls:
         ethereum_yield = providers["ethereum_exchange_rate"] = EthereumExchangeRateYieldProvider(
             settings.ethereum_rpc_urls,
             request_timeout=settings.provider_timeout_seconds,
         )
-        staking_yield_chain.append(ethereum_yield)
+        wbeth_yield_chain.append(ethereum_yield)
     if settings.binance_api_key and settings.binance_api_secret:
         binance_yield = providers["binance_wbeth_rate"] = BinanceWbethYieldProvider(
             settings.binance_api_key,
             settings.binance_api_secret,
             request_timeout=settings.provider_timeout_seconds,
         )
-        staking_yield_chain.append(binance_yield)
+        wbeth_yield_chain.append(binance_yield)
     market_ratio_yield = providers["staking_market_ratio_proxy"] = StakingMarketRatioYieldProvider(
         router,
-        specs=(WBETH_MARKET_RATIO_SPEC,),
+        specs=(
+            WBETH_MARKET_RATIO_SPEC,
+            STETH_MARKET_RATIO_SPEC,
+            WSTETH_MARKET_RATIO_SPEC,
+        ),
         lookback_days=settings.staking_yield_market_fallback_days,
     )
-    staking_yield_chain.append(market_ratio_yield)
-    router.register("WBETH:USDC", Capability.YIELD, staking_yield_chain)
+    wbeth_yield_chain.append(market_ratio_yield)
+    router.register("WBETH:USDC", Capability.YIELD, wbeth_yield_chain)
+
+    lido = providers["lido"] = LidoAprProvider(
+        request_timeout=settings.provider_timeout_seconds,
+    )
+    for symbol in ("STETH:USDC", "WSTETH:USDC"):
+        router.register(symbol, Capability.YIELD, [lido, market_ratio_yield])
 
     alpaca = None
     if settings.alpaca_api_key and settings.alpaca_api_secret:
@@ -163,21 +187,18 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
 
     fx_chain = [provider for provider in (twelve, alpha) if provider is not None]
     if fx_chain:
-        for symbol in ("USD:CNH", "USD:HKD"):
+        for symbol in FX_HUB_SYMBOLS:
             router.register(symbol, Capability.QUOTE, fx_chain)
             router.register(symbol, Capability.HISTORY, fx_chain)
-        hkd_synthetic = SyntheticQuoteProvider(
-            router.get_quote,
-            (SyntheticRecipe.hkd_cnh(),),
+        synthetic_fx = providers["synthetic_fx"] = UsdHubFxQuoteProvider(router.get_quote)
+        synthetic_fx_history = providers["synthetic_fx_history"] = UsdHubFxHistoryProvider(
+            router.get_history
         )
-        providers["synthetic_hkd_cnh"] = hkd_synthetic
-        router.register("HKD:CNH", Capability.QUOTE, [hkd_synthetic])
-        hkd_history = SyntheticHistoryProvider(
-            router.get_history,
-            (SyntheticRecipe.hkd_cnh(),),
-        )
-        providers["synthetic_hkd_cnh_history"] = hkd_history
-        router.register("HKD:CNH", Capability.HISTORY, [hkd_history])
+        for symbol in FX_SYMBOLS:
+            if symbol in FX_HUB_SYMBOLS:
+                continue
+            router.register(symbol, Capability.QUOTE, [synthetic_fx])
+            router.register(symbol, Capability.HISTORY, [synthetic_fx_history])
 
     if settings.fred_api_key:
         fred = providers["fred"] = FredProvider(settings.fred_api_key)

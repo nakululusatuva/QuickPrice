@@ -198,7 +198,7 @@ def synthesize_hkd_cnh(
     """HKD/CNH formula: USD/CNH divided by USD/HKD.
 
     The slower USD/HKD leg may be up to 20 minutes old. USD/CNH retains a
-    tighter five-minute freshness requirement because it is polled every 130s.
+    tighter five-minute freshness requirement.
     """
 
     return synthesize_division(

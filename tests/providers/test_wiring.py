@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from quickprice.config import Settings
+from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
 from quickprice.plugin_api import (
     AssetClass,
     InstrumentPlugin,
@@ -11,9 +12,12 @@ from quickprice.plugin_api import (
 )
 from quickprice.providers.alpaca import AlpacaProvider
 from quickprice.providers.base import Capability
+from quickprice.providers.coingecko import CoinGeckoProvider
+from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
+    LidoAprProvider,
     StakingMarketRatioYieldProvider,
 )
 from quickprice.providers.twelve_data import TwelveDataProvider
@@ -72,6 +76,37 @@ async def test_wbeth_yield_route_keeps_market_ratio_as_final_fallback_without_cr
 
 
 @pytest.mark.asyncio
+async def test_lido_tokens_use_coingecko_prices_and_official_apr_before_ratio_fallback() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        coingecko_api_key="coingecko-demo-key",
+        staking_yield_market_fallback_days=30,
+    )
+    graph = build_provider_graph(settings)
+    try:
+        for symbol in ("STETH:USDC", "WSTETH:USDC"):
+            quote_chain = graph.router.providers_for(symbol, Capability.QUOTE)
+            history_chain = graph.router.providers_for(symbol, Capability.HISTORY)
+            yield_chain = graph.router.providers_for(symbol, Capability.YIELD)
+
+            assert len(quote_chain) == len(history_chain) == 1
+            assert isinstance(quote_chain[0], CoinGeckoProvider)
+            assert history_chain[0] is quote_chain[0]
+            assert tuple(type(provider) for provider in yield_chain) == (
+                LidoAprProvider,
+                StakingMarketRatioYieldProvider,
+            )
+            assert yield_chain[-1].lookback_days == 30
+        for internal_symbol in ("ETH:USD", "STETH:USD", "WSTETH:USD"):
+            assert graph.router.providers_for(internal_symbol, Capability.HISTORY) == (
+                graph.providers["coingecko"],
+            )
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_graph_wires_fx_cache_cadences_and_alpaca_clock_url() -> None:
     settings = Settings(
         require_free_threaded=False,
@@ -90,9 +125,22 @@ async def test_provider_graph_wires_fx_cache_cadences_and_alpaca_clock_url() -> 
 
         assert isinstance(twelve, TwelveDataProvider)
         assert twelve.quote_cache_ttl_seconds == {
-            "USD:CNH": 260,
+            "USD:EUR": 1_800,
+            "USD:GBP": 1_800,
             "USD:HKD": 1_800,
+            "USD:SGD": 1_800,
+            "USD:CNH": 260,
         }
+        for symbol in FX_HUB_SYMBOLS:
+            assert graph.router.providers_for(symbol, Capability.QUOTE) == (twelve,)
+            assert graph.router.providers_for(symbol, Capability.HISTORY) == (twelve,)
+        synthetic_quote = graph.providers["synthetic_fx"]
+        synthetic_history = graph.providers["synthetic_fx_history"]
+        assert isinstance(synthetic_quote, UsdHubFxQuoteProvider)
+        assert isinstance(synthetic_history, UsdHubFxHistoryProvider)
+        for symbol in set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS):
+            assert graph.router.providers_for(symbol, Capability.QUOTE) == (synthetic_quote,)
+            assert graph.router.providers_for(symbol, Capability.HISTORY) == (synthetic_history,)
         assert isinstance(alpaca, AlpacaProvider)
         assert alpaca.trading_base_url == "https://clock.example.invalid/v2"
     finally:

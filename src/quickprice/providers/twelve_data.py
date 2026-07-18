@@ -5,7 +5,10 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, ClassVar
+
+from quickprice.fx import FX_HUB_SYMBOLS
 
 from ._models import decimal_value, point, quote, utc_datetime
 from ._ttl import AsyncTtlCache
@@ -28,9 +31,11 @@ class TwelveDataProvider(HttpProvider):
         "QQQM:USD": "QQQM",
         "BOXX:USD": "BOXX",
         "SGOV:USD": "SGOV",
-        "USD:CNH": "USD/CNH",
-        "USD:HKD": "USD/HKD",
+        **{symbol: symbol.replace(":", "/") for symbol in FX_HUB_SYMBOLS},
     }
+    fx_quote_ttl_floors_seconds: ClassVar[Mapping[str, float]] = MappingProxyType(
+        {symbol: 240.0 if symbol == "USD:CNH" else 900.0 for symbol in FX_HUB_SYMBOLS}
+    )
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1min",
         "5m": "5min",
@@ -44,20 +49,31 @@ class TwelveDataProvider(HttpProvider):
         self,
         api_key: str,
         *,
-        usd_cnh_quote_ttl_seconds: float = 130.0,
+        usd_cnh_quote_ttl_seconds: float = 240.0,
         usd_hkd_quote_ttl_seconds: float = 900.0,
+        fx_quote_ttl_seconds: Mapping[str, float] | None = None,
         quote_cache_clock: Callable[[], float] = time.monotonic,
         **kwargs,
     ):
         kwargs.setdefault("quota", daily_budget(790))
         super().__init__(**kwargs)
         self.api_key = api_key
-        # These floors keep the two continuously collected FX legs below the
-        # 790-credit free-tier ceiling even when standalone and synthetic
-        # collectors request the same components independently.
+        requested_ttls = {symbol: usd_hkd_quote_ttl_seconds for symbol in FX_HUB_SYMBOLS}
+        requested_ttls["USD:CNH"] = usd_cnh_quote_ttl_seconds
+        if fx_quote_ttl_seconds is not None:
+            normalized_ttls = {
+                symbol.strip().upper(): float(ttl) for symbol, ttl in fx_quote_ttl_seconds.items()
+            }
+            unknown = normalized_ttls.keys() - self.fx_quote_ttl_floors_seconds.keys()
+            if unknown:
+                raise ValueError(f"unsupported FX cache policy: {', '.join(sorted(unknown))}")
+            requested_ttls.update(normalized_ttls)
+        # Five shared USD-spoke caches consume at most 744 quote credits per
+        # UTC day at their default floors: 360 for CNH plus 96 for each of the
+        # other four spokes. All 30 public pairs reuse these cache entries.
         self.quote_cache_ttl_seconds = {
-            "USD:CNH": max(130.0, usd_cnh_quote_ttl_seconds),
-            "USD:HKD": max(900.0, usd_hkd_quote_ttl_seconds),
+            symbol: max(self.fx_quote_ttl_floors_seconds[symbol], requested_ttls[symbol])
+            for symbol in FX_HUB_SYMBOLS
         }
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
 
@@ -96,7 +112,7 @@ class TwelveDataProvider(HttpProvider):
             "GET",
             f"{self.base_url}/quote",
             params={"symbol": vendor_symbol, "apikey": self.api_key, "timezone": "UTC"},
-            allow_quota_reserve=normalized in {"USD:CNH", "USD:HKD"},
+            allow_quota_reserve=normalized in FX_HUB_SYMBOLS,
         )
         document = self._document(payload)
         try:
@@ -115,7 +131,7 @@ class TwelveDataProvider(HttpProvider):
             as_of=as_of,
             provider=self.name,
             feed=self.feed,
-            price_basis="last",
+            price_basis="exchange_rate" if normalized in FX_HUB_SYMBOLS else "last",
             market_status=market_status,
             is_derived=False,
             components=(),
@@ -155,7 +171,7 @@ class TwelveDataProvider(HttpProvider):
                 "timezone": "UTC",
                 "apikey": self.api_key,
             },
-            allow_quota_reserve=normalized in {"USD:CNH", "USD:HKD"},
+            allow_quota_reserve=normalized in FX_HUB_SYMBOLS,
         )
         document = self._document(payload)
         rows = document.get("values")

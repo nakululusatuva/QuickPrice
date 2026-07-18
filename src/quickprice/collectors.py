@@ -19,11 +19,15 @@ from typing import Any
 
 from .config import Settings
 from .domain import PricePoint, ProviderQuote, utc_now
+from .fx import FX_HUB_SYMBOLS, FX_SYMBOLS, fx_hub_requirements
 from .market import scheduled_market_status
 from .plugin_api import AssetClass, MarketCalendar, YieldStrategy
 from .providers.base import AllProvidersFailed, Capability, ProviderError
+from .providers.fx import FX_MAX_SKEW
 from .providers.wiring import ProviderGraph, build_provider_graph
 from .registry import InstrumentRegistry, build_registry
+
+FX_HISTORY_REFRESH_SECONDS = 24 * 60 * 60
 
 
 def derive_cross_history(
@@ -36,39 +40,33 @@ def derive_cross_history(
     provider: str,
     interval: str,
 ) -> tuple[PricePoint, ...]:
-    """Align each left bar to the nearest right bar within the allowed skew."""
+    """Align each left bar to the last right bar at or before it."""
     left_sorted = sorted(left, key=lambda item: item.timestamp)
     right_sorted = sorted(right, key=lambda item: item.timestamp)
     if not left_sorted or not right_sorted:
         return ()
     output: dict[datetime, PricePoint] = {}
     index = 0
+    last_right: PricePoint | None = None
     for left_point in left_sorted:
-        while (
-            index + 1 < len(right_sorted)
-            and right_sorted[index + 1].timestamp <= left_point.timestamp
-        ):
+        while index < len(right_sorted) and right_sorted[index].timestamp <= left_point.timestamp:
+            last_right = right_sorted[index]
             index += 1
-        candidates = [right_sorted[index]]
-        if index + 1 < len(right_sorted):
-            candidates.append(right_sorted[index + 1])
-        right_point = min(candidates, key=lambda item: abs(item.timestamp - left_point.timestamp))
-        if abs(left_point.timestamp - right_point.timestamp) > max_skew:
+        if last_right is None or left_point.timestamp - last_right.timestamp > max_skew:
             continue
         try:
             price = (
-                left_point.price * right_point.price
+                left_point.price * last_right.price
                 if operation == "multiply"
-                else left_point.price / right_point.price
+                else left_point.price / last_right.price
             )
         except ArithmeticError, ZeroDivisionError:
             continue
         if price <= Decimal(0):
             continue
-        as_of = min(left_point.timestamp, right_point.timestamp)
-        output[as_of] = PricePoint(
+        output[left_point.timestamp] = PricePoint(
             symbol,
-            as_of,
+            left_point.timestamp,
             price,
             provider,
             True,
@@ -107,6 +105,7 @@ class MarketDataCoordinator:
         self._websocket_reconnects: dict[str, int] = {}
         self._checkpoint_state: dict[tuple[str, str], dict[str, str]] = {}
         self._equity_history_fallback_at: dict[str, float] = {}
+        self._next_fx_history_refresh_at = 0.0
 
     async def start(self) -> None:
         if self._supervisor is not None:
@@ -406,18 +405,26 @@ class MarketDataCoordinator:
                 self._record_error(f"yield:{symbol}", exc)
 
     async def _history_loop(self) -> None:
-        initial = True
         while True:
-            await self._backfill_history(include_fx=initial)
-            initial = False
-            await asyncio.sleep(self.settings.history_poll_seconds)
+            include_fx = time.monotonic() >= self._next_fx_history_refresh_at
+            await self._backfill_history(include_fx=include_fx)
+            if include_fx:
+                self._next_fx_history_refresh_at = time.monotonic() + FX_HISTORY_REFRESH_SECONDS
+            until_fx = max(1.0, self._next_fx_history_refresh_at - time.monotonic())
+            await asyncio.sleep(min(self.settings.history_poll_seconds, until_fx))
 
     async def _backfill_history(self, *, include_fx: bool) -> None:
         symbols = iter(
             instrument.symbol
             for instrument in self.registry.values()
             if instrument.history_enabled
-            and (include_fx or instrument.asset_class is not AssetClass.FX)
+            and (
+                instrument.asset_class is not AssetClass.FX
+                or (
+                    include_fx
+                    and (instrument.symbol not in FX_SYMBOLS or instrument.symbol in FX_HUB_SYMBOLS)
+                )
+            )
         )
 
         async def worker() -> None:
@@ -433,6 +440,73 @@ class MarketDataCoordinator:
         async with asyncio.TaskGroup() as group:
             for index in range(min(2, len(self.registry))):
                 group.create_task(worker(), name=f"history-worker:{index}")
+        if include_fx:
+            await self._materialize_builtin_fx_history()
+
+    async def _materialize_builtin_fx_history(self) -> None:
+        """Build every public FX inverse and cross from cached USD-spoke rings."""
+
+        history = getattr(self.service, "history", None)
+        publish = getattr(self.service, "publish_history_async", None)
+        if history is None or not callable(publish):
+            return
+        points_for_interval = getattr(history, "points_for_interval", None)
+        if not callable(points_for_interval):
+            return
+
+        for symbol in FX_SYMBOLS:
+            instrument = self.registry.resolve(symbol)
+            if instrument is None or instrument.symbol != symbol or symbol in FX_HUB_SYMBOLS:
+                continue
+            requirements = fx_hub_requirements(symbol)
+            _, quote_currency = symbol.split(":", 1)
+            derived: list[PricePoint] = []
+            for interval in ("1m", "5m", "1d"):
+                step = {
+                    "1m": timedelta(minutes=1),
+                    "5m": timedelta(minutes=5),
+                    "1d": timedelta(days=1),
+                }[interval]
+                existing = points_for_interval(symbol, interval)
+                cutoff = max((item.timestamp for item in existing), default=None)
+                if cutoff is not None:
+                    cutoff -= step
+                numerator = tuple(
+                    item
+                    for item in points_for_interval(requirements[0], interval)
+                    if cutoff is None or item.timestamp >= cutoff
+                )
+                if quote_currency == "USD":
+                    derived.extend(
+                        PricePoint(
+                            symbol=symbol,
+                            timestamp=item.timestamp,
+                            price=Decimal(1) / item.price,
+                            provider="synthetic_fx",
+                            is_derived=True,
+                            interval=interval,
+                        )
+                        for item in numerator
+                    )
+                    continue
+                denominator = tuple(
+                    item
+                    for item in points_for_interval(requirements[1], interval)
+                    if cutoff is None or item.timestamp >= cutoff - FX_MAX_SKEW
+                )
+                derived.extend(
+                    derive_cross_history(
+                        symbol,
+                        numerator,
+                        denominator,
+                        operation="divide",
+                        max_skew=FX_MAX_SKEW,
+                        provider="synthetic_fx",
+                        interval=interval,
+                    )
+                )
+            if derived:
+                await publish(derived, persist=False)
 
     async def _backfill_symbol(self, symbol: str) -> None:
         instrument = self.registry[symbol]
@@ -447,9 +521,7 @@ class MarketDataCoordinator:
         published_any = False
         for interval, duration in (("1m", timedelta(hours=48)), ("5m", timedelta(days=45))):
             retention_start = now - duration
-            existing = tuple(
-                point for point in self.service.history.points(symbol) if point.interval == interval
-            )
+            existing = self.service.history.points_for_interval(symbol, interval)
             step = timedelta(minutes=1 if interval == "1m" else 5)
             if (
                 existing
@@ -471,9 +543,7 @@ class MarketDataCoordinator:
             if equity_symbol:
                 if any(point.provider != "alpaca" for point in fetched):
                     used_sparse_fallback = True
-        existing_daily = tuple(
-            point for point in self.service.history.points(symbol) if point.interval == "1d"
-        )
+        existing_daily = self.service.history.points_for_interval(symbol, "1d")
         daily_retention_start = now - timedelta(days=400)
         daily_start = (
             max(

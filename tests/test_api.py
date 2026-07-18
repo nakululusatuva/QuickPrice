@@ -95,7 +95,7 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     body = response.json()
     assert body["schema_version"] == "1.1"
     assert body["partial"] is False
-    assert len(body["data"]) == 8
+    assert len(body["data"]) == len(client.app.state.registry.symbols)
     by_symbol = {item["symbol"]: item for item in body["data"]}
     assert isinstance(by_symbol["BTC:USDC"]["price"], float | int)
     assert isinstance(by_symbol["QQQM:USD"]["dividend"]["yield_percent"], float | int)
@@ -108,6 +108,10 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     assert wbeth["underlying_asset"] == "ETH"
     assert wbeth["estimated_annual_yield"]["rate_type"] == "apy"
     assert wbeth["estimated_annual_yield"]["quality"]["confidence"] == "high"
+    assert by_symbol["STETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
+    assert by_symbol["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
+    assert by_symbol["STETH:USDC"]["estimated_annual_yield"] is not None
+    assert by_symbol["WSTETH:USDC"]["estimated_annual_yield"] is not None
     assert by_symbol["QQQM:USD"]["asset_class"] == "equity"
     assert by_symbol["BOXX:USD"]["asset_type"] == "growth_bond_etf"
     assert by_symbol["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"
@@ -240,10 +244,13 @@ def test_instruments_documents_classification_and_methods(client, auth_headers):
     response = client.get("/v1/instruments", headers=auth_headers)
     assert response.status_code == 200
     items = {item["symbol"]: item for item in response.json()["data"]}
-    assert len(items) == 8
+    assert len(items) == len(client.app.state.registry.symbols)
     assert items["SGOV:USD"]["yield_method"] == "latest_distribution_annualized"
     assert items["WBETH:USDC"]["yield_method"] == "staking_provider_metric"
     assert items["WBETH:USDC"]["reward_accrual_mode"] == "value_accruing"
+    assert items["STETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
+    assert items["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
+    assert items["EUR:GBP"]["asset_class"] == "fx"
     assert items["QQQM:USD"]["dividend_method"] == "latest_regular_cash_annualized_x4"
     assert items["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"
     assert items["QQQM:USD"]["description"]

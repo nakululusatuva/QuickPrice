@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlencode
 
 from quickprice.domain import (
@@ -41,6 +41,7 @@ from .base import (
 WBETH_ETHEREUM_ADDRESS = "0xa2e3356610840701bdf5611a53974510ae27e2e1"
 WBETH_EXCHANGE_RATE_CALL = "0x3ba0b9a9"
 WBETH_EXCHANGE_RATE_EVENT = "0x0b4e9390054347e2a16d95fd8376311b0d2deedecba526e9742bcaa40b059f0b"
+LIDO_STETH_ADDRESS = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
 
 
 @dataclass(frozen=True, slots=True)
@@ -702,6 +703,89 @@ class BinanceWbethYieldProvider(HttpProvider):
         return tuple(sorted(result, key=lambda row: row.as_of))
 
 
+class LidoAprProvider(HttpProvider):
+    """Read Lido's official seven-day simple-moving-average stETH APR."""
+
+    name = "lido"
+    base_url = "https://eth-api.lido.fi"
+    path = "/v1/protocol/steth/apr/sma"
+    _accrual_modes: ClassVar[dict[str, RewardAccrualMode]] = {
+        "STETH:USDC": RewardAccrualMode.REBASING_BALANCE,
+        "WSTETH:USDC": RewardAccrualMode.VALUE_ACCRUING,
+    }
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._clock = clock
+
+    async def get_yield(self, symbol: str) -> YieldMetric:
+        normalized = symbol.strip().upper()
+        try:
+            accrual_mode = self._accrual_modes[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(
+                self.name, f"unsupported yield symbol {normalized}"
+            ) from exc
+
+        payload = await self._request_json("GET", f"{self.base_url}{self.path}")
+        document = require_mapping(payload, self.name)
+        data = require_mapping(document.get("data"), self.name, "APR data")
+        meta = require_mapping(document.get("meta"), self.name, "APR metadata")
+        apr_rows = require_sequence(data.get("aprs"), self.name, "APR observations")
+        if not apr_rows:
+            raise ProviderUnavailable(self.name, "Lido APR observations are empty")
+        try:
+            chain_id = int(meta.get("chainId", 0))
+        except (TypeError, ValueError) as exc:
+            raise MalformedResponse(self.name, "invalid Lido APR chain id") from exc
+        if (
+            str(meta.get("symbol", "")).lower() != "steth"
+            or str(meta.get("address", "")).lower() != LIDO_STETH_ADDRESS.lower()
+            or chain_id != 1
+        ):
+            raise MalformedResponse(self.name, "unexpected Lido APR metadata")
+
+        observations: list[datetime] = []
+        for item in apr_rows:
+            row = require_mapping(item, self.name, "APR observation")
+            try:
+                observations.append(utc_datetime(row["timeUnix"]))
+                decimal_value(row["apr"])
+            except (KeyError, ValueError) as exc:
+                raise MalformedResponse(self.name, "invalid Lido APR observation") from exc
+        try:
+            value = decimal_value(data["smaApr"])
+        except (KeyError, ValueError) as exc:
+            raise MalformedResponse(self.name, "invalid Lido SMA APR") from exc
+
+        as_of = max(observations)
+        staleness_ms = _staleness_ms(self._clock(), as_of)
+        return YieldMetric(
+            symbol=normalized,
+            value=value,
+            as_of=as_of,
+            method="lido_steth_apr_7d_sma",
+            provider=self.name,
+            is_proxy=False,
+            rate_type=YieldRateType.APR,
+            observation_window_days=Decimal(7),
+            accrual_mode=accrual_mode,
+            underlying_asset="ETH",
+            is_estimate=True,
+            quality=YieldQuality(
+                stale=staleness_ms > 2 * 24 * 60 * 60 * 1000,
+                staleness_ms=staleness_ms,
+                confidence="high",
+            ),
+            fallback_level=0,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class StakingMarketRatioSpec:
     """Market pairs used by the explicitly low-confidence ratio fallback."""
@@ -727,6 +811,22 @@ WBETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
     symbol="WBETH:USDC",
     staking_pair="WBETH:USDC",
     underlying_pair="ETH:USDC",
+    underlying_asset="ETH",
+    accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+)
+
+STETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
+    symbol="STETH:USDC",
+    staking_pair="STETH:USD",
+    underlying_pair="ETH:USD",
+    underlying_asset="ETH",
+    accrual_mode=RewardAccrualMode.REBASING_BALANCE,
+)
+
+WSTETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
+    symbol="WSTETH:USDC",
+    staking_pair="WSTETH:USD",
+    underlying_pair="ETH:USD",
     underlying_asset="ETH",
     accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
 )
