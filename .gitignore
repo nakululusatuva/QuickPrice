@@ -10,6 +10,8 @@ dist/
 build/
 *.egg-info/
 .env
+provider-keys.env
+provider-keys.*.env
 data/
 *.db
 *.db-shm

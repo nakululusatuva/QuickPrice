@@ -1,10 +1,66 @@
-"""Environment-only configuration with safe production defaults."""
+"""Environment configuration with isolated provider-credential loading."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
+from typing import Final
+
+_PROVIDER_SECRET_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "QUICKPRICE_ALPACA_API_KEY",
+        "QUICKPRICE_ALPACA_API_SECRET",
+        "QUICKPRICE_ALPHA_VANTAGE_API_KEY",
+        "QUICKPRICE_BINANCE_API_KEY",
+        "QUICKPRICE_BINANCE_API_SECRET",
+        "QUICKPRICE_COINGECKO_API_KEY",
+        "QUICKPRICE_ETHEREUM_RPC_URLS",
+        "QUICKPRICE_FRED_API_KEY",
+        "QUICKPRICE_TWELVE_DATA_API_KEY",
+    }
+)
+
+
+def _provider_key_file_values() -> MappingProxyType[str, str]:
+    raw_path = os.getenv("QUICKPRICE_PROVIDER_KEYS_FILE", "").strip()
+    if not raw_path:
+        return MappingProxyType({})
+
+    path = Path(raw_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"provider key file does not exist: {path}")
+
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, raw_value = line.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            raise ValueError(f"{path}:{line_number}: expected NAME=VALUE")
+        if name not in _PROVIDER_SECRET_NAMES:
+            raise ValueError(f"{path}:{line_number}: unsupported provider credential {name!r}")
+        if name in values:
+            raise ValueError(f"{path}:{line_number}: duplicate provider credential {name!r}")
+
+        value = raw_value.strip()
+        if value[:1] in {"'", '"'}:
+            quote = value[0]
+            if len(value) < 2 or value[-1] != quote:
+                raise ValueError(f"{path}:{line_number}: unterminated quoted value")
+            value = value[1:-1]
+        values[name] = value
+    return MappingProxyType(values)
+
+
+def _provider_value(name: str, file_values: MappingProxyType[str, str]) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        value = file_values.get(name)
+    return value
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -33,10 +89,16 @@ def _float(name: str, default: float, *, minimum: float = 0) -> float:
     return value
 
 
-def _secret(name: str, legacy_name: str | None = None) -> str | None:
+def _secret(
+    name: str,
+    file_values: MappingProxyType[str, str],
+    legacy_name: str | None = None,
+) -> str | None:
     value = os.getenv(name)
     if value is None and legacy_name:
         value = os.getenv(legacy_name)
+    if value is None:
+        value = file_values.get(name)
     return value.strip() if value and value.strip() else None
 
 
@@ -57,7 +119,7 @@ class Settings:
     circuit_open_seconds: float = 60.0
     crypto_poll_seconds: float = 1.0
     equity_poll_seconds: float = 5.0
-    usd_cnh_poll_seconds: float = 130.0
+    usd_cnh_poll_seconds: float = 240.0
     usd_hkd_poll_seconds: float = 900.0
     metadata_poll_seconds: float = 21600.0
     history_poll_seconds: float = 3600.0
@@ -86,6 +148,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        provider_key_values = _provider_key_file_values()
         raw_hashes = os.getenv("QUICKPRICE_API_KEY_HASHES", "")
         hashes = tuple(item.strip().lower() for item in raw_hashes.split(",") if item.strip())
         raw_plugins = os.getenv("QUICKPRICE_ENABLED_PLUGINS", "")
@@ -95,7 +158,9 @@ class Settings:
         ethereum_rpc_urls = tuple(
             dict.fromkeys(
                 item.strip()
-                for item in os.getenv("QUICKPRICE_ETHEREUM_RPC_URLS", "").split(",")
+                for item in (
+                    _provider_value("QUICKPRICE_ETHEREUM_RPC_URLS", provider_key_values) or ""
+                ).split(",")
                 if item.strip()
             )
         )
@@ -119,7 +184,7 @@ class Settings:
             circuit_open_seconds=_float("QUICKPRICE_CIRCUIT_OPEN_SECONDS", 60.0, minimum=1.0),
             crypto_poll_seconds=_float("QUICKPRICE_CRYPTO_POLL_SECONDS", 1.0, minimum=0.25),
             equity_poll_seconds=_float("QUICKPRICE_EQUITY_POLL_SECONDS", 5.0, minimum=1),
-            usd_cnh_poll_seconds=_float("QUICKPRICE_USD_CNH_POLL_SECONDS", 130, minimum=130),
+            usd_cnh_poll_seconds=_float("QUICKPRICE_USD_CNH_POLL_SECONDS", 240, minimum=240),
             usd_hkd_poll_seconds=_float("QUICKPRICE_USD_HKD_POLL_SECONDS", 900, minimum=900),
             metadata_poll_seconds=_float("QUICKPRICE_METADATA_POLL_SECONDS", 21600, minimum=300),
             history_poll_seconds=_float("QUICKPRICE_HISTORY_POLL_SECONDS", 3600, minimum=60),
@@ -137,8 +202,12 @@ class Settings:
             host=os.getenv("QUICKPRICE_HOST", "0.0.0.0"),
             port=_int("QUICKPRICE_PORT", 8080, minimum=1),
             log_level=os.getenv("QUICKPRICE_LOG_LEVEL", "info").lower(),
-            alpaca_api_key=_secret("QUICKPRICE_ALPACA_API_KEY", "ALPACA_API_KEY"),
-            alpaca_api_secret=_secret("QUICKPRICE_ALPACA_API_SECRET", "ALPACA_API_SECRET"),
+            alpaca_api_key=_secret(
+                "QUICKPRICE_ALPACA_API_KEY", provider_key_values, "ALPACA_API_KEY"
+            ),
+            alpaca_api_secret=_secret(
+                "QUICKPRICE_ALPACA_API_SECRET", provider_key_values, "ALPACA_API_SECRET"
+            ),
             alpaca_trading_base_url=(
                 os.getenv(
                     "QUICKPRICE_ALPACA_TRADING_BASE_URL",
@@ -146,15 +215,21 @@ class Settings:
                 ).strip()
                 or "https://paper-api.alpaca.markets/v2"
             ),
-            twelve_data_api_key=_secret("QUICKPRICE_TWELVE_DATA_API_KEY", "TWELVE_DATA_API_KEY"),
-            alpha_vantage_api_key=_secret(
-                "QUICKPRICE_ALPHA_VANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY"
+            twelve_data_api_key=_secret(
+                "QUICKPRICE_TWELVE_DATA_API_KEY", provider_key_values, "TWELVE_DATA_API_KEY"
             ),
-            coingecko_api_key=_secret("QUICKPRICE_COINGECKO_API_KEY", "COINGECKO_API_KEY"),
-            fred_api_key=_secret("QUICKPRICE_FRED_API_KEY", "FRED_API_KEY"),
+            alpha_vantage_api_key=_secret(
+                "QUICKPRICE_ALPHA_VANTAGE_API_KEY",
+                provider_key_values,
+                "ALPHA_VANTAGE_API_KEY",
+            ),
+            coingecko_api_key=_secret(
+                "QUICKPRICE_COINGECKO_API_KEY", provider_key_values, "COINGECKO_API_KEY"
+            ),
+            fred_api_key=_secret("QUICKPRICE_FRED_API_KEY", provider_key_values, "FRED_API_KEY"),
             ethereum_rpc_urls=ethereum_rpc_urls,
-            binance_api_key=_secret("QUICKPRICE_BINANCE_API_KEY"),
-            binance_api_secret=_secret("QUICKPRICE_BINANCE_API_SECRET"),
+            binance_api_key=_secret("QUICKPRICE_BINANCE_API_KEY", provider_key_values),
+            binance_api_secret=_secret("QUICKPRICE_BINANCE_API_SECRET", provider_key_values),
             staking_yield_market_fallback_days=_int(
                 "QUICKPRICE_STAKING_YIELD_MARKET_FALLBACK_DAYS", 30, minimum=7
             ),

@@ -9,6 +9,7 @@ User=quickprice
 Group=quickprice
 WorkingDirectory=/opt/quickprice
 EnvironmentFile=/etc/quickprice/quickprice.env
+EnvironmentFile=/etc/quickprice/provider-keys.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/quickprice/.venv/bin/quickprice serve --host 127.0.0.1 --port 8080
