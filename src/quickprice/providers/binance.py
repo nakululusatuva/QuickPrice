@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, ClassVar
 
 import aiohttp
 
-from ._models import decimal_value, point, quote, utc_datetime
-from .base import HttpProvider, MalformedResponse, UnsupportedInstrument, require_sequence
+from ._models import component, decimal_value, point, quote, utc_datetime
+from .base import (
+    HttpProvider,
+    MalformedResponse,
+    ProviderUnavailable,
+    UnsupportedInstrument,
+    require_sequence,
+)
 
 
 class BinanceProvider(HttpProvider):
@@ -30,6 +37,9 @@ class BinanceProvider(HttpProvider):
         "USDC:USDT": "USDCUSDT",
     }
     _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
+    _midpoint_symbols: ClassVar[frozenset[str]] = frozenset(
+        {"WBETH:ETH", "WBETH:USDT", "USDC:USDT"}
+    )
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1m",
         "5m": "5m",
@@ -38,6 +48,19 @@ class BinanceProvider(HttpProvider):
         "4h": "4h",
         "1d": "1d",
     }
+
+    def __init__(
+        self,
+        *args,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        maximum_relative_book_spread: Decimal = Decimal("0.005"),
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._wall_clock = wall_clock
+        self.maximum_relative_book_spread = decimal_value(maximum_relative_book_spread)
+        if self.maximum_relative_book_spread <= 0:
+            raise ValueError("maximum_relative_book_spread must be positive")
 
     def _exchange_symbol(self, symbol: str) -> str:
         normalized = symbol.strip().upper()
@@ -49,6 +72,8 @@ class BinanceProvider(HttpProvider):
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
         exchange_symbol = self._exchange_symbol(normalized)
+        if normalized in self._midpoint_symbols:
+            return await self._get_midpoint_quote(normalized, exchange_symbol)
         payload = await self._request_json(
             "GET",
             f"{self.rest_base_url}/api/v3/aggTrades",
@@ -73,6 +98,66 @@ class BinanceProvider(HttpProvider):
             market_status="open",
             is_derived=False,
             components=(),
+            fallback_level=0,
+            license_scope="personal_internal",
+            coverage="exchange",
+        )
+
+    async def _get_midpoint_quote(self, normalized: str, exchange_symbol: str):
+        """Observe a current book midpoint for synthetic-only WBETH legs.
+
+        Last trades in these thin component markets can be minutes apart even
+        while both books remain live. The book ticker is an observation at
+        retrieval time, so concurrent legs can retain the strict two-second
+        synthetic skew without relabeling an old trade as current.
+        """
+
+        payload = await self._request_json(
+            "GET",
+            f"{self.rest_base_url}/api/v3/ticker/bookTicker",
+            params={"symbol": exchange_symbol},
+        )
+        if not isinstance(payload, dict):
+            raise MalformedResponse(self.name, "book ticker must be an object")
+        try:
+            bid = decimal_value(payload["bidPrice"])
+            ask = decimal_value(payload["askPrice"])
+        except (KeyError, ValueError) as exc:
+            raise MalformedResponse(self.name, "invalid book ticker") from exc
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise MalformedResponse(self.name, "invalid book spread")
+        midpoint = (bid + ask) / 2
+        if (ask - bid) / midpoint > self.maximum_relative_book_spread:
+            raise ProviderUnavailable(self.name, "book spread exceeds safety limit")
+        observed_at = self._wall_clock().astimezone(UTC)
+        feed = f"{self.feed}_book"
+        return quote(
+            symbol=normalized,
+            price=midpoint,
+            as_of=observed_at,
+            provider=self.name,
+            feed=feed,
+            price_basis="midpoint",
+            market_status="open",
+            is_derived=True,
+            components=(
+                component(
+                    symbol=normalized,
+                    provider=self.name,
+                    price=bid,
+                    as_of=observed_at,
+                    feed=feed,
+                    role="best_bid",
+                ),
+                component(
+                    symbol=normalized,
+                    provider=self.name,
+                    price=ask,
+                    as_of=observed_at,
+                    feed=feed,
+                    role="best_ask",
+                ),
+            ),
             fallback_level=0,
             license_scope="personal_internal",
             coverage="exchange",

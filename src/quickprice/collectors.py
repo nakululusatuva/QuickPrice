@@ -28,6 +28,9 @@ from .providers.wiring import ProviderGraph, build_provider_graph
 from .registry import InstrumentRegistry, build_registry
 
 FX_HISTORY_REFRESH_SECONDS = 24 * 60 * 60
+FX_HISTORY_RETRY_SECONDS = 60
+FX_STARTUP_PRESEED_TIMEOUT_SECONDS = 15.0
+DAILY_PREFIX_RETRY_SECONDS = 24 * 60 * 60
 
 
 def derive_cross_history(
@@ -106,6 +109,14 @@ class MarketDataCoordinator:
         self._stream_observed_at: dict[tuple[int, str], float] = {}
         self._checkpoint_state: dict[tuple[str, str], dict[str, str]] = {}
         self._equity_history_fallback_at: dict[str, float] = {}
+        self._daily_prefix_retry_at: dict[str, float] = {}
+        self._daily_preseeded_symbols: set[str] = set()
+        self._fx_daily_retry_symbols: set[str] = set()
+        self._fx_failed_history_intervals: set[tuple[str, str]] = set()
+        self._fx_history_intervals_for_cycle: dict[str, tuple[str, ...]] = {}
+        self._fx_history_retry_only = False
+        self._history_full_cycle = True
+        self._fx_startup_preseed_timeout_seconds = FX_STARTUP_PRESEED_TIMEOUT_SECONDS
         self._next_fx_history_refresh_at = 0.0
 
     async def start(self) -> None:
@@ -188,6 +199,13 @@ class MarketDataCoordinator:
         await self.graph.close()
 
     async def _run(self) -> None:
+        await self._startup_preseed_fx_daily()
+        # Publish synthetic inverses and crosses from the restored/seeded USD
+        # hubs before readiness is exposed.  Otherwise the first materialize
+        # pass waits behind every regular history worker and the API can be
+        # temporarily complete for hub pairs but missing long-horizon changes
+        # for all derived FX instruments.
+        await self._materialize_builtin_fx_history()
         tasks: list[asyncio.Task[Any]] = []
         async with asyncio.TaskGroup() as group:
             tasks.append(group.create_task(self._publish_loop(), name="publish-coalesced"))
@@ -208,6 +226,61 @@ class MarketDataCoordinator:
             await self._stop.wait()
             for task in tasks:
                 task.cancel()
+
+    async def _startup_preseed_fx_daily(self) -> bool:
+        """Boundedly seed all USD-hub daily histories before competing collectors."""
+
+        history = getattr(self.service, "history", None)
+        if history is None:
+            return True
+        hubs = tuple(
+            symbol
+            for symbol in FX_HUB_SYMBOLS
+            if self.registry.resolve(symbol) is not None
+            and self.router.configured(symbol, Capability.HISTORY)
+        )
+        if not hubs:
+            return True
+
+        async def seed(symbol: str) -> bool:
+            try:
+                _, _, complete = await self._backfill_daily_interval(
+                    symbol,
+                    utc_now(),
+                    refresh_complete=False,
+                    force_prefix_retry=True,
+                )
+                self._update_fx_daily_retry_state(symbol, complete)
+                if complete:
+                    self._last_errors.pop(f"history-daily:{symbol}", None)
+                return complete
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._fx_daily_retry_symbols.add(symbol)
+                self._record_error(f"history-daily:{symbol}", exc)
+                return False
+
+        try:
+            async with asyncio.timeout(self._fx_startup_preseed_timeout_seconds):
+                results = await asyncio.gather(*(seed(symbol) for symbol in hubs))
+        except TimeoutError:
+            self._record_error(
+                "history-daily:startup",
+                TimeoutError("FX daily startup preseed exceeded its bounded deadline"),
+            )
+            return False
+        complete = all(results)
+        if complete:
+            self._last_errors.pop("history-daily:startup", None)
+        return complete
+
+    def _update_fx_daily_retry_state(self, symbol: str, complete: bool) -> None:
+        retry_at = self._daily_prefix_retry_at.get(symbol, 0.0)
+        if complete or time.monotonic() < retry_at:
+            self._fx_daily_retry_symbols.discard(symbol)
+        else:
+            self._fx_daily_retry_symbols.add(symbol)
 
     def _queue_quote(self, quote: ProviderQuote) -> None:
         self._note_checkpoint(quote)
@@ -289,6 +362,27 @@ class MarketDataCoordinator:
         next_interval = instrument.quote_poll_seconds
         chain = self.router.providers_for(symbol, Capability.QUOTE)
         primary_provider = chain[0] if chain else None
+        fallback_probe_seconds = max(
+            (
+                next_interval,
+                *(
+                    float(value)
+                    for provider in chain
+                    if (value := getattr(provider, "minimum_quote_poll_seconds", None)) is not None
+                ),
+            )
+        )
+        fallback_closed_seconds = max(
+            (
+                0.0,
+                *(
+                    float(value)
+                    for provider in chain
+                    if (value := getattr(provider, "closed_market_quote_poll_seconds", None))
+                    is not None
+                ),
+            )
+        )
         stream_suppression_seconds = min(
             instrument.stale_after_seconds,
             float(getattr(primary_provider, "stream_poll_suppression_seconds", 0.0)),
@@ -308,17 +402,35 @@ class MarketDataCoordinator:
             self._queue_quote(quote)
             self._last_errors.pop(f"quote:{symbol}", None)
             if instrument.market_calendar is MarketCalendar.US_EQUITY:
-                selected_provider = self.graph.providers.get(quote.provider)
+                selected_provider = self.graph.providers.get(quote.provider) or next(
+                    (
+                        provider
+                        for provider in chain
+                        if getattr(provider, "name", None) == quote.provider
+                    ),
+                    None,
+                )
+                is_fallback = quote.fallback_level > 0 or (
+                    primary_provider is not None
+                    and getattr(primary_provider, "name", None) != quote.provider
+                )
+                if is_fallback:
+                    next_interval = max(next_interval, fallback_probe_seconds)
                 minimum_poll_seconds = getattr(
                     selected_provider, "minimum_quote_poll_seconds", None
                 )
                 if minimum_poll_seconds is not None:
                     next_interval = max(next_interval, float(minimum_poll_seconds))
-                elif "alpaca" not in self.graph.providers or quote.provider != "alpaca":
-                    next_interval = max(next_interval, 24 * 60 * 60)
-                if quote.market_status == "closed":
+                scheduled_status = scheduled_market_status(
+                    instrument.market_calendar,
+                    utc_now(),
+                )
+                if quote.market_status == "closed" and (
+                    not is_fallback or scheduled_status == "closed"
+                ):
                     next_interval = max(
                         next_interval,
+                        fallback_closed_seconds if is_fallback else 0.0,
                         float(
                             getattr(
                                 selected_provider,
@@ -331,13 +443,23 @@ class MarketDataCoordinator:
                 next_interval = max(next_interval, 300.0)
             elif quote.provider == "kraken":
                 next_interval = max(next_interval, 2.0)
-            if quote.provider == "alpha_vantage":
+            if (
+                quote.provider == "alpha_vantage"
+                and instrument.asset_class is not AssetClass.FX
+                and instrument.market_calendar is not MarketCalendar.US_EQUITY
+            ):
                 next_interval = max(next_interval, 6 * 60 * 60)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if isinstance(exc, AllProvidersFailed) and any(
-                provider == "alpha_vantage" for provider, _ in exc.attempts
+            if instrument.market_calendar is MarketCalendar.US_EQUITY:
+                next_interval = max(next_interval, fallback_probe_seconds)
+                if scheduled_market_status(instrument.market_calendar, utc_now()) == "closed":
+                    next_interval = max(next_interval, fallback_closed_seconds)
+            elif (
+                instrument.asset_class is not AssetClass.FX
+                and isinstance(exc, AllProvidersFailed)
+                and any(provider == "alpha_vantage" for provider, _ in exc.attempts)
             ):
                 next_interval = max(next_interval, 6 * 60 * 60)
             self._mark_source_failed(symbol)
@@ -406,20 +528,43 @@ class MarketDataCoordinator:
             delay = min(60.0, delay * 2)
 
     async def _metadata_loop(self) -> None:
+        next_refresh_at: dict[str, float] = {}
         while True:
-            instruments = iter(self.registry.values())
+            now = time.monotonic()
+            due = tuple(
+                instrument
+                for instrument in self.registry.values()
+                if next_refresh_at.get(instrument.symbol, 0.0) <= now
+            )
+            instruments = iter(due)
 
             async def worker(items: Any = instruments) -> None:
                 for instrument in items:
-                    await self._refresh_metadata(instrument)
+                    retry_early = await self._refresh_metadata(instrument)
+                    delay = (
+                        self.settings.metadata_retry_seconds
+                        if retry_early
+                        else self.settings.metadata_poll_seconds
+                    )
+                    next_refresh_at[instrument.symbol] = time.monotonic() + max(1.0, delay)
 
-            async with asyncio.TaskGroup() as group:
-                for index in range(min(4, len(self.registry))):
-                    group.create_task(worker(), name=f"metadata-worker:{index}")
-            await asyncio.sleep(self.settings.metadata_poll_seconds)
+            if due:
+                async with asyncio.TaskGroup() as group:
+                    for index in range(min(4, len(due))):
+                        group.create_task(worker(), name=f"metadata-worker:{index}")
 
-    async def _refresh_metadata(self, instrument: Any) -> None:
+            upcoming = tuple(
+                next_refresh_at.get(instrument.symbol, time.monotonic())
+                for instrument in self.registry.values()
+            )
+            if not upcoming:
+                await asyncio.sleep(max(1.0, self.settings.metadata_poll_seconds))
+                continue
+            await asyncio.sleep(max(1.0, min(upcoming) - time.monotonic()))
+
+    async def _refresh_metadata(self, instrument: Any) -> bool:
         symbol = instrument.symbol
+        retry_early = False
         if (
             instrument.dividend_strategy is not None
             or instrument.yield_strategy is YieldStrategy.LATEST_DISTRIBUTION_ANNUALIZED
@@ -432,6 +577,7 @@ class MarketDataCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                retry_early = True
                 self._record_error(f"dividend:{symbol}", exc)
         if (
             instrument.yield_strategy is not None
@@ -442,49 +588,163 @@ class MarketDataCoordinator:
                 metric = await self.router.get_yield(symbol)
                 self.service.publish_yield_metric(metric)
                 self._last_errors.pop(f"yield:{symbol}", None)
+                retry_early = retry_early or (
+                    metric.is_proxy
+                    or metric.fallback_level > 0
+                    or bool(metric.quality and metric.quality.stale)
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                retry_early = True
                 self._record_error(f"yield:{symbol}", exc)
+        return retry_early
 
     async def _history_loop(self) -> None:
+        next_full_refresh_at = 0.0
         while True:
-            include_fx = time.monotonic() >= self._next_fx_history_refresh_at
-            await self._backfill_history(include_fx=include_fx)
-            if include_fx:
-                self._next_fx_history_refresh_at = time.monotonic() + FX_HISTORY_REFRESH_SECONDS
-            until_fx = max(1.0, self._next_fx_history_refresh_at - time.monotonic())
-            await asyncio.sleep(min(self.settings.history_poll_seconds, until_fx))
+            now = time.monotonic()
+            include_fx = now >= self._next_fx_history_refresh_at
+            full_refresh = now >= next_full_refresh_at
+            if not include_fx and not full_refresh:
+                await asyncio.sleep(
+                    max(
+                        1.0,
+                        min(self._next_fx_history_refresh_at, next_full_refresh_at) - now,
+                    )
+                )
+                continue
 
-    async def _backfill_history(self, *, include_fx: bool) -> None:
-        symbols = iter(
+            self._history_full_cycle = full_refresh
+            fx_history_complete = await self._backfill_history(include_fx=include_fx)
+            completed_at = time.monotonic()
+            if full_refresh:
+                next_full_refresh_at = completed_at + self.settings.history_poll_seconds
+            if include_fx:
+                self._fx_history_retry_only = fx_history_complete is False
+                retry_after = (
+                    FX_HISTORY_REFRESH_SECONDS
+                    if fx_history_complete is not False
+                    else FX_HISTORY_RETRY_SECONDS
+                )
+                self._next_fx_history_refresh_at = completed_at + retry_after
+            await asyncio.sleep(
+                max(
+                    1.0,
+                    min(self._next_fx_history_refresh_at, next_full_refresh_at) - time.monotonic(),
+                )
+            )
+
+    async def _backfill_history(self, *, include_fx: bool) -> bool:
+        retry_only = self._fx_history_retry_only
+        selected_symbols = tuple(
             instrument.symbol
             for instrument in self.registry.values()
             if instrument.history_enabled
             and (
-                instrument.asset_class is not AssetClass.FX
+                (
+                    self._history_full_cycle
+                    and (
+                        instrument.asset_class is not AssetClass.FX
+                        or instrument.symbol not in FX_SYMBOLS
+                    )
+                )
                 or (
                     include_fx
-                    and (instrument.symbol not in FX_SYMBOLS or instrument.symbol in FX_HUB_SYMBOLS)
+                    and instrument.symbol in FX_HUB_SYMBOLS
+                    and (
+                        not retry_only
+                        or (
+                            instrument.symbol in self._fx_daily_retry_symbols
+                            or any(
+                                failed_symbol == instrument.symbol
+                                for failed_symbol, _ in self._fx_failed_history_intervals
+                            )
+                        )
+                    )
                 )
             )
         )
-
-        async def worker() -> None:
-            for symbol in symbols:
+        fx_hubs = tuple(symbol for symbol in selected_symbols if symbol in FX_HUB_SYMBOLS)
+        self._fx_history_intervals_for_cycle = {
+            symbol: tuple(
+                interval
+                for interval in ("1m", "5m")
+                if not retry_only or (symbol, interval) in self._fx_failed_history_intervals
+            )
+            for symbol in fx_hubs
+        }
+        self._daily_preseeded_symbols = set(fx_hubs)
+        if include_fx:
+            daily_targets = tuple(
+                symbol
+                for symbol in fx_hubs
+                if not retry_only or symbol in self._fx_daily_retry_symbols
+            )
+            # Daily work precedes minute bars. A compact fallback or genuinely
+            # short history installs its own 24-hour prefix backoff; only a
+            # request that produced no usable prefix remains on the 60-second
+            # transient retry path.
+            for symbol in daily_targets:
                 try:
-                    await self._backfill_symbol(symbol)
-                    self._last_errors.pop(f"history:{symbol}", None)
+                    _, _, complete = await self._backfill_daily_interval(
+                        symbol,
+                        utc_now(),
+                        refresh_complete=False,
+                    )
+                    self._update_fx_daily_retry_state(symbol, complete)
+                    if complete:
+                        self._last_errors.pop(f"history-daily:{symbol}", None)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self._record_error(f"history:{symbol}", exc)
+                    self._fx_daily_retry_symbols.add(symbol)
+                    self._record_error(f"history-daily:{symbol}", exc)
 
-        async with asyncio.TaskGroup() as group:
-            for index in range(min(2, len(self.registry))):
-                group.create_task(worker(), name=f"history-worker:{index}")
-        if include_fx:
-            await self._materialize_builtin_fx_history()
+        symbols = iter(selected_symbols)
+
+        async def worker() -> None:
+            for symbol in symbols:
+                attempted_fx_intervals = self._fx_history_intervals_for_cycle.get(symbol)
+                if symbol in fx_hubs and not attempted_fx_intervals:
+                    continue
+                try:
+                    interval_errors = await self._backfill_symbol(symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if attempted_fx_intervals is not None:
+                        self._fx_failed_history_intervals.update(
+                            (symbol, interval) for interval in attempted_fx_intervals
+                        )
+                    self._record_error(f"history:{symbol}", exc)
+                    continue
+
+                if attempted_fx_intervals is None:
+                    self._last_errors.pop(f"history:{symbol}", None)
+                    continue
+                errors = interval_errors if isinstance(interval_errors, dict) else {}
+                for interval in attempted_fx_intervals:
+                    key = (symbol, interval)
+                    if interval in errors:
+                        self._fx_failed_history_intervals.add(key)
+                    else:
+                        self._fx_failed_history_intervals.discard(key)
+                if errors:
+                    self._record_error(f"history:{symbol}", next(iter(errors.values())))
+                else:
+                    self._last_errors.pop(f"history:{symbol}", None)
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                for index in range(min(2, len(self.registry))):
+                    group.create_task(worker(), name=f"history-worker:{index}")
+            if include_fx:
+                await self._materialize_builtin_fx_history()
+        finally:
+            self._daily_preseeded_symbols.clear()
+            self._fx_history_intervals_for_cycle.clear()
+        return not self._fx_daily_retry_symbols and not self._fx_failed_history_intervals
 
     async def _materialize_builtin_fx_history(self) -> None:
         """Build every public FX inverse and cross from cached USD-spoke rings."""
@@ -496,6 +756,7 @@ class MarketDataCoordinator:
         points_for_interval = getattr(history, "points_for_interval", None)
         if not callable(points_for_interval):
             return
+        daily_analytics_start = utc_now() - timedelta(days=365)
 
         for symbol in FX_SYMBOLS:
             instrument = self.registry.resolve(symbol)
@@ -512,6 +773,16 @@ class MarketDataCoordinator:
                 }[interval]
                 existing = points_for_interval(symbol, interval)
                 cutoff = max((item.timestamp for item in existing), default=None)
+                if (
+                    interval == "1d"
+                    and existing
+                    and min(item.timestamp for item in existing) > daily_analytics_start
+                ):
+                    # A restored synthetic tail must not hide an older prefix
+                    # that became available after the USD hubs were backfilled.
+                    # Rebuild the complete daily ring until it can support the
+                    # rolling 365-day reference, then resume tail updates.
+                    cutoff = None
                 if cutoff is not None:
                     cutoff -= step
                 numerator = tuple(
@@ -551,18 +822,22 @@ class MarketDataCoordinator:
             if derived:
                 await publish(derived, persist=False)
 
-    async def _backfill_symbol(self, symbol: str) -> None:
+    async def _backfill_symbol(self, symbol: str) -> dict[str, BaseException]:
         instrument = self.registry[symbol]
         equity_symbol = instrument.asset_class in {AssetClass.EQUITY, AssetClass.BOND}
         if equity_symbol:
             last_fallback = self._equity_history_fallback_at.get(symbol)
             if last_fallback is not None and time.monotonic() - last_fallback < 24 * 60 * 60:
-                return
+                return {}
         now = utc_now()
         used_sparse_fallback = False
         last_error: BaseException | None = None
         published_any = False
+        interval_errors: dict[str, BaseException] = {}
+        requested_intervals = self._fx_history_intervals_for_cycle.get(symbol, ("1m", "5m"))
         for interval, duration in (("1m", timedelta(hours=48)), ("5m", timedelta(days=45))):
+            if interval not in requested_intervals:
+                continue
             retention_start = now - duration
             existing = self.service.history.points_for_interval(symbol, interval)
             step = timedelta(minutes=1 if interval == "1m" else 5)
@@ -581,36 +856,82 @@ class MarketDataCoordinator:
                 raise
             except Exception as exc:
                 last_error = exc
+                interval_errors[interval] = exc
                 continue
             published_any = published_any or bool(fetched)
             if equity_symbol:
                 if any(point.provider != "alpaca" for point in fetched):
                     used_sparse_fallback = True
-        existing_daily = self.service.history.points_for_interval(symbol, "1d")
-        daily_retention_start = now - timedelta(days=400)
-        daily_start = (
-            max(
-                daily_retention_start,
-                max(point.timestamp for point in existing_daily) - timedelta(days=1),
-            )
-            if existing_daily
-            else daily_retention_start
-        )
-        if self.router.configured(symbol, Capability.HISTORY):
+        if symbol not in self._daily_preseeded_symbols:
             try:
-                daily = await self._fetch_history_pages(symbol, "1d", daily_start, now)
+                daily_published, daily_sparse, _ = await self._backfill_daily_interval(symbol, now)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last_error = exc
+                interval_errors["1d"] = exc
             else:
-                published_any = published_any or bool(daily)
-                if any(point.provider != "alpaca" for point in daily):
-                    used_sparse_fallback = True
+                published_any = published_any or daily_published
+                used_sparse_fallback = used_sparse_fallback or (equity_symbol and daily_sparse)
         if used_sparse_fallback:
             self._equity_history_fallback_at[symbol] = time.monotonic()
-        if last_error is not None and not published_any:
+        if (
+            last_error is not None
+            and not published_any
+            and instrument.asset_class is not AssetClass.FX
+        ):
             raise last_error
+        return interval_errors
+
+    async def _backfill_daily_interval(
+        self,
+        symbol: str,
+        now: datetime,
+        *,
+        refresh_complete: bool = True,
+        force_prefix_retry: bool = False,
+    ) -> tuple[bool, bool, bool]:
+        existing_daily = self.service.history.points_for_interval(symbol, "1d")
+        daily_retention_start = now - timedelta(days=400)
+        daily_analytics_start = now - timedelta(days=365)
+        daily_step = timedelta(days=1)
+        # A recent suffix can be restored from SQLite after an earlier sparse
+        # fallback. Do not mistake it for a completed backfill: a 1Y change
+        # requires an observation at or before the exact 365-day cutoff. Once
+        # that cutoff is covered, subsequent cycles only overlap the newest
+        # day; recent listings re-probe their unavailable prefix once per day.
+        daily_prefix_complete = (
+            bool(existing_daily)
+            and min(point.timestamp for point in existing_daily) <= daily_analytics_start
+        )
+        prefix_retry_due = time.monotonic() >= self._daily_prefix_retry_at.get(symbol, 0.0)
+        daily_start = (
+            max(
+                daily_retention_start,
+                max(point.timestamp for point in existing_daily) - daily_step,
+            )
+            if daily_prefix_complete
+            else daily_retention_start
+        )
+        if not self.router.configured(symbol, Capability.HISTORY):
+            return False, False, daily_prefix_complete
+        if daily_prefix_complete and not refresh_complete:
+            return False, False, True
+        if not daily_prefix_complete and not prefix_retry_due and not force_prefix_retry:
+            return False, False, False
+
+        daily = await self._fetch_history_pages(symbol, "1d", daily_start, now)
+        used_sparse_fallback = any(point.provider != "alpaca" for point in daily)
+        combined_daily = (*existing_daily, *daily)
+        complete = (
+            bool(combined_daily)
+            and min(point.timestamp for point in combined_daily) <= daily_analytics_start
+        )
+        if complete:
+            self._daily_prefix_retry_at.pop(symbol, None)
+        elif combined_daily:
+            self._daily_prefix_retry_at[symbol] = time.monotonic() + DAILY_PREFIX_RETRY_SECONDS
+        return bool(daily), used_sparse_fallback, complete
 
     async def _fetch_history_pages(
         self, symbol: str, interval: str, start: datetime, end: datetime

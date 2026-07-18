@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 from datetime import UTC, datetime, timedelta
@@ -9,8 +10,15 @@ from urllib.parse import urlencode
 
 import pytest
 
-from quickprice.domain import PricePoint, RewardAccrualMode, YieldRateType
-from quickprice.providers.base import MalformedResponse, ProviderUnavailable
+from quickprice.domain import (
+    AccrualIndexPoint,
+    PricePoint,
+    RewardAccrualMode,
+    YieldMetric,
+    YieldRateType,
+)
+from quickprice.providers.base import Capability, MalformedResponse, ProviderUnavailable
+from quickprice.providers.router import ProviderRouter
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
@@ -18,11 +26,87 @@ from quickprice.providers.staking import (
     StakingMarketRatioSpec,
     StakingMarketRatioYieldProvider,
 )
+from quickprice.staking import ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS
 
 
 def _uint256(value: Decimal) -> str:
     integer = int(value * Decimal(10**18))
     return f"0x{integer:064x}"
+
+
+@pytest.mark.asyncio
+async def test_ethereum_yield_uses_bounded_multi_rpc_route_budget_not_global_timeout():
+    now = datetime(2026, 7, 20, tzinfo=UTC)
+    provider = EthereumExchangeRateYieldProvider(
+        "https://rpc.example.invalid",
+        request_timeout=8,
+        clock=lambda: now,
+    )
+    expected = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("2.4"),
+        as_of=now,
+        method="onchain_exchange_rate_trailing_apy",
+        provider=provider.name,
+        rate_type=YieldRateType.APY,
+        accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+        underlying_asset="ETH",
+        is_estimate=True,
+    )
+
+    async def slower_than_global_timeout(_symbol: str) -> YieldMetric:
+        await asyncio.sleep(0.02)
+        return expected
+
+    provider.get_yield = AsyncMock(side_effect=slower_than_global_timeout)
+    router = ProviderRouter(
+        {("WBETH:USDC", Capability.YIELD): [provider]},
+        timeout_seconds=0.005,
+    )
+    try:
+        result = await router.get_yield("WBETH:USDC")
+    finally:
+        await router.close()
+
+    assert provider.request_timeout == 8
+    assert provider.routing_timeout_seconds == 64
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_ethereum_rpc_keeps_individual_http_request_timeout():
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self, **_kwargs):
+            return {"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+
+    class Session:
+        def __init__(self):
+            self.timeout = None
+
+        def request(self, *_args, **kwargs):
+            self.timeout = kwargs["timeout"]
+            return Response()
+
+    session = Session()
+    provider = EthereumExchangeRateYieldProvider(
+        "https://rpc.example.invalid",
+        session=session,
+        request_timeout=0.125,
+    )
+
+    result = await provider._rpc("https://rpc.example.invalid", "eth_chainId", ())
+
+    assert result == "0x1"
+    assert session.timeout == 0.125
+    assert provider.routing_timeout_seconds == 45
 
 
 @pytest.mark.asyncio
@@ -68,17 +152,67 @@ async def test_ethereum_wbeth_exchange_rate_history_produces_trailing_apy():
 
     metric = await provider.get_yield("WBETH:USDC")
 
+    assert metric.method == "onchain_exchange_rate_trailing_apy"
     assert metric.rate_type is YieldRateType.APY
     assert metric.accrual_mode is RewardAccrualMode.VALUE_ACCRUING
     assert metric.underlying_asset == "ETH"
     assert metric.is_proxy is False
     assert metric.is_estimate is True
+    assert metric.fallback_level == 0
     assert metric.observation_window_days == Decimal("7")
     assert metric.as_of == now - timedelta(days=1)
     assert metric.accrual_index is not None
     assert metric.accrual_index.value == Decimal("1.01")
     assert float(metric.value) == pytest.approx((1.01 ** (365 / 7) - 1) * 100)
-    assert metric.quality is not None and metric.quality.confidence == "high"
+    assert metric.quality is not None
+    assert metric.quality.confidence == "high"
+    assert metric.quality.stale is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_age", "expected_stale"),
+    [
+        (timedelta(hours=16), False),
+        (timedelta(seconds=ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS + 1), True),
+    ],
+)
+async def test_ethereum_daily_exchange_rate_uses_daily_freshness_tolerance(
+    event_age: timedelta,
+    expected_stale: bool,
+) -> None:
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    provider = EthereumExchangeRateYieldProvider(
+        "https://rpc.example.invalid",
+        clock=lambda: now,
+    )
+    current = AccrualIndexPoint(
+        symbol="WBETH:ETH",
+        underlying_asset="ETH",
+        value=Decimal("1.01"),
+        as_of=now - event_age,
+        provider=provider.name,
+        kind="protocol_exchange_rate",
+    )
+    reference = AccrualIndexPoint(
+        symbol="WBETH:ETH",
+        underlying_asset="ETH",
+        value=Decimal("1"),
+        as_of=current.as_of - timedelta(days=7),
+        provider=provider.name,
+        kind="protocol_exchange_rate",
+    )
+    provider._current_index_on_endpoint = AsyncMock(return_value=current)
+    provider._index_history_on_endpoint = AsyncMock(return_value=(reference,))
+
+    metric = await provider._yield_on_endpoint(
+        "https://rpc.example.invalid",
+        provider._spec("WBETH:USDC"),
+    )
+
+    assert metric.quality is not None
+    assert metric.quality.stale is expected_stale
+    assert metric.quality.staleness_ms == int(event_age.total_seconds() * 1000)
 
 
 @pytest.mark.asyncio
@@ -253,7 +387,7 @@ async def test_ethereum_history_chunks_log_requests_to_configured_span():
 
 
 @pytest.mark.asyncio
-async def test_binance_wbeth_rate_keeps_vendor_apr_and_signs_request():
+async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
     now = datetime(2026, 7, 20, tzinfo=UTC)
     provider = BinanceWbethYieldProvider(
         "read-only-key",
@@ -264,7 +398,7 @@ async def test_binance_wbeth_rate_keeps_vendor_apr_and_signs_request():
         return_value={
             "rows": [
                 {
-                    "annualPercentageRate": "0.032",
+                    "annualPercentageRate": "0.023",
                     "exchangeRate": "1.1",
                     "time": int((now - timedelta(hours=1)).timestamp() * 1000),
                 }
@@ -275,12 +409,19 @@ async def test_binance_wbeth_rate_keeps_vendor_apr_and_signs_request():
 
     metric = await provider.get_yield("WBETH:USDC")
 
-    assert metric.value == Decimal("3.200")
+    assert metric.value == Decimal("2.300")
     assert metric.rate_type is YieldRateType.APR
     assert metric.method == "binance_wbeth_rate_history_apr"
     assert metric.is_proxy is False
     assert metric.is_estimate is False
+    assert metric.observation_window_days is None
+    assert metric.fallback_level == 0
+    assert metric.quality is not None
+    assert metric.quality.confidence == "high"
+    assert metric.quality.stale is False
     assert metric.accrual_index is not None
+    assert metric.accrual_index.kind == "vendor_exchange_rate"
+    assert metric.components[0].feed == "binance_eth_staking"
     call = provider._request_json.await_args
     params = dict(call.kwargs["params"])
     signature = params.pop("signature")
@@ -292,6 +433,31 @@ async def test_binance_wbeth_rate_keeps_vendor_apr_and_signs_request():
     assert signature == expected
     assert call.kwargs["headers"] == {"X-MBX-APIKEY": "read-only-key"}
     assert "secret" not in urlencode(call.kwargs["params"])
+
+
+@pytest.mark.asyncio
+async def test_binance_wbeth_rate_rejects_negative_vendor_apr():
+    now = datetime(2026, 7, 20, tzinfo=UTC)
+    provider = BinanceWbethYieldProvider(
+        "read-only-key",
+        "secret",
+        clock=lambda: now,
+    )
+    provider._request_json = AsyncMock(
+        return_value={
+            "rows": [
+                {
+                    "annualPercentageRate": "-0.001",
+                    "exchangeRate": "1.1",
+                    "time": int((now - timedelta(hours=1)).timestamp() * 1000),
+                }
+            ],
+            "total": "1",
+        }
+    )
+
+    with pytest.raises(MalformedResponse, match="APR cannot be negative"):
+        await provider.get_yield("WBETH:USDC")
 
 
 @pytest.mark.asyncio
@@ -404,6 +570,7 @@ async def test_generic_market_ratio_is_a_low_confidence_30_day_proxy():
     assert metric.method == "staking_market_ratio_30d_annualized"
     assert metric.is_proxy is True
     assert metric.is_estimate is True
+    assert metric.fallback_level == 0
     assert metric.rate_type is YieldRateType.APY
     assert metric.accrual_mode is RewardAccrualMode.REBASING_BALANCE
     assert metric.observation_window_days == Decimal("30.5")

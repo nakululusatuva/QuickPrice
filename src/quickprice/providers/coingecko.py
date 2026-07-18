@@ -6,12 +6,16 @@ import asyncio
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from datetime import time as datetime_time
+from decimal import Decimal
 from typing import ClassVar
 
 from ._models import component, decimal_value, point, quote, utc_datetime
+from ._ttl import AsyncTtlCache
 from .base import (
     HttpProvider,
     MalformedResponse,
+    ProviderError,
     ProviderUnavailable,
     UnsupportedInstrument,
     require_mapping,
@@ -24,6 +28,16 @@ class CoinGeckoProvider(HttpProvider):
     name = "coingecko"
     base_url = "https://api.coingecko.com/api/v3"
     feed = "coingecko_aggregated"
+    # Successful dated snapshots are immutable and reusable across adjacent
+    # collection cycles. Transient failures must expire well before the
+    # collector's 24-hour incomplete-prefix retry.
+    daily_snapshot_success_ttl_seconds: ClassVar[float] = 26 * 60 * 60
+    daily_snapshot_error_ttl_seconds: ClassVar[float] = 15 * 60
+    # The Demo plan exposes at most the trailing 365 days. Clamp every
+    # individual request at the adapter boundary so a generic 400-day local
+    # retention policy cannot turn an otherwise useful one-year backfill into
+    # an HTTP 401 response.
+    maximum_history_lookback: ClassVar[timedelta] = timedelta(days=365)
     coin_ids: ClassVar[dict[str, str]] = {
         "BTC:USDC": "bitcoin",
         "ETH:USDC": "ethereum",
@@ -49,7 +63,10 @@ class CoinGeckoProvider(HttpProvider):
         }
     )
     component_skew_limits: ClassVar[dict[str, timedelta]] = {
-        "WBETH:USDC": timedelta(seconds=2),
+        # CoinGecko aggregates the token and USDC observations independently.
+        # A sub-minute skew is expected and remains visible in ``components``;
+        # applying the exchange-leg two-second policy here rejected valid data.
+        "WBETH:USDC": timedelta(seconds=60),
         "STETH:USDC": timedelta(seconds=60),
         "WSTETH:USDC": timedelta(seconds=60),
     }
@@ -75,6 +92,7 @@ class CoinGeckoProvider(HttpProvider):
         self._price_cache: Mapping[str, object] | None = None
         self._cache_expires_at = 0.0
         self._refresh_error: str | None = None
+        self._daily_snapshot_cache = AsyncTtlCache[tuple[str, str], Decimal](clock=clock)
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -211,11 +229,12 @@ class CoinGeckoProvider(HttpProvider):
         end_utc = end.astimezone(UTC)
         if start_utc >= end_utc:
             raise ValueError("history start must be before end")
+        query_start = max(start_utc, end_utc - self.maximum_history_lookback)
 
         coin_id = self._coin(normalized)
         params: dict[str, str | int] = {
             "vs_currency": "usd",
-            "from": int(start_utc.timestamp()),
+            "from": int(query_start.timestamp()),
             "to": int(end_utc.timestamp()),
             "precision": "full",
         }
@@ -245,7 +264,7 @@ class CoinGeckoProvider(HttpProvider):
                 price_value = decimal_value(row[1]) / current_usdc_usd
             except (ValueError, ZeroDivisionError) as exc:
                 raise MalformedResponse(self.name, "invalid historical price value") from exc
-            if start_utc <= timestamp <= end_utc:
+            if query_start <= timestamp <= end_utc:
                 result.append(
                     point(
                         symbol=normalized,
@@ -256,9 +275,67 @@ class CoinGeckoProvider(HttpProvider):
                         is_derived=quoted_in_usdc,
                     )
                 )
+        if normalized_interval == "1d" and start_utc < query_start:
+            # Range history begins at the next UTC daily bucket, which is
+            # later than the exact rolling-365-day cutoff. CoinGecko's dated
+            # snapshot endpoint remains available for that boundary day and
+            # supplies a real observation at 00:00 UTC, allowing analytics to
+            # choose a reference at or before the cutoff.
+            boundary_time = datetime.combine(query_start.date(), datetime_time.min, tzinfo=UTC)
+            if start_utc <= boundary_time <= end_utc:
+                try:
+                    boundary_price = await self._daily_snapshot_usd_price(
+                        coin_id, query_start.date().strftime("%d-%m-%Y")
+                    )
+                except ProviderError:
+                    # Keep the otherwise valid 365-day range when an optional
+                    # boundary lookup is temporarily unavailable.
+                    pass
+                else:
+                    if quoted_in_usdc:
+                        boundary_price /= current_usdc_usd
+                    result.append(
+                        point(
+                            symbol=normalized,
+                            timestamp=boundary_time,
+                            price=boundary_price,
+                            provider=self.name,
+                            interval=normalized_interval,
+                            is_derived=quoted_in_usdc,
+                        )
+                    )
+        result.sort(key=lambda item: item.timestamp)
         if limit is not None:
             result = result[-max(0, limit) :]
         return tuple(result)
+
+    async def _daily_snapshot_usd_price(self, coin_id: str, date_text: str):
+        async def load():
+            payload = await self._request_json(
+                "GET",
+                f"{self.base_url}/coins/{coin_id}/history",
+                params={"date": date_text, "localization": "false"},
+                headers=self._headers,
+            )
+            document = require_mapping(payload, self.name)
+            market_data = require_mapping(document.get("market_data"), self.name, "market data")
+            current_price = require_mapping(
+                market_data.get("current_price"), self.name, "historical current price"
+            )
+            try:
+                value = decimal_value(current_price["usd"])
+            except (KeyError, ValueError) as exc:
+                raise MalformedResponse(self.name, "invalid historical daily snapshot") from exc
+            if value <= 0:
+                raise MalformedResponse(self.name, "historical daily snapshot is not positive")
+            return value
+
+        return await self._daily_snapshot_cache.get_or_load(
+            (coin_id, date_text),
+            self.daily_snapshot_success_ttl_seconds,
+            load,
+            error_ttl_seconds=self.daily_snapshot_error_ttl_seconds,
+        )
 
     async def _history_usdc_normalization_price(self):
         # Historical changes are invariant to a constant quote-currency

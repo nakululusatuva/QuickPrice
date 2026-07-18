@@ -16,6 +16,12 @@ from .domain import (
 
 _SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
 
+# ExchangeRateUpdated is a daily protocol index. One expected publication plus
+# twelve hours of scheduling and chain/provider grace keeps a normal daily event
+# current while detecting a missed update within two six-hour metadata cycles.
+ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS = 36 * 60 * 60
+ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD = "onchain_exchange_rate_trailing_apy"
+
 
 def annualize_index_growth(
     reference: AccrualIndexPoint,

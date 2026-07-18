@@ -49,6 +49,10 @@ class ProviderRateLimited(ProviderError):
     """The upstream or QuickPrice's local quota gate rejected the request."""
 
 
+class ProviderBusy(ProviderRateLimited):
+    """Local provider admission is saturated; another backend must not consume quota."""
+
+
 class MalformedResponse(ProviderError):
     """The upstream answered, but its payload did not satisfy the contract."""
 

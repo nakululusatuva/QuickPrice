@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from quickprice.domain import PricePoint, ProviderQuote
+from quickprice.domain import PricePoint, ProviderQuote, SourceComponent
 from quickprice.providers.synthetic import (
     SyntheticComponentError,
     SyntheticHistoryProvider,
@@ -61,6 +61,46 @@ def test_usdt_ratio_formula():
         now=NOW,
     )
     assert result.price == Decimal("4142") / Decimal("1.0005")
+
+
+def test_synthetic_quote_preserves_nested_book_provenance():
+    left = ProviderQuote(
+        "WBETH:USDT",
+        Decimal("4142"),
+        NOW,
+        "binance",
+        "binance_spot_book",
+        price_basis="midpoint",
+        is_derived=True,
+        components=(
+            SourceComponent(
+                "WBETH:USDT",
+                "binance",
+                Decimal("4141"),
+                NOW,
+                "binance_spot_book",
+                "best_bid",
+            ),
+            SourceComponent(
+                "WBETH:USDT",
+                "binance",
+                Decimal("4143"),
+                NOW,
+                "binance_spot_book",
+                "best_ask",
+            ),
+        ),
+    )
+    right = make_quote("USDC:USDT", "1.0005")
+
+    result = synthesize_division("WBETH:USDC", left, right, now=NOW)
+
+    assert [item.role for item in result.components] == [
+        "numerator",
+        "numerator_best_bid",
+        "numerator_best_ask",
+        "denominator",
+    ]
 
 
 def test_hkd_cnh_allows_slow_hkd_leg_up_to_twenty_minutes():

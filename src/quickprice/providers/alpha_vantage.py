@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from quickprice.equities import DIVIDEND_FREQUENCIES, LISTED_TICKERS
 from quickprice.fx import FX_HUB_SYMBOLS
+from quickprice.market import seconds_until_next_us_equity_open
 
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
 from ._ttl import AsyncTtlCache
@@ -28,6 +29,7 @@ class AlphaVantageProvider(HttpProvider):
     name = "alpha_vantage"
     base_url = "https://www.alphavantage.co/query"
     feed = "alpha_vantage_eod"
+    history_prefix_limited = True
     equity_symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
     fx_symbols: ClassVar[dict[str, tuple[str, str]]] = {
         symbol: tuple(symbol.split(":")) for symbol in FX_HUB_SYMBOLS
@@ -68,7 +70,11 @@ class AlphaVantageProvider(HttpProvider):
                 lambda: self._get_fx_quote(normalized),
             )
         if normalized in self.equity_symbols:
-            return await self._get_equity_quote(normalized)
+            return await self._quote_cache.get_or_load(
+                normalized,
+                seconds_until_next_us_equity_open(self._wall_clock()),
+                lambda: self._get_equity_quote(normalized),
+            )
         raise UnsupportedInstrument(self.name, f"unsupported symbol {normalized}")
 
     async def _get_fx_quote(self, symbol: str):

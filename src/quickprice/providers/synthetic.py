@@ -86,17 +86,30 @@ def _synthetic_quote(
     roles = (
         ("multiplicand", "multiplier") if operation == "multiply" else ("numerator", "denominator")
     )
-    components = tuple(
-        component(
-            symbol=item.symbol,
-            provider=item.provider,
-            price=item.price,
-            as_of=item.as_of,
-            feed=item.feed,
-            role=role,
+    components_list = []
+    for item, role in zip((left, right), roles, strict=True):
+        components_list.append(
+            component(
+                symbol=item.symbol,
+                provider=item.provider,
+                price=item.price,
+                as_of=item.as_of,
+                feed=item.feed,
+                role=role,
+            )
         )
-        for item, role in zip((left, right), roles, strict=True)
-    )
+        components_list.extend(
+            component(
+                symbol=child.symbol,
+                provider=child.provider,
+                price=child.price,
+                as_of=child.as_of,
+                feed=child.feed,
+                role=f"{role}_{child.role or 'component'}",
+            )
+            for child in item.components
+        )
+    components = tuple(components_list)
     feed = "+".join(dict.fromkeys((left.feed, right.feed)))
     license_scope = (
         left.license_scope

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -10,18 +11,24 @@ from typing import Any, ClassVar
 
 from quickprice.equities import LISTED_TICKERS
 from quickprice.fx import FX_HUB_SYMBOLS
+from quickprice.market import seconds_until_next_us_equity_open
 
 from ._models import decimal_value, point, quote, utc_datetime
 from ._ttl import AsyncTtlCache
 from .base import (
     HttpProvider,
     MalformedResponse,
+    ProviderBusy,
     ProviderRateLimited,
     ProviderUnavailable,
     UnsupportedInstrument,
     require_mapping,
 )
-from .quota import daily_budget
+from .quota import SlidingWindowRateGate, daily_budget
+
+
+class _LocalRateGateAdmissionTimeout(ProviderBusy):
+    """The local pacing queue saturated before an upstream request began."""
 
 
 class TwelveDataProvider(HttpProvider):
@@ -52,11 +59,20 @@ class TwelveDataProvider(HttpProvider):
         usd_hkd_quote_ttl_seconds: float = 900.0,
         fx_quote_ttl_seconds: Mapping[str, float] | None = None,
         quote_cache_clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        calls_per_minute: int = 8,
+        rate_gate: SlidingWindowRateGate | None = None,
+        rate_gate_timeout_seconds: float = 5.0,
         **kwargs,
     ):
         kwargs.setdefault("quota", daily_budget(790))
         super().__init__(**kwargs)
         self.api_key = api_key
+        if rate_gate_timeout_seconds <= 0:
+            raise ValueError("rate_gate_timeout_seconds must be positive")
+        self.rate_gate_timeout_seconds = float(rate_gate_timeout_seconds)
+        self.routing_timeout_seconds = self.rate_gate_timeout_seconds + self.request_timeout + 1.0
+        self._rate_gate = rate_gate or SlidingWindowRateGate(calls_per_minute, 60.0)
         requested_ttls = {symbol: usd_hkd_quote_ttl_seconds for symbol in FX_HUB_SYMBOLS}
         requested_ttls["USD:CNH"] = usd_cnh_quote_ttl_seconds
         if fx_quote_ttl_seconds is not None:
@@ -75,6 +91,20 @@ class TwelveDataProvider(HttpProvider):
             for symbol in FX_HUB_SYMBOLS
         }
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
+        self._wall_clock = wall_clock
+
+    async def _request_json(self, *args, **kwargs):
+        # Twelve applies a short-window ceiling independently from its daily
+        # credit budget. Serialize every adapter request through one provider-
+        # wide gate so concurrent startup quote/history work cannot burst 429s.
+        try:
+            async with asyncio.timeout(self.rate_gate_timeout_seconds):
+                await self._rate_gate.acquire()
+        except TimeoutError:
+            raise _LocalRateGateAdmissionTimeout(
+                self.name, "local short-window rate gate admission timed out"
+            ) from None
+        return await super()._request_json(*args, **kwargs)
 
     def _vendor_symbol(self, symbol: str) -> str:
         normalized = symbol.strip().upper()
@@ -97,16 +127,27 @@ class TwelveDataProvider(HttpProvider):
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
         ttl_seconds = self.quote_cache_ttl_seconds.get(normalized)
+        if ttl_seconds is None and normalized in LISTED_TICKERS:
+            ttl_seconds = seconds_until_next_us_equity_open(self._wall_clock())
         if ttl_seconds is not None:
-            return await self._quote_cache.get_or_load(
-                normalized,
-                ttl_seconds,
-                lambda: self._get_quote_uncached(normalized),
-            )
+            try:
+                return await self._quote_cache.get_or_load(
+                    normalized,
+                    ttl_seconds,
+                    lambda: self._get_quote_uncached(normalized),
+                )
+            except _LocalRateGateAdmissionTimeout:
+                # No vendor request occurred, so this transient local error
+                # must not suppress the next poll for the positive 240/900s
+                # quote TTL. Other provider errors remain negative-cached.
+                self._quote_cache.discard(normalized)
+                raise
         return await self._get_quote_uncached(normalized)
 
     async def _get_quote_uncached(self, normalized: str):
         vendor_symbol = self._vendor_symbol(normalized)
+        if normalized in FX_HUB_SYMBOLS:
+            return await self._get_latest_fx_bar(normalized, vendor_symbol)
         payload = await self._request_json(
             "GET",
             f"{self.base_url}/quote",
@@ -137,7 +178,66 @@ class TwelveDataProvider(HttpProvider):
             fallback_level=0,
             license_scope="personal_internal",
             coverage="vendor_aggregate",
-            market_status_as_of=datetime.now(UTC) if is_open in {True, False} else None,
+            market_status_as_of=self._wall_clock() if is_open in {True, False} else None,
+        )
+
+    async def _get_latest_fx_bar(self, normalized: str, vendor_symbol: str):
+        """Use Twelve's latest timestamped minute bar for an FX quote.
+
+        The free ``/quote`` response can retain an old timestamp while the
+        ``/time_series`` feed continues to advance. A single one-row request
+        costs the same credit as ``/quote`` and keeps the five cached USD hub
+        legs within the existing daily budget. The returned bar timestamp is
+        preserved verbatim; callers can therefore reject or mark it stale
+        without QuickPrice inventing freshness.
+        """
+
+        payload = await self._request_json(
+            "GET",
+            f"{self.base_url}/time_series",
+            params={
+                "symbol": vendor_symbol,
+                "interval": "1min",
+                "outputsize": 1,
+                "order": "DESC",
+                "adjust": "none",
+                "timezone": "UTC",
+                "apikey": self.api_key,
+            },
+            allow_quota_reserve=True,
+        )
+        document = self._document(payload)
+        rows = document.get("values")
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)) or not rows:
+            raise MalformedResponse(self.name, "latest FX time-series values must be an array")
+        try:
+            row = max(
+                rows,
+                key=lambda item: (
+                    utc_datetime(item["datetime"])
+                    if isinstance(item, Mapping)
+                    else datetime.min.replace(tzinfo=UTC)
+                ),
+            )
+            if not isinstance(row, Mapping):
+                raise KeyError("row")
+            price = decimal_value(row["close"])
+            as_of = utc_datetime(row["datetime"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedResponse(self.name, "invalid latest FX time-series value") from exc
+        return quote(
+            symbol=normalized,
+            price=price,
+            as_of=as_of,
+            provider=self.name,
+            feed=f"{self.feed}_time_series",
+            price_basis="time_series_close",
+            market_status="unknown",
+            is_derived=False,
+            components=(),
+            fallback_level=0,
+            license_scope="personal_internal",
+            coverage="vendor_aggregate",
         )
 
     async def get_history(

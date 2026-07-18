@@ -29,7 +29,11 @@ from .plugin_api import AssetClass, YieldStrategy
 from .registry import InstrumentRegistry, build_registry
 from .runtime import FreeThreadedStatus, inspect_free_threaded_runtime
 from .schemas import QualityModel, QuoteModel, snapshot_to_wire
-from .staking import estimate_from_staking_metric
+from .staking import (
+    ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS,
+    ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+    estimate_from_staking_metric,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -178,8 +182,10 @@ class QuickPriceService:
                         record.raw.get("stale_after_seconds") if record is not None else None
                     )
                     self._yield_stale_after_seconds[metric.symbol] = (
-                        self._coerce_yield_stale_after_seconds(persisted_threshold)
-                        or self._default_yield_stale_after_seconds(metric)
+                        self._restored_yield_stale_after_seconds(
+                            metric,
+                            persisted_threshold,
+                        )
                     )
         checkpoints = getattr(restored, "provider_checkpoints", None)
         if checkpoints:
@@ -453,12 +459,31 @@ class QuickPriceService:
         stale_after_seconds = self._default_yield_stale_after_seconds(metric)
         with self._metadata_lock:
             current = self._yield_metrics.get(metric.symbol)
-            if (
-                current is not None
-                and metric.fallback_level == current.fallback_level
-                and metric.as_of < current.as_of
-            ):
-                return
+            if current is not None:
+                same_source = (
+                    metric.provider.casefold() == current.provider.casefold()
+                    and metric.method == current.method
+                )
+                current_rank = self._yield_source_rank(current)
+                incoming_rank = self._yield_source_rank(metric)
+                if (same_source or incoming_rank == current_rank) and metric.as_of < current.as_of:
+                    return
+                is_downgrade = not same_source and incoming_rank > current_rank
+                if is_downgrade:
+                    current_stale_after_seconds = self._yield_stale_after_seconds.get(
+                        current.symbol
+                    )
+                    if current_stale_after_seconds is None:
+                        current_stale_after_seconds = self._default_yield_stale_after_seconds(
+                            current
+                        )
+                    now = utc_now()
+                    current_age_seconds = max(
+                        0.0,
+                        (now - current.as_of).total_seconds(),
+                    )
+                    if current_age_seconds <= current_stale_after_seconds:
+                        return
             self._yield_metrics[metric.symbol] = metric
             self._yield_stale_after_seconds[metric.symbol] = stale_after_seconds
         self._rebuild(metric.symbol, persist=persist)
@@ -473,6 +498,18 @@ class QuickPriceService:
             return None
         return result if result > 0 else None
 
+    @staticmethod
+    def _yield_source_rank(metric: YieldMetric) -> tuple[int, int]:
+        """Return a stable semantic tier followed by the current route level.
+
+        Route levels are configuration-relative and therefore unsafe as the
+        first comparison after restart. Provider-reported non-proxy rates rank
+        above protocol/index estimates, which rank above market proxies.
+        """
+
+        semantic_tier = 2 if metric.is_proxy else 1 if metric.is_estimate else 0
+        return semantic_tier, metric.fallback_level
+
     def _default_yield_stale_after_seconds(self, metric: YieldMetric) -> float:
         """Choose and persist a metadata freshness SLA for a yield observation."""
 
@@ -483,7 +520,25 @@ class QuickPriceService:
             threshold = max(threshold, 7 * 24 * 60 * 60)
         if metric.method == "latest_distribution_annualized":
             threshold = max(threshold, 45 * 24 * 60 * 60)
+        if metric.method == ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD:
+            threshold = max(threshold, ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS)
         return threshold
+
+    def _restored_yield_stale_after_seconds(
+        self,
+        metric: YieldMetric,
+        persisted_value: Any,
+    ) -> float:
+        """Restore a persisted SLA while applying mandatory policy migrations."""
+
+        persisted = self._coerce_yield_stale_after_seconds(persisted_value)
+        if persisted is None:
+            return self._default_yield_stale_after_seconds(metric)
+        if metric.method == ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD:
+            # Databases written before the daily-index policy stored the generic
+            # 12-hour SLA. Never restore that obsolete value after an upgrade.
+            return max(persisted, self._default_yield_stale_after_seconds(metric))
+        return persisted
 
     def _persist_yield_metric(self, metric: YieldMetric, stale_after_seconds: float) -> None:
         """Persist the effective route plus its freshness policy as one record."""
@@ -671,15 +726,36 @@ class QuickPriceService:
         with self._metadata_lock:
             self._source_failures.update(symbol for symbol in symbols if symbol in self.registry)
 
-    def get_quote(self, symbol: str, *, now: datetime | None = None) -> QuoteModel:
+    def get_quote(
+        self,
+        symbol: str,
+        *,
+        now: datetime | None = None,
+        require_complete_metadata: bool = True,
+    ) -> QuoteModel:
+        """Project a snapshot with dynamic quote and yield freshness.
+
+        Public market-data routes keep ``require_complete_metadata=True`` so
+        mandatory dividend and yield fields remain strict. Authenticated
+        operational views may relax that gate while retaining the same market
+        status, quote quality, and annual-yield quality calculations.
+        """
+
         instrument = self.registry[symbol]
         snapshot = self.snapshots.get(symbol)
         if snapshot is None:
             raise DataUnavailableError(symbol, "no valid price has ever been received")
-        if instrument.yield_strategy is not None and snapshot.estimated_annual_yield is None:
-            raise DataUnavailableError(symbol, "required estimated annual yield is unavailable")
-        if instrument.dividend_strategy is not None and snapshot.dividend is None:
-            raise DataUnavailableError(symbol, "required latest regular dividend is unavailable")
+        if require_complete_metadata:
+            if instrument.yield_strategy is not None and snapshot.estimated_annual_yield is None:
+                raise DataUnavailableError(
+                    symbol,
+                    "required estimated annual yield is unavailable",
+                )
+            if instrument.dividend_strategy is not None and snapshot.dividend is None:
+                raise DataUnavailableError(
+                    symbol,
+                    "required latest regular dividend is unavailable",
+                )
         cached = self._wire_cache[symbol]
         now = utc_now() if now is None else now
         market_status, quality = self._quality(snapshot, instrument.asset_class, now)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -8,15 +9,23 @@ import pytest
 from quickprice.analytics import boxx_yield
 from quickprice.config import Settings
 from quickprice.domain import (
+    AccrualIndexPoint,
     DividendEvent,
     PricePoint,
     ProviderQuote,
     QuoteSnapshot,
+    RewardAccrualMode,
     SourceComponent,
     YieldMetric,
+    YieldQuality,
+    YieldRateType,
     utc_now,
 )
 from quickprice.service import DataUnavailableError, QuickPriceService
+from quickprice.staking import (
+    ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS,
+    ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+)
 from quickprice.storage import (
     DividendEventRecord,
     LatestSnapshotRecord,
@@ -25,6 +34,93 @@ from quickprice.storage import (
     SQLiteStorage,
     YieldMetricRecord,
 )
+
+
+def _wbeth_primary_metric(
+    as_of: datetime,
+    *,
+    value: str = "2.4187",
+) -> YieldMetric:
+    return YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal(value),
+        as_of=as_of,
+        method=ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+        provider="ethereum_exchange_rate",
+        rate_type=YieldRateType.APY,
+        observation_window_days=Decimal("7"),
+        accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+        underlying_asset="ETH",
+        is_estimate=True,
+        accrual_index=AccrualIndexPoint(
+            symbol="WBETH:ETH",
+            underlying_asset="ETH",
+            value=Decimal("1.072"),
+            as_of=as_of,
+            provider="ethereum_exchange_rate",
+            kind="protocol_exchange_rate",
+        ),
+        quality=YieldQuality(stale=False, confidence="high"),
+        fallback_level=0,
+    )
+
+
+def _wbeth_binance_metric(
+    as_of: datetime,
+    *,
+    value: str = "2.3",
+) -> YieldMetric:
+    return YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal(value),
+        as_of=as_of,
+        method="binance_wbeth_rate_history_apr",
+        provider="binance_wbeth_rate",
+        rate_type=YieldRateType.APR,
+        accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+        underlying_asset="ETH",
+        is_estimate=False,
+        accrual_index=AccrualIndexPoint(
+            symbol="WBETH:ETH",
+            underlying_asset="ETH",
+            value=Decimal("1.072"),
+            as_of=as_of,
+            provider="binance_wbeth_rate",
+            kind="vendor_exchange_rate",
+        ),
+        quality=YieldQuality(stale=False, confidence="high"),
+        fallback_level=0,
+    )
+
+
+def _wbeth_proxy_metric(
+    as_of: datetime,
+    *,
+    fallback_level: int = 2,
+) -> YieldMetric:
+    return YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("3.1"),
+        as_of=as_of,
+        method="staking_market_ratio_30d_annualized",
+        provider="staking_market_ratio_proxy",
+        is_proxy=True,
+        rate_type=YieldRateType.APY,
+        observation_window_days=Decimal("30"),
+        accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+        underlying_asset="ETH",
+        is_estimate=True,
+        accrual_index=AccrualIndexPoint(
+            symbol="WBETH:ETH",
+            underlying_asset="ETH",
+            value=Decimal("1.07"),
+            as_of=as_of,
+            provider="staking_market_ratio_proxy",
+            kind="market_price_ratio",
+        ),
+        quality=YieldQuality(stale=False, confidence="low"),
+        fallback_level=fallback_level,
+    )
 
 
 @pytest.mark.asyncio
@@ -150,48 +246,157 @@ async def test_daily_fallback_history_persists_and_restores(tmp_path):
     await restored.stop()
 
 
-def test_yield_route_change_replaces_newer_observation_but_same_route_does_not(settings):
-    now = utc_now()
+def test_expired_primary_accepts_proxy_and_recovered_primary_wins(
+    settings,
+    monkeypatch,
+):
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    monkeypatch.setattr("quickprice.service.utc_now", lambda: now)
     service = QuickPriceService(settings)
     service.publish_quote(
-        ProviderQuote("BOXX:USD", Decimal("110"), now, "fixture", "iex"),
+        ProviderQuote("WBETH:USDC", Decimal("3500"), now, "fixture", "fixture"),
         persist=False,
     )
     service.publish_yield_metric(
-        YieldMetric("BOXX:USD", Decimal("4.2"), now, "DGS3MO", "primary"),
+        _wbeth_primary_metric(now - timedelta(seconds=ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS + 1)),
         persist=False,
     )
     service.publish_yield_metric(
-        YieldMetric(
-            "BOXX:USD",
-            Decimal("4.1"),
-            now - timedelta(hours=1),
-            "cached_treasury_proxy",
-            "fallback",
-            fallback_level=1,
-        ),
+        _wbeth_proxy_metric(now, fallback_level=0),
         persist=False,
     )
 
-    selected = service.get_quote("BOXX:USD", now=now).estimated_annual_yield
+    selected = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
     assert selected is not None
-    assert selected.provider == "fallback"
-    assert selected.fallback_level == 1
+    assert selected.provider == "staking_market_ratio_proxy"
+    assert selected.fallback_level == 0
 
     service.publish_yield_metric(
-        YieldMetric(
-            "BOXX:USD",
-            Decimal("1.0"),
-            now - timedelta(hours=2),
-            "cached_treasury_proxy",
-            "fallback",
-            fallback_level=1,
-        ),
+        _wbeth_primary_metric(now - timedelta(hours=1), value="2.35"),
         persist=False,
     )
-    unchanged = service.get_quote("BOXX:USD", now=now).estimated_annual_yield
+    recovered = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert recovered is not None
+    assert recovered.provider == "ethereum_exchange_rate"
+    assert recovered.fallback_level == 0
+    assert recovered.percent == 2.35
+
+    service.publish_yield_metric(
+        _wbeth_primary_metric(now - timedelta(hours=2), value="1.0"),
+        persist=False,
+    )
+    unchanged = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
     assert unchanged is not None
-    assert unchanged.percent == selected.percent
+    assert unchanged.percent == recovered.percent
+
+    service.publish_yield_metric(
+        _wbeth_primary_metric(now, value="2.4"),
+        persist=False,
+    )
+    newer = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert newer is not None
+    assert newer.percent == 2.4
+
+
+@pytest.mark.asyncio
+async def test_route_upgrade_prefers_older_provider_reported_rate_after_restart(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "service.db"
+    base_settings = dict(
+        production=False,
+        require_free_threaded=False,
+        background_enabled=False,
+        database_path=database_path,
+        api_key_hashes=("sha256:" + "1" * 64,),
+        rate_limit_enabled=False,
+        sqlite_batch_ms=10,
+    )
+    without_binance = Settings(**base_settings)
+    with_binance = Settings(
+        **base_settings,
+        binance_api_key="read-only-key",
+        binance_api_secret="signing-secret",
+    )
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    monkeypatch.setattr("quickprice.service.utc_now", lambda: now)
+
+    service = QuickPriceService(without_binance)
+    await service.start()
+    service.publish_quote(ProviderQuote("WBETH:USDC", Decimal("3500"), now, "fixture", "fixture"))
+    service.publish_yield_metric(_wbeth_primary_metric(now - timedelta(hours=1)))
+    await service.stop()
+
+    upgraded = QuickPriceService(with_binance)
+    await upgraded.start()
+    restored = upgraded.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert restored is not None
+    assert restored.provider == "ethereum_exchange_rate"
+    assert restored.fallback_level == 0
+
+    upgraded.publish_yield_metric(_wbeth_binance_metric(now - timedelta(hours=2)))
+    selected = upgraded.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert selected is not None
+    assert selected.provider == "binance_wbeth_rate"
+    assert selected.percent == 2.3
+    assert selected.fallback_level == 0
+    await upgraded.stop()
+
+    restarted = QuickPriceService(with_binance)
+    await restarted.start()
+    persisted = restarted.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert persisted is not None
+    assert persisted.provider == "binance_wbeth_rate"
+    await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_key_removal_retains_fresh_reported_rate_then_accepts_expired_estimate(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "service.db"
+    base_settings = dict(
+        production=False,
+        require_free_threaded=False,
+        background_enabled=False,
+        database_path=database_path,
+        api_key_hashes=("sha256:" + "1" * 64,),
+        rate_limit_enabled=False,
+        sqlite_batch_ms=10,
+    )
+    with_binance = Settings(
+        **base_settings,
+        binance_api_key="read-only-key",
+        binance_api_secret="signing-secret",
+    )
+    without_binance = Settings(**base_settings)
+    clock = [datetime(2026, 7, 20, 16, tzinfo=UTC)]
+    monkeypatch.setattr("quickprice.service.utc_now", lambda: clock[0])
+    reported_as_of = clock[0] - timedelta(hours=1)
+
+    service = QuickPriceService(with_binance)
+    await service.start()
+    service.publish_quote(
+        ProviderQuote("WBETH:USDC", Decimal("3500"), clock[0], "fixture", "fixture")
+    )
+    service.publish_yield_metric(_wbeth_binance_metric(reported_as_of))
+    await service.stop()
+
+    downgraded = QuickPriceService(without_binance)
+    await downgraded.start()
+    downgraded.publish_yield_metric(_wbeth_primary_metric(clock[0]))
+    retained = downgraded.get_quote("WBETH:USDC", now=clock[0]).estimated_annual_yield
+    assert retained is not None and retained.quality is not None
+    assert retained.provider == "binance_wbeth_rate"
+
+    clock[0] = reported_as_of + timedelta(seconds=retained.quality.stale_after_seconds + 1)
+    downgraded.publish_yield_metric(_wbeth_primary_metric(clock[0]))
+    accepted = downgraded.get_quote("WBETH:USDC", now=clock[0]).estimated_annual_yield
+    assert accepted is not None
+    assert accepted.provider == "ethereum_exchange_rate"
+    await downgraded.stop()
 
 
 @pytest.mark.asyncio
@@ -209,12 +414,20 @@ async def test_effective_fallback_yield_and_freshness_policy_survive_restart(tmp
     service = QuickPriceService(settings)
     await service.start()
     service.publish_quote(ProviderQuote("BOXX:USD", Decimal("110"), now, "fixture", "iex"))
-    service.publish_yield_metric(YieldMetric("BOXX:USD", Decimal("4.2"), now, "DGS3MO", "primary"))
+    service.publish_yield_metric(
+        YieldMetric(
+            "BOXX:USD",
+            Decimal("4.2"),
+            now - timedelta(days=8),
+            "DGS3MO",
+            "primary",
+        )
+    )
     service.publish_yield_metric(
         YieldMetric(
             "BOXX:USD",
             Decimal("4.1"),
-            now - timedelta(days=1),
+            now,
             "cached_treasury_proxy",
             "fallback",
             fallback_level=1,
@@ -240,6 +453,130 @@ async def test_effective_fallback_yield_and_freshness_policy_survive_restart(tmp
     assert advanced.quality.stale is True
     assert advanced.quality.staleness_ms == int((threshold + 1) * 1000)
     await restored.stop()
+
+
+@pytest.mark.asyncio
+async def test_daily_onchain_yield_freshness_policy_survives_restart(tmp_path):
+    settings = Settings(
+        production=False,
+        require_free_threaded=False,
+        background_enabled=False,
+        database_path=tmp_path / "service.db",
+        api_key_hashes=("sha256:" + "1" * 64,),
+        rate_limit_enabled=False,
+        metadata_poll_seconds=21_600,
+        sqlite_batch_ms=10,
+    )
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    event_as_of = now - timedelta(hours=16)
+    service = QuickPriceService(settings)
+    await service.start()
+    service.publish_quote(ProviderQuote("WBETH:USDC", Decimal("3500"), now, "fixture", "fixture"))
+    service.publish_yield_metric(
+        YieldMetric(
+            symbol="WBETH:USDC",
+            value=Decimal("2.4187"),
+            as_of=event_as_of,
+            method=ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+            provider="ethereum_exchange_rate",
+            rate_type=YieldRateType.APY,
+            observation_window_days=Decimal("7"),
+            accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+            underlying_asset="ETH",
+            is_estimate=True,
+            accrual_index=AccrualIndexPoint(
+                symbol="WBETH:ETH",
+                underlying_asset="ETH",
+                value=Decimal("1.072"),
+                as_of=event_as_of,
+                provider="ethereum_exchange_rate",
+                kind="protocol_exchange_rate",
+            ),
+            quality=YieldQuality(
+                stale=False,
+                staleness_ms=16 * 60 * 60 * 1000,
+                confidence="high",
+            ),
+        )
+    )
+    await service.stop()
+
+    restored = QuickPriceService(settings)
+    await restored.start()
+    selected = restored.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert selected is not None and selected.quality is not None
+    assert selected.quality.stale_after_seconds == ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS
+    assert selected.quality.staleness_ms == 16 * 60 * 60 * 1000
+    assert selected.quality.stale is False
+
+    expired = restored.get_quote(
+        "WBETH:USDC",
+        now=event_as_of + timedelta(seconds=ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS + 1),
+    ).estimated_annual_yield
+    assert expired is not None and expired.quality is not None
+    assert expired.quality.stale is True
+    assert expired.quality.staleness_ms == (ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS + 1) * 1000
+    await restored.stop()
+
+
+@pytest.mark.asyncio
+async def test_legacy_onchain_sla_migrates_and_fresh_primary_rejects_proxy(
+    tmp_path,
+    monkeypatch,
+):
+    settings = Settings(
+        production=False,
+        require_free_threaded=False,
+        background_enabled=False,
+        database_path=tmp_path / "service.db",
+        api_key_hashes=("sha256:" + "1" * 64,),
+        rate_limit_enabled=False,
+        metadata_poll_seconds=21_600,
+        sqlite_batch_ms=10,
+    )
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    monkeypatch.setattr("quickprice.service.utc_now", lambda: now)
+    primary = _wbeth_primary_metric(now - timedelta(hours=16))
+    quote = ProviderQuote(
+        "WBETH:USDC",
+        Decimal("3500"),
+        now,
+        "fixture",
+        "fixture",
+    )
+    record = YieldMetricRecord.from_domain(primary)
+    legacy_record = replace(
+        record,
+        raw={**record.raw, "stale_after_seconds": 12 * 60 * 60},
+    )
+    storage = SQLiteStorage(settings.database_path, batch_interval_ms=10)
+    await storage.start()
+    await storage.enqueue_snapshot(QuoteSnapshot(quote, {}), wait=True)
+    await storage.enqueue_yield(legacy_record, wait=True)
+    await storage.stop()
+
+    service = QuickPriceService(settings)
+    await service.start()
+    selected = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert selected is not None and selected.quality is not None
+    assert selected.provider == "ethereum_exchange_rate"
+    assert selected.quality.stale_after_seconds == ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS
+    assert selected.quality.stale is False
+
+    service.publish_yield_metric(_wbeth_proxy_metric(now, fallback_level=0))
+    retained = service.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert retained is not None
+    assert retained.provider == "ethereum_exchange_rate"
+    assert retained.fallback_level == 0
+    await service.stop()
+
+    restarted = QuickPriceService(settings)
+    await restarted.start()
+    persisted = restarted.get_quote("WBETH:USDC", now=now).estimated_annual_yield
+    assert persisted is not None
+    assert persisted.provider == "ethereum_exchange_rate"
+    assert persisted.fallback_level == 0
+    await restarted.stop()
 
 
 @pytest.mark.asyncio

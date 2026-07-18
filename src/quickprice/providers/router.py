@@ -17,6 +17,7 @@ from ._models import replace_metadata
 from .base import (
     AllProvidersFailed,
     Capability,
+    ProviderBusy,
     ProviderError,
     ProviderRateLimited,
     ProviderUnavailable,
@@ -233,8 +234,12 @@ class ProviderRouter:
 
             try:
                 method = getattr(provider, method_name)
-                async with asyncio.timeout(self.timeout_seconds):
+                routing_timeout = getattr(provider, "routing_timeout_seconds", self.timeout_seconds)
+                if routing_timeout is None:
                     result = await method(symbol, **kwargs)
+                else:
+                    async with asyncio.timeout(float(routing_timeout)):
+                        result = await method(symbol, **kwargs)
             except TimeoutError:
                 error: ProviderError = ProviderUnavailable(name, "timeout")
                 self._record_failure(
@@ -250,6 +255,13 @@ class ProviderRouter:
                 circuit.probing = False
                 attempts.append((name, error.message))
                 continue
+            except ProviderBusy as error:
+                # Local pacing saturation is not an upstream failure and must
+                # not burn the next provider's scarce reserve. Retry this
+                # route after the collector's bounded backoff instead.
+                circuit.probing = False
+                attempts.append((name, error.message))
+                break
             except (ProviderRateLimited, ProviderError) as error:
                 self._record_failure(
                     circuit,

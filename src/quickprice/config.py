@@ -124,9 +124,12 @@ class Settings:
     usd_cnh_poll_seconds: float = 240.0
     usd_hkd_poll_seconds: float = 900.0
     metadata_poll_seconds: float = 21600.0
+    metadata_retry_seconds: float = 300.0
     history_poll_seconds: float = 3600.0
     twelve_daily_credits: int = 790
     twelve_fx_reserve_credits: int = 769
+    twelve_calls_per_minute: int = 8
+    twelve_rate_gate_timeout_seconds: float = 5.0
     alpha_vantage_daily_credits: int = 25
     finnhub_calls_per_minute: int = 60
     coingecko_monthly_credits: int = 9000
@@ -192,9 +195,14 @@ class Settings:
             usd_cnh_poll_seconds=_float("QUICKPRICE_USD_CNH_POLL_SECONDS", 240, minimum=240),
             usd_hkd_poll_seconds=_float("QUICKPRICE_USD_HKD_POLL_SECONDS", 900, minimum=900),
             metadata_poll_seconds=_float("QUICKPRICE_METADATA_POLL_SECONDS", 21600, minimum=300),
+            metadata_retry_seconds=_float("QUICKPRICE_METADATA_RETRY_SECONDS", 300, minimum=60),
             history_poll_seconds=_float("QUICKPRICE_HISTORY_POLL_SECONDS", 3600, minimum=60),
             twelve_daily_credits=_int("QUICKPRICE_TWELVE_DAILY_CREDITS", 790, minimum=1),
             twelve_fx_reserve_credits=_int("QUICKPRICE_TWELVE_FX_RESERVE_CREDITS", 769, minimum=0),
+            twelve_calls_per_minute=_int("QUICKPRICE_TWELVE_CALLS_PER_MINUTE", 8, minimum=1),
+            twelve_rate_gate_timeout_seconds=_float(
+                "QUICKPRICE_TWELVE_RATE_GATE_TIMEOUT_SECONDS", 5.0, minimum=0.1
+            ),
             alpha_vantage_daily_credits=_int(
                 "QUICKPRICE_ALPHA_VANTAGE_DAILY_CREDITS", 25, minimum=1
             ),

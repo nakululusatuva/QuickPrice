@@ -4,12 +4,14 @@ import asyncio
 import math
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
 from quickprice.equities import LISTED_SYMBOLS
 from quickprice.providers.alpha_vantage import AlphaVantageProvider
-from quickprice.providers.base import ProviderUnavailable
+from quickprice.providers.base import HttpProvider, ProviderRateLimited, ProviderUnavailable
 from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxQuoteProvider
 from quickprice.providers.twelve_data import TwelveDataProvider
@@ -87,9 +89,12 @@ async def test_twelve_fx_hub_cache_keeps_the_complete_matrix_under_daily_limit()
             "USD/CNH": "7.20",
         }
         return {
-            "close": prices[vendor_symbol],
-            "timestamp": int(clock.now().timestamp()),
-            "is_market_open": True,
+            "values": [
+                {
+                    "close": prices[vendor_symbol],
+                    "datetime": clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            ]
         }
 
     provider._request_json = request_json
@@ -127,6 +132,57 @@ async def test_twelve_fx_hub_cache_keeps_the_complete_matrix_under_daily_limit()
     daily_tail_history_requests = 5 * 3
     assert theoretical_max + initial_hub_history_requests == 769 < 790
     assert theoretical_max + daily_tail_history_requests == 759 < 790
+
+
+@pytest.mark.asyncio
+async def test_twelve_local_gate_timeout_is_not_negative_cached(monkeypatch) -> None:
+    class Gate:
+        calls = 0
+
+        async def acquire(self):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(1)
+
+    gate = Gate()
+    provider = TwelveDataProvider(
+        "key",
+        rate_gate=gate,
+        rate_gate_timeout_seconds=0.005,
+    )
+    upstream = AsyncMock(
+        return_value={"values": [{"datetime": "2026-07-20 15:30:00", "close": "7.20"}]}
+    )
+    monkeypatch.setattr(HttpProvider, "_request_json", upstream)
+
+    with pytest.raises(ProviderRateLimited, match="admission timed out"):
+        await provider.get_quote("USD:CNH")
+    result = await provider.get_quote("USD:CNH")
+
+    assert result.price == Decimal("7.20")
+    assert gate.calls == 2
+    assert upstream.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_twelve_upstream_failure_remains_negative_cached(monkeypatch) -> None:
+    class Gate:
+        calls = 0
+
+        async def acquire(self):
+            self.calls += 1
+
+    gate = Gate()
+    provider = TwelveDataProvider("key", rate_gate=gate)
+    upstream = AsyncMock(side_effect=ProviderUnavailable("twelve_data", "fixture outage"))
+    monkeypatch.setattr(HttpProvider, "_request_json", upstream)
+
+    for _ in range(2):
+        with pytest.raises(ProviderUnavailable, match="fixture outage"):
+            await provider.get_quote("USD:CNH")
+
+    assert gate.calls == 1
+    assert upstream.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -172,6 +228,59 @@ async def test_alpha_fx_cache_limits_five_hub_legs_to_twenty_requests_per_day() 
 
     assert calls == Counter({currency: 4 for currency in ("EUR", "GBP", "HKD", "SGD", "CNH")})
     assert calls.total() == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["twelve_data", "alpha_vantage"])
+async def test_equity_fallback_cache_expires_at_the_next_session_open(
+    provider_name: str,
+) -> None:
+    clock = VirtualClock()
+    clock.origin = datetime(2026, 7, 20, 13, 20, tzinfo=UTC)  # Monday 09:20 New York
+    calls = 0
+    provider = (
+        TwelveDataProvider(
+            "key",
+            quote_cache_clock=clock.monotonic,
+            wall_clock=clock.now,
+        )
+        if provider_name == "twelve_data"
+        else AlphaVantageProvider(
+            "key",
+            quote_cache_clock=clock.monotonic,
+            wall_clock=clock.now,
+        )
+    )
+
+    async def request_json(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if provider_name == "twelve_data":
+            return {
+                "close": "200.00",
+                "datetime": clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_market_open": clock.seconds >= 600,
+            }
+        return {
+            "Global Quote": {
+                "05. price": "200.00",
+                "07. latest trading day": "2026-07-17",
+            }
+        }
+
+    provider._request_json = request_json
+
+    await provider.get_quote("QQQM:USD")
+    clock.seconds = 599
+    await provider.get_quote("QQQM:USD")
+    assert calls == 1
+
+    clock.seconds = 600
+    await provider.get_quote("QQQM:USD")
+    clock.seconds = 601
+    await provider.get_quote("QQQM:USD")
+
+    assert calls == 2
 
 
 @pytest.mark.asyncio

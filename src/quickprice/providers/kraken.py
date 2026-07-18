@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import aiohttp
@@ -46,6 +46,19 @@ class KrakenProvider(HttpProvider):
         "4h": 240,
         "1d": 1440,
     }
+
+    def __init__(
+        self,
+        *args,
+        max_quote_ages: Mapping[str, timedelta] | None = None,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.max_quote_ages = {
+            symbol.strip().upper(): age for symbol, age in (max_quote_ages or {}).items()
+        }
+        self._wall_clock = wall_clock
 
     def _pair(self, symbol: str) -> tuple[str, str]:
         normalized = symbol.strip().upper()
@@ -92,6 +105,12 @@ class KrakenProvider(HttpProvider):
             as_of = utc_datetime(trade[2])
         except ValueError as exc:
             raise MalformedResponse(self.name, "invalid trade value") from exc
+        max_age = self.max_quote_ages.get(normalized)
+        if max_age is not None and self._wall_clock().astimezone(UTC) - as_of > max_age:
+            # An illiquid pair can return a valid but hours-old last trade.
+            # Treat it as unavailable so the router can select its fresher
+            # aggregate fallback rather than accepting a stale primary.
+            raise ProviderUnavailable(self.name, "latest trade is stale")
         return quote(
             symbol=normalized,
             price=price,

@@ -8,16 +8,37 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from quickprice.analytics import calculate_changes
 from quickprice.builtin_plugin import FX_INSTRUMENTS
 from quickprice.collectors import MarketDataCoordinator, derive_cross_history
 from quickprice.config import Settings
-from quickprice.domain import PricePoint, ProviderQuote
+from quickprice.domain import (
+    PricePoint,
+    ProviderQuote,
+    RewardAccrualMode,
+    YieldMetric,
+    YieldQuality,
+)
 from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
-from quickprice.plugin_api import AssetClass, InstrumentPlugin, InstrumentSpec
-from quickprice.providers.base import Capability
+from quickprice.plugin_api import (
+    AssetClass,
+    InstrumentPlugin,
+    InstrumentSpec,
+    MarketCalendar,
+    YieldStrategy,
+)
+from quickprice.providers.alpha_vantage import AlphaVantageProvider
+from quickprice.providers.base import (
+    Capability,
+    ProviderBusy,
+    ProviderUnavailable,
+)
+from quickprice.providers.router import ProviderRouter
+from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.providers.wiring import build_provider_graph
 from quickprice.registry import InstrumentRegistry
 from quickprice.service import QuickPriceService
+from quickprice.staking import ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD
 
 
 def _large_registry(count: int, *, history_enabled: bool) -> InstrumentRegistry:
@@ -65,6 +86,94 @@ def _large_registry(count: int, *, history_enabled: bool) -> InstrumentRegistry:
     )
 
 
+def _yield_registry() -> InstrumentRegistry:
+    instrument = InstrumentSpec(
+        symbol="WBETH:USDC",
+        base="WBETH",
+        quote="USDC",
+        name="Wrapped Binance Beacon ETH",
+        description="A metadata retry scheduler fixture.",
+        asset_class=AssetClass.CRYPTO,
+        asset_type="liquid_staking_token",
+        price_basis="synthetic_cross",
+        yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+        reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+        underlying_asset="ETH",
+        history_enabled=False,
+    )
+    return InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="metadata-retry-fixture",
+                version="1",
+                instruments=(instrument,),
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+
+
+def _fx_hub_registry(
+    *symbols: str,
+    include_non_fx: bool = False,
+    include_plugin_fx: bool = False,
+) -> InstrumentRegistry:
+    instruments = tuple(
+        InstrumentSpec(
+            symbol=symbol,
+            base=symbol.split(":", 1)[0],
+            quote=symbol.split(":", 1)[1],
+            name=symbol,
+            description="An FX collector retry fixture.",
+            asset_class=AssetClass.FX,
+            asset_type="forex_pair",
+            price_basis="vendor_aggregate",
+            market_calendar=MarketCalendar.FX_24X5,
+            stale_after_seconds=300 if symbol == "USD:CNH" else 1200,
+            quote_poll_seconds=240 if symbol == "USD:CNH" else 900,
+        )
+        for symbol in symbols
+    )
+    if include_non_fx:
+        instruments += (
+            InstrumentSpec(
+                symbol="TOKEN:USD",
+                base="TOKEN",
+                quote="USD",
+                name="Token",
+                description="A non-FX retry isolation fixture.",
+                asset_class=AssetClass.CRYPTO,
+                asset_type="spot_crypto",
+                price_basis="last_trade",
+            ),
+        )
+    if include_plugin_fx:
+        instruments += (
+            InstrumentSpec(
+                symbol="CAD:JPY",
+                base="CAD",
+                quote="JPY",
+                name="Canadian Dollar / Japanese Yen",
+                description="A plugin-defined FX retry isolation fixture.",
+                asset_class=AssetClass.FX,
+                asset_type="forex_pair",
+                price_basis="vendor_aggregate",
+                market_calendar=MarketCalendar.FX_24X5,
+                quote_poll_seconds=900,
+            ),
+        )
+    return InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-retry-fixture",
+                version="1",
+                instruments=instruments,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+
+
 def test_cross_history_aligns_and_divides_components():
     now = datetime(2026, 7, 20, 4, tzinfo=UTC)
     left = [PricePoint("USD:CNH", now, Decimal("7.2"), "twelve")]
@@ -96,6 +205,216 @@ def test_cross_history_rejects_excessive_component_skew():
         interval="1m",
     )
     assert result == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_proxy", "fallback_level", "stale"),
+    [
+        (True, 0, False),
+        (False, 1, False),
+        (False, 0, True),
+    ],
+)
+async def test_metadata_loop_retries_degraded_yield_then_restores_primary(
+    monkeypatch,
+    is_proxy: bool,
+    fallback_level: int,
+    stale: bool,
+) -> None:
+    import quickprice.collectors as collectors
+
+    as_of = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    fallback = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("3.2"),
+        as_of=as_of,
+        method="market_ratio_30d",
+        provider="market_fallback",
+        is_proxy=is_proxy,
+        quality=YieldQuality(stale=stale, confidence="low"),
+        fallback_level=fallback_level,
+    )
+    primary = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("2.8"),
+        as_of=as_of,
+        method="exchange_rate_growth",
+        provider="binance",
+    )
+    settings = Settings(
+        background_enabled=False,
+        metadata_poll_seconds=21_600,
+        metadata_retry_seconds=300,
+    )
+    registry = _yield_registry()
+    service = QuickPriceService(settings, registry)
+    coordinator = MarketDataCoordinator(
+        service,
+        settings,
+        registry,
+    )
+
+    class Router:
+        calls = 0
+
+        def configured(self, *_args):
+            return True
+
+        async def get_yield(self, _symbol):
+            self.calls += 1
+            return fallback if self.calls == 1 else primary
+
+    router = Router()
+    coordinator.router = router
+    monotonic = 0.0
+    sleeps: list[float] = []
+    observed_metrics: list[YieldMetric | None] = []
+
+    async def advance(delay: float) -> None:
+        nonlocal monotonic
+        sleeps.append(delay)
+        observed_metrics.append(service._yield_metrics.get("WBETH:USDC"))
+        if len(sleeps) == 2:
+            raise asyncio.CancelledError
+        monotonic += delay
+
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: monotonic)
+    monkeypatch.setattr(collectors.asyncio, "sleep", advance)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._metadata_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert router.calls == 2
+    assert observed_metrics == [fallback, primary]
+    assert service._yield_metrics["WBETH:USDC"] == primary
+    assert sleeps == [300, 21_600]
+
+
+@pytest.mark.asyncio
+async def test_metadata_loop_keeps_normal_cadence_for_current_daily_onchain_index(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    metric = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("2.4187"),
+        as_of=now - timedelta(hours=16),
+        method=ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+        provider="ethereum_exchange_rate",
+        quality=YieldQuality(
+            stale=False,
+            staleness_ms=16 * 60 * 60 * 1000,
+            confidence="high",
+        ),
+    )
+    settings = Settings(
+        background_enabled=False,
+        metadata_poll_seconds=21_600,
+        metadata_retry_seconds=300,
+    )
+    registry = _yield_registry()
+    service = QuickPriceService(settings, registry)
+    coordinator = MarketDataCoordinator(service, settings, registry)
+
+    class Router:
+        calls = 0
+
+        def configured(self, *_args):
+            return True
+
+        async def get_yield(self, _symbol):
+            self.calls += 1
+            return metric
+
+    router = Router()
+    coordinator.router = router
+    sleeps: list[float] = []
+
+    async def stop_after_scheduled_delay(delay: float) -> None:
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(collectors.asyncio, "sleep", stop_after_scheduled_delay)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._metadata_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert router.calls == 1
+    assert service._yield_metrics["WBETH:USDC"] == metric
+    assert sleeps == [21_600]
+
+
+@pytest.mark.asyncio
+async def test_metadata_loop_retries_fetch_failure_without_busy_loop(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    primary = YieldMetric(
+        symbol="WBETH:USDC",
+        value=Decimal("2.8"),
+        as_of=datetime(2026, 7, 20, 15, tzinfo=UTC),
+        method="exchange_rate_growth",
+        provider="binance",
+    )
+    settings = Settings(
+        background_enabled=False,
+        metadata_poll_seconds=21_600,
+        metadata_retry_seconds=300,
+    )
+    registry = _yield_registry()
+    service = QuickPriceService(settings, registry)
+    coordinator = MarketDataCoordinator(
+        service,
+        settings,
+        registry,
+    )
+
+    class Router:
+        calls = 0
+
+        def configured(self, *_args):
+            return True
+
+        async def get_yield(self, _symbol):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary upstream failure")
+            return primary
+
+    router = Router()
+    coordinator.router = router
+    monotonic = 0.0
+    sleeps: list[float] = []
+    observed_metrics: list[YieldMetric | None] = []
+
+    async def advance(delay: float) -> None:
+        nonlocal monotonic
+        sleeps.append(delay)
+        observed_metrics.append(service._yield_metrics.get("WBETH:USDC"))
+        if len(sleeps) == 2:
+            raise asyncio.CancelledError
+        monotonic += delay
+
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: monotonic)
+    monkeypatch.setattr(collectors.asyncio, "sleep", advance)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._metadata_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert router.calls == 2
+    assert observed_metrics == [None, primary]
+    assert service._yield_metrics["WBETH:USDC"] == primary
+    assert sleeps == [300, 21_600]
+    assert "yield:WBETH:USDC" not in coordinator._last_errors
 
 
 def test_cross_history_never_uses_a_future_component():
@@ -205,6 +524,553 @@ async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> 
     assert len(service.published_sizes) == 2 * (len(FX_SYMBOLS) - len(FX_HUB_SYMBOLS))
     assert sum(service.published_sizes[-25:]) == 75
     assert service.persist_flags == [False] * len(service.persist_flags)
+
+
+@pytest.mark.asyncio
+async def test_restored_fx_tails_rebuild_one_year_prefix_from_complete_hubs(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-restore-prefix-fixture",
+                version="1",
+                instruments=FX_INSTRUMENTS,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    settings = Settings(background_enabled=False)
+    service = QuickPriceService(settings, registry)
+    old_at = now - timedelta(days=366)
+    recent_at = now - timedelta(days=1)
+    hub_prices = {
+        "USD:EUR": Decimal("0.90"),
+        "USD:GBP": Decimal("0.75"),
+        "USD:HKD": Decimal("7.80"),
+        "USD:SGD": Decimal("1.25"),
+        "USD:CNH": Decimal("7.20"),
+    }
+    restored = [
+        PricePoint(symbol, timestamp, price, "twelve_data", interval="1d")
+        for symbol, price in hub_prices.items()
+        for timestamp in (old_at, recent_at)
+    ]
+    # Simulate a restart with complete persisted hubs but only a recent tail
+    # for every derived inverse/cross.
+    for symbol in set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS):
+        restored.append(
+            PricePoint(
+                symbol,
+                recent_at,
+                Decimal("1"),
+                "synthetic_fx",
+                is_derived=True,
+                interval="1d",
+            )
+        )
+    service.history.load(restored)
+    coordinator = MarketDataCoordinator(service, settings, registry)
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        await coordinator._materialize_builtin_fx_history()
+    finally:
+        await coordinator.graph.close()
+
+    derived_symbols = set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS)
+    assert len(derived_symbols) == 25
+    for symbol in derived_symbols:
+        points = service.history.points_for_interval(symbol, "1d")
+        assert min(point.timestamp for point in points) <= now - timedelta(days=365)
+        assert calculate_changes(points[-1].price, now, points)["1y"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fx_startup_fetches_all_hub_daily_histories_before_intraday(monkeypatch) -> None:
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-daily-priority-fixture",
+                version="1",
+                instruments=FX_INSTRUMENTS,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+
+    class History:
+        def points_for_interval(self, _symbol, _interval):
+            return ()
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=History()),
+        Settings(background_enabled=False),
+        registry,
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[tuple[str, str]] = []
+
+    async def fetch(symbol, interval, start, end):
+        del end
+        calls.append((symbol, interval))
+        return (PricePoint(symbol, start, Decimal("1"), "twelve_data", interval=interval),)
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        complete = await coordinator._backfill_history(include_fx=True)
+    finally:
+        await coordinator.graph.close()
+
+    assert complete is True
+    assert calls[:5] == [(symbol, "1d") for symbol in FX_HUB_SYMBOLS]
+    assert all(interval != "1d" for _, interval in calls[5:])
+
+
+@pytest.mark.asyncio
+async def test_run_awaits_all_fx_daily_preseed_before_quote_and_history_tasks(
+    monkeypatch,
+) -> None:
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-startup-lifecycle-fixture",
+                version="1",
+                instruments=FX_INSTRUMENTS,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+
+    class History:
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], dict[datetime, PricePoint]] = {}
+
+        def points_for_interval(self, symbol, interval):
+            points = self.values.get((symbol, interval), {})
+            return tuple(points[key] for key in sorted(points))
+
+        def add(self, points):
+            for point in points:
+                self.values.setdefault((point.symbol, point.interval), {})[point.timestamp] = point
+
+    history = History()
+
+    async def publish_history(points, *, persist=True):
+        del persist
+        history.add(points)
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=history, publish_history_async=publish_history),
+        Settings(background_enabled=False),
+        registry,
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    events: list[tuple[str, str | None]] = []
+
+    async def fetch(symbol, interval, start, end):
+        del end
+        events.append(("daily", symbol))
+        points = (
+            PricePoint(symbol, start, Decimal("1"), "twelve_data", interval=interval),
+            PricePoint(
+                symbol,
+                now - timedelta(days=1),
+                Decimal("1.01"),
+                "twelve_data",
+                interval=interval,
+            ),
+        )
+        history.add(points)
+        return points
+
+    async def quote_loop():
+        events.append(("quote", None))
+        await coordinator._stop.wait()
+
+    async def history_loop():
+        events.append(("intraday", None))
+        await coordinator._stop.wait()
+
+    async def idle_loop():
+        await coordinator._stop.wait()
+
+    coordinator._fetch_history_pages = fetch
+    coordinator._quote_scheduler_loop = quote_loop
+    coordinator._history_loop = history_loop
+    coordinator._publish_loop = idle_loop
+    coordinator._metadata_loop = idle_loop
+    coordinator._maintenance_loop = idle_loop
+    coordinator._stream_symbols = lambda _provider: ()
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+
+    task = asyncio.create_task(coordinator._run())
+    try:
+        await coordinator._started.wait()
+        derived_symbols = set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS)
+        for symbol in derived_symbols:
+            points = history.points_for_interval(symbol, "1d")
+            assert points
+            assert points[0].timestamp <= now - timedelta(days=365)
+            assert calculate_changes(points[-1].price, now, points)["1y"] is not None
+        coordinator._stop.set()
+        await task
+    finally:
+        await coordinator.graph.close()
+
+    assert len(events) == 7
+    assert {symbol for kind, symbol in events[:5] if kind == "daily"} == set(FX_HUB_SYMBOLS)
+    assert {kind for kind, _ in events[5:]} == {"quote", "intraday"}
+
+
+@pytest.mark.asyncio
+async def test_bounded_fx_preseed_timeout_still_starts_quote_collection() -> None:
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="fx-startup-timeout-fixture",
+                version="1",
+                instruments=FX_INSTRUMENTS,
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+
+    class History:
+        def points_for_interval(self, _symbol, _interval):
+            return ()
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=History()),
+        Settings(background_enabled=False),
+        registry,
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    coordinator._fx_startup_preseed_timeout_seconds = 0.01
+    never = asyncio.Event()
+    quote_started = asyncio.Event()
+
+    async def blocked_fetch(*_args, **_kwargs):
+        await never.wait()
+        return ()
+
+    async def quote_loop():
+        quote_started.set()
+        await coordinator._stop.wait()
+
+    async def idle_loop():
+        await coordinator._stop.wait()
+
+    coordinator._fetch_history_pages = blocked_fetch
+    coordinator._quote_scheduler_loop = quote_loop
+    coordinator._history_loop = idle_loop
+    coordinator._publish_loop = idle_loop
+    coordinator._metadata_loop = idle_loop
+    coordinator._maintenance_loop = idle_loop
+    coordinator._stream_symbols = lambda _provider: ()
+
+    task = asyncio.create_task(coordinator._run())
+    try:
+        async with asyncio.timeout(0.2):
+            await coordinator._started.wait()
+            await quote_started.wait()
+        coordinator._stop.set()
+        await task
+    finally:
+        await coordinator.graph.close()
+
+    assert "history-daily:startup" in coordinator._last_errors
+
+
+@pytest.mark.asyncio
+async def test_alpha_compact_fx_prefix_is_deferred_without_minute_refetch(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    monotonic = 100.0
+
+    class History:
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], list[PricePoint]] = {}
+
+        def points_for_interval(self, symbol, interval):
+            return tuple(self.values.get((symbol, interval), ()))
+
+        def add(self, points):
+            for point in points:
+                self.values.setdefault((point.symbol, point.interval), []).append(point)
+
+    history = History()
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=history),
+        Settings(background_enabled=False),
+        _fx_hub_registry("USD:CNH"),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[str] = []
+
+    async def fetch(symbol, interval, start, end):
+        del end
+        calls.append(interval)
+        point = PricePoint(
+            symbol,
+            now - timedelta(days=99) if interval == "1d" else start,
+            Decimal("7.2"),
+            "alpha_vantage" if interval == "1d" else "twelve_data",
+            interval=interval,
+        )
+        history.add((point,))
+        return (point,)
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    monkeypatch.setattr("quickprice.collectors.time.monotonic", lambda: monotonic)
+    try:
+        assert await coordinator._startup_preseed_fx_daily() is False
+        assert calls == ["1d"]
+        assert coordinator._fx_daily_retry_symbols == set()
+        assert coordinator._daily_prefix_retry_at["USD:CNH"] == (monotonic + 24 * 60 * 60)
+
+        assert await coordinator._backfill_history(include_fx=True) is True
+    finally:
+        await coordinator.graph.close()
+
+    assert calls == ["1d", "1m", "5m"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ProviderBusy, ProviderUnavailable])
+async def test_transient_fx_daily_failure_retries_without_repeating_intraday(
+    monkeypatch,
+    error_type,
+) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+
+    class History:
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], list[PricePoint]] = {}
+
+        def points_for_interval(self, symbol, interval):
+            return tuple(self.values.get((symbol, interval), ()))
+
+        def add(self, points):
+            for point in points:
+                self.values.setdefault((point.symbol, point.interval), []).append(point)
+
+    history = History()
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=history),
+        Settings(background_enabled=False),
+        _fx_hub_registry("USD:CNH"),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[str] = []
+    daily_attempts = 0
+
+    async def fetch(symbol, interval, start, end):
+        nonlocal daily_attempts
+        del end
+        calls.append(interval)
+        if interval == "1d":
+            daily_attempts += 1
+            if daily_attempts == 1:
+                raise error_type("twelve_data", "temporary failure")
+        point = PricePoint(symbol, start, Decimal("7.2"), "twelve_data", interval=interval)
+        history.add((point,))
+        return (point,)
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        assert await coordinator._backfill_history(include_fx=True) is False
+        assert calls == ["1d", "1m", "5m"]
+        assert coordinator._fx_daily_retry_symbols == {"USD:CNH"}
+
+        coordinator._fx_history_retry_only = True
+        assert await coordinator._backfill_history(include_fx=True) is True
+    finally:
+        await coordinator.graph.close()
+
+    assert calls == ["1d", "1m", "5m", "1d"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ProviderBusy, ProviderUnavailable])
+async def test_fx_intraday_failure_retries_only_failed_interval(
+    monkeypatch,
+    error_type,
+) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+
+    class History:
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], list[PricePoint]] = {}
+
+        def points_for_interval(self, symbol, interval):
+            return tuple(self.values.get((symbol, interval), ()))
+
+        def add(self, points):
+            for point in points:
+                self.values.setdefault((point.symbol, point.interval), []).append(point)
+
+    history = History()
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=history),
+        Settings(background_enabled=False),
+        _fx_hub_registry("USD:CNH"),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[str] = []
+    failed_once = False
+
+    async def fetch(symbol, interval, start, end):
+        nonlocal failed_once
+        del end
+        calls.append(interval)
+        if interval == "1m" and not failed_once:
+            failed_once = True
+            raise error_type("twelve_data", "temporary failure")
+        point = PricePoint(symbol, start, Decimal("7.2"), "twelve_data", interval=interval)
+        history.add((point,))
+        return (point,)
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        assert await coordinator._backfill_history(include_fx=True) is False
+        assert calls == ["1d", "1m", "5m"]
+        assert coordinator._fx_failed_history_intervals == {("USD:CNH", "1m")}
+
+        coordinator._fx_history_retry_only = True
+        assert await coordinator._backfill_history(include_fx=True) is True
+    finally:
+        await coordinator.graph.close()
+
+    assert calls == ["1d", "1m", "5m", "1m"]
+    assert coordinator._fx_failed_history_intervals == set()
+
+
+@pytest.mark.asyncio
+async def test_fx_retry_only_cycle_skips_non_fx_until_the_next_full_cycle() -> None:
+    class History:
+        def points_for_interval(self, _symbol, _interval):
+            return ()
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=History()),
+        Settings(background_enabled=False),
+        _fx_hub_registry(
+            "USD:CNH",
+            include_non_fx=True,
+            include_plugin_fx=True,
+        ),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    coordinator._fx_history_retry_only = True
+    coordinator._history_full_cycle = False
+    coordinator._fx_failed_history_intervals = {("USD:CNH", "1m")}
+    calls: list[str] = []
+
+    async def backfill(symbol):
+        calls.append(symbol)
+        if symbol == "USD:CNH":
+            return {"1m": ProviderUnavailable("twelve_data", "still unavailable")}
+        return {}
+
+    coordinator._backfill_symbol = backfill
+    try:
+        assert await coordinator._backfill_history(include_fx=True) is False
+        assert calls == ["USD:CNH"]
+
+        coordinator._history_full_cycle = True
+        assert await coordinator._backfill_history(include_fx=True) is False
+    finally:
+        await coordinator.graph.close()
+
+    assert set(calls[1:]) == {"USD:CNH", "TOKEN:USD", "CAD:JPY"}
+
+
+@pytest.mark.asyncio
+async def test_persistent_fx_failure_keeps_independent_hourly_full_history_cycle(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False, history_poll_seconds=3_600),
+        _large_registry(1, history_enabled=False),
+    )
+    now = 0.0
+    calls: list[tuple[bool, bool, float]] = []
+
+    async def backfill(*, include_fx: bool) -> bool:
+        calls.append((include_fx, coordinator._history_full_cycle, now))
+        if now >= 3_660:
+            raise asyncio.CancelledError
+        return False
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    coordinator._backfill_history = backfill
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: now)
+    monkeypatch.setattr(collectors.asyncio, "sleep", advance)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._history_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert [(full, timestamp) for _, full, timestamp in calls if full] == [
+        (True, 0.0),
+        (True, 3_600.0),
+    ]
+    assert all(
+        timestamp % 60 == 0 and not full
+        for _, full, timestamp in calls
+        if timestamp not in {0.0, 3_600.0}
+    )
+
+
+@pytest.mark.asyncio
+async def test_fx_daily_failure_retries_after_one_minute_before_daily_deferral(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False, history_poll_seconds=3_600),
+        _large_registry(1, history_enabled=False),
+    )
+    now = 0.0
+    calls: list[tuple[bool, float]] = []
+
+    async def backfill(*, include_fx: bool) -> bool:
+        calls.append((include_fx, now))
+        if len(calls) == 1:
+            return False
+        if len(calls) == 2:
+            return True
+        raise asyncio.CancelledError
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    coordinator._backfill_history = backfill
+    monkeypatch.setattr(collectors.time, "monotonic", lambda: now)
+    monkeypatch.setattr(collectors.asyncio, "sleep", advance)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._history_loop()
+    finally:
+        await coordinator.graph.close()
+
+    assert calls == [(True, 0.0), (True, 60.0), (False, 3_600.0)]
 
 
 @pytest.mark.asyncio
@@ -358,6 +1224,422 @@ async def test_finnhub_quote_uses_live_quota_safe_cadence_instead_of_daily_fallb
         assert coordinator._pending["QQQM:USD"].provider == "finnhub"
     finally:
         await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_equity_fallback_keeps_finnhub_cadence_until_alpaca_recovers(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    symbol = "QQQM:USD"
+    clock = 0.0
+    observed_at = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
+
+    class Alpaca:
+        name = "alpaca"
+        stream_poll_suppression_seconds = 120.0
+        closed_market_quote_poll_seconds = 900.0
+        calls = 0
+
+        async def get_quote(self, requested_symbol):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderUnavailable(self.name, "temporary outage")
+            return ProviderQuote(
+                requested_symbol,
+                Decimal("201"),
+                observed_at + timedelta(seconds=20),
+                self.name,
+                "iex",
+                market_status="open",
+            )
+
+    class Finnhub:
+        name = "finnhub"
+        minimum_quote_poll_seconds = 20.0
+        closed_market_quote_poll_seconds = 900.0
+
+        async def get_quote(self, _symbol):
+            raise ProviderUnavailable(self.name, "temporary outage")
+
+    alpaca = Alpaca()
+    finnhub = Finnhub()
+    twelve = TwelveDataProvider(
+        "key",
+        quote_cache_clock=lambda: clock,
+        wall_clock=lambda: observed_at + timedelta(seconds=clock),
+    )
+    twelve_calls = 0
+
+    async def twelve_request(*_args, **_kwargs):
+        nonlocal twelve_calls
+        twelve_calls += 1
+        return {
+            "close": "200",
+            "datetime": observed_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "is_market_open": True,
+        }
+
+    twelve._request_json = twelve_request
+    router = ProviderRouter(
+        {(symbol, Capability.QUOTE): [alpaca, finnhub, twelve]},
+        failure_threshold=100,
+        clock=lambda: clock,
+    )
+    coordinator = MarketDataCoordinator(SimpleNamespace(), Settings(background_enabled=False))
+    coordinator.router = router
+    monkeypatch.setattr(
+        collectors,
+        "utc_now",
+        lambda: observed_at + timedelta(seconds=clock),
+    )
+    try:
+        first_interval = await coordinator._poll_quote_once(symbol)
+        clock = first_interval
+        second_interval = await coordinator._poll_quote_once(symbol)
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert first_interval == finnhub.minimum_quote_poll_seconds == 20
+    assert second_interval == coordinator.registry[symbol].quote_poll_seconds == 5
+    assert alpaca.calls == 2
+    assert twelve_calls == 1
+    assert coordinator._pending[symbol].provider == "alpaca"
+
+
+@pytest.mark.asyncio
+async def test_sustained_equity_primary_failure_reuses_scarce_fallback_caches(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    symbol = "QQQM:USD"
+    seconds = 0.0
+    origin = datetime(2026, 7, 20, 15, tzinfo=UTC)  # Monday 11:00 New York
+
+    class FailingPrimary:
+        stream_poll_suppression_seconds = 120.0
+        closed_market_quote_poll_seconds = 900.0
+
+        def __init__(self, name):
+            self.name = name
+            self.calls = 0
+            if name == "finnhub":
+                self.minimum_quote_poll_seconds = 20.0
+
+        async def get_quote(self, _symbol):
+            self.calls += 1
+            raise ProviderUnavailable(self.name, "sustained outage")
+
+    alpaca = FailingPrimary("alpaca")
+    finnhub = FailingPrimary("finnhub")
+    twelve = TwelveDataProvider(
+        "key",
+        quote_cache_clock=lambda: seconds,
+        wall_clock=lambda: origin + timedelta(seconds=seconds),
+    )
+    alpha = AlphaVantageProvider(
+        "key",
+        quote_cache_clock=lambda: seconds,
+        wall_clock=lambda: origin + timedelta(seconds=seconds),
+    )
+    twelve_calls = 0
+    alpha_calls = 0
+
+    async def twelve_request(*_args, **_kwargs):
+        nonlocal twelve_calls
+        twelve_calls += 1
+        raise ProviderUnavailable("twelve_data", "sustained outage")
+
+    async def alpha_request(*_args, **_kwargs):
+        nonlocal alpha_calls
+        alpha_calls += 1
+        return {
+            "Global Quote": {
+                "05. price": "200.00",
+                "07. latest trading day": "2026-07-17",
+            }
+        }
+
+    twelve._request_json = twelve_request
+    alpha._request_json = alpha_request
+    router = ProviderRouter(
+        {(symbol, Capability.QUOTE): [alpaca, finnhub, twelve, alpha]},
+        failure_threshold=1_000,
+        clock=lambda: seconds,
+    )
+    coordinator = MarketDataCoordinator(SimpleNamespace(), Settings(background_enabled=False))
+    coordinator.router = router
+    monkeypatch.setattr(
+        collectors,
+        "utc_now",
+        lambda: origin + timedelta(seconds=seconds),
+    )
+    try:
+        for _ in range(180):
+            next_interval = await coordinator._poll_quote_once(symbol)
+            assert next_interval == 20
+            seconds += next_interval
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert alpaca.calls == finnhub.calls == 180
+    assert twelve_calls == alpha_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fx_alpha_fallback_keeps_normal_cadence_until_twelve_recovers() -> None:
+    symbol = "USD:CNH"
+    first_as_of = datetime(2026, 7, 20, 15, tzinfo=UTC)
+
+    class Twelve:
+        name = "twelve_data"
+        calls = 0
+
+        async def get_quote(self, requested_symbol):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderUnavailable(self.name, "temporary outage")
+            return ProviderQuote(
+                requested_symbol,
+                Decimal("7.21"),
+                first_as_of + timedelta(minutes=4),
+                self.name,
+                "twelve_data_fx",
+            )
+
+    class Alpha:
+        name = "alpha_vantage"
+
+        async def get_quote(self, requested_symbol):
+            return ProviderQuote(
+                requested_symbol,
+                Decimal("7.20"),
+                first_as_of,
+                self.name,
+                "alpha_vantage_fx",
+            )
+
+    twelve = Twelve()
+    alpha = Alpha()
+    router = ProviderRouter({(symbol, Capability.QUOTE): [twelve, alpha]})
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+        _fx_hub_registry(symbol),
+    )
+    coordinator.router = router
+    try:
+        first_interval = await coordinator._poll_quote_once(symbol)
+        second_interval = await coordinator._poll_quote_once(symbol)
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert first_interval == second_interval == 240
+    assert twelve.calls == 2
+    assert coordinator._pending[symbol].provider == "twelve_data"
+
+
+@pytest.mark.asyncio
+async def test_sustained_twelve_failure_reuses_six_hour_alpha_fx_cache() -> None:
+    clock = 0.0
+    alpha_upstream_calls: list[str] = []
+
+    class Twelve:
+        name = "twelve_data"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_quote(self, symbol):
+            self.calls.append(symbol)
+            raise ProviderUnavailable(self.name, "sustained outage")
+
+    twelve = Twelve()
+    alpha = AlphaVantageProvider("key", quote_cache_clock=lambda: clock)
+
+    async def alpha_request(_method, _url, *, params, **_kwargs):
+        counter = str(params["to_currency"])
+        alpha_upstream_calls.append(counter)
+        return {
+            "Realtime Currency Exchange Rate": {
+                "5. Exchange Rate": "7.20",
+                "6. Last Refreshed": "2026-07-20 15:00:00",
+            }
+        }
+
+    alpha._request_json = alpha_request
+    router = ProviderRouter(
+        {(symbol, Capability.QUOTE): [twelve, alpha] for symbol in FX_HUB_SYMBOLS},
+        failure_threshold=100,
+        clock=lambda: clock,
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+        _fx_hub_registry(*FX_HUB_SYMBOLS),
+    )
+    coordinator.router = router
+    events = sorted(
+        (second, symbol, coordinator.registry[symbol].quote_poll_seconds)
+        for symbol in FX_HUB_SYMBOLS
+        for second in range(
+            0,
+            3_600,
+            int(coordinator.registry[symbol].quote_poll_seconds),
+        )
+    )
+    try:
+        for second, symbol, expected_interval in events:
+            clock = float(second)
+            assert await coordinator._poll_quote_once(symbol) == expected_interval
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert len(twelve.calls) == len(events) == 31
+    assert len(alpha_upstream_calls) == len(FX_HUB_SYMBOLS) == 5
+    assert set(alpha_upstream_calls) == {symbol.split(":", 1)[1] for symbol in FX_HUB_SYMBOLS}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("symbol", "expected_interval"),
+    [("USD:CNH", 240), ("USD:HKD", 900)],
+)
+async def test_all_failed_fx_quote_keeps_normal_primary_probe_cadence(
+    symbol: str,
+    expected_interval: int,
+) -> None:
+    class FailingProvider:
+        def __init__(self, name):
+            self.name = name
+
+        async def get_quote(self, _symbol):
+            raise ProviderUnavailable(self.name, "temporary outage")
+
+    router = ProviderRouter(
+        {
+            (symbol, Capability.QUOTE): [
+                FailingProvider("twelve_data"),
+                FailingProvider("alpha_vantage"),
+            ]
+        }
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+        _fx_hub_registry(symbol),
+    )
+    coordinator.router = router
+    try:
+        next_interval = await coordinator._poll_quote_once(symbol)
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert next_interval == expected_interval
+    assert f"quote:{symbol}" in coordinator._last_errors
+
+
+@pytest.mark.asyncio
+async def test_fresh_alpaca_stream_observation_suppresses_rest_poll(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            background_enabled=False,
+            alpaca_api_key="key",
+            alpaca_api_secret="secret",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["alpaca"]
+        provider._request_json = AsyncMock()
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(provider), "QQQM:USD")] = 99.0
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == coordinator.registry["QQQM:USD"].quote_poll_seconds == 5
+        provider._request_json.assert_not_awaited()
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_alpaca_quote_uses_fifteen_minute_floor(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    now = datetime(2026, 7, 19, 16, tzinfo=UTC)
+    monkeypatch.setattr(collectors, "utc_now", lambda: now)
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            background_enabled=False,
+            alpaca_api_key="key",
+            alpaca_api_secret="secret",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["alpaca"]
+        provider._request_json = AsyncMock(
+            side_effect=[
+                {"trade": {"p": "200", "t": "2026-07-17T19:59:00Z"}},
+                {"is_open": False, "timestamp": now.isoformat()},
+            ]
+        )
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == provider.closed_market_quote_poll_seconds == 900
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_all_failed_equity_route_uses_route_wide_floor(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    now = datetime(2026, 7, 19, 16, tzinfo=UTC)
+    monkeypatch.setattr(collectors, "utc_now", lambda: now)
+
+    class FailingProvider:
+        def __init__(self, name, *, closed_floor=0.0, minimum=0.0):
+            self.name = name
+            self.closed_market_quote_poll_seconds = closed_floor
+            if minimum:
+                self.minimum_quote_poll_seconds = minimum
+
+        async def get_quote(self, _symbol):
+            raise ProviderUnavailable(self.name, "weekend outage")
+
+    router = ProviderRouter(
+        {
+            ("QQQM:USD", Capability.QUOTE): [
+                FailingProvider("alpaca", closed_floor=900),
+                FailingProvider("finnhub", closed_floor=900, minimum=20),
+                FailingProvider("twelve_data"),
+                FailingProvider("alpha_vantage"),
+            ]
+        }
+    )
+    coordinator = MarketDataCoordinator(SimpleNamespace(), Settings(background_enabled=False))
+    coordinator.router = router
+    try:
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+    finally:
+        await router.close()
+        await coordinator.graph.close()
+
+    assert next_interval == 900
 
 
 @pytest.mark.asyncio
@@ -542,6 +1824,158 @@ async def test_history_fetch_uses_forward_windows_no_larger_than_5000_bars(tmp_p
     assert len(router.calls) == 3
     assert all(limit == 5_000 for _, _, limit in router.calls)
     await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_backfill_recovers_old_prefix_before_resuming_tail_updates(monkeypatch) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    recent = PricePoint(
+        "BOXX:USD",
+        now - timedelta(days=100),
+        Decimal("110"),
+        "alpha_vantage",
+        interval="1d",
+    )
+
+    class History:
+        daily = (recent,)
+
+        def points_for_interval(self, symbol, interval):
+            assert symbol == "BOXX:USD"
+            return self.daily if interval == "1d" else ()
+
+    service = SimpleNamespace(history=History())
+    coordinator = MarketDataCoordinator(service, Settings(background_enabled=False))
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[tuple[str, datetime, datetime]] = []
+
+    async def fetch(symbol, interval, start, end):
+        calls.append((interval, start, end))
+        return ()
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        await coordinator._backfill_symbol("BOXX:USD")
+        daily_call = next(item for item in calls if item[0] == "1d")
+        assert daily_call[1] == now - timedelta(days=400)
+
+        calls.clear()
+        service.history.daily = (
+            PricePoint(
+                "BOXX:USD",
+                now - timedelta(days=399),
+                Decimal("100"),
+                "twelve_data",
+                interval="1d",
+            ),
+            PricePoint(
+                "BOXX:USD",
+                now - timedelta(days=1),
+                Decimal("111"),
+                "twelve_data",
+                interval="1d",
+            ),
+        )
+        await coordinator._backfill_symbol("BOXX:USD")
+        daily_call = next(item for item in calls if item[0] == "1d")
+        assert daily_call[1] == now - timedelta(days=2)
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_boundary_at_analytics_cutoff_uses_tail_only_across_cycles(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    boundary = (now - timedelta(days=365)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    class History:
+        def points_for_interval(self, symbol, interval):
+            assert symbol == "STETH:USDC"
+            if interval != "1d":
+                return ()
+            return (
+                PricePoint(symbol, boundary, Decimal("1800"), "coingecko", interval="1d"),
+                PricePoint(
+                    symbol,
+                    now - timedelta(days=1),
+                    Decimal("1900"),
+                    "coingecko",
+                    interval="1d",
+                ),
+            )
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=History()),
+        Settings(background_enabled=False),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    calls: list[tuple[str, datetime]] = []
+
+    async def fetch(symbol, interval, start, end):
+        del symbol, end
+        calls.append((interval, start))
+        return ()
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    try:
+        for _ in range(3):
+            await coordinator._backfill_symbol("STETH:USDC")
+    finally:
+        await coordinator.graph.close()
+
+    daily_starts = [start for interval, start in calls if interval == "1d"]
+    assert daily_starts == [now - timedelta(days=2)] * 3
+    assert all(start > now - timedelta(days=365) for start in daily_starts)
+
+
+@pytest.mark.asyncio
+async def test_recent_listing_full_prefix_is_retried_only_once_per_day(monkeypatch) -> None:
+    now = datetime(2026, 7, 20, 15, tzinfo=UTC)
+    listed_at = now - timedelta(days=30)
+
+    class History:
+        def points_for_interval(self, symbol, interval):
+            assert symbol == "CRCL:USD"
+            if interval != "1d":
+                return ()
+            return (PricePoint(symbol, listed_at, Decimal("100"), "alpaca", interval="1d"),)
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(history=History()),
+        Settings(background_enabled=False),
+    )
+    coordinator.router = SimpleNamespace(configured=lambda *_: True)
+    monotonic = [100.0]
+    calls: list[tuple[str, datetime]] = []
+
+    async def fetch(symbol, interval, start, end):
+        del end
+        calls.append((interval, start))
+        if interval == "1d":
+            return (PricePoint(symbol, listed_at, Decimal("100"), "alpaca", interval="1d"),)
+        return ()
+
+    coordinator._fetch_history_pages = fetch
+    monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
+    monkeypatch.setattr("quickprice.collectors.time.monotonic", lambda: monotonic[0])
+    try:
+        for _ in range(3):
+            await coordinator._backfill_symbol("CRCL:USD")
+        assert [item for item in calls if item[0] == "1d"] == [("1d", now - timedelta(days=400))]
+
+        monotonic[0] += 24 * 60 * 60 + 1
+        await coordinator._backfill_symbol("CRCL:USD")
+    finally:
+        await coordinator.graph.close()
+
+    assert [item for item in calls if item[0] == "1d"] == [
+        ("1d", now - timedelta(days=400)),
+        ("1d", now - timedelta(days=400)),
+    ]
 
 
 @pytest.mark.asyncio

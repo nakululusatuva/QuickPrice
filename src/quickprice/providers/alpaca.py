@@ -30,6 +30,8 @@ class AlpacaProvider(HttpProvider):
     trading_base_url = "https://paper-api.alpaca.markets/v2"
     websocket_url = "wss://stream.data.alpaca.markets/v2/iex"
     feed = "iex"
+    stream_poll_suppression_seconds = 120.0
+    closed_market_quote_poll_seconds = 900.0
     symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
     _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
     _frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
@@ -224,7 +226,16 @@ class AlpacaProvider(HttpProvider):
             headers=self._headers,
         )
         document = self._document(payload)
-        rows = document.get("cash_dividends", ())
+        if "cash_dividends" in document:
+            # Alpaca's legacy response exposed the action collection directly.
+            rows = document["cash_dividends"]
+        else:
+            actions = document.get("corporate_actions")
+            if actions is None:
+                rows = ()
+            else:
+                actions = require_mapping(actions, self.name, "corporate_actions")
+                rows = actions.get("cash_dividends", ())
         if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
             raise MalformedResponse(self.name, "cash_dividends must be an array")
         regular = []

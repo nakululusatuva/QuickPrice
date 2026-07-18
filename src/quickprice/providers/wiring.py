@@ -55,7 +55,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     providers = context.providers
 
     binance = providers["binance"] = BinanceProvider()
-    kraken = providers["kraken"] = KrakenProvider()
+    kraken = providers["kraken"] = KrakenProvider(max_quote_ages={"XMR:USDC": timedelta(minutes=5)})
     coingecko = None
     if settings.coingecko_api_key:
         coingecko = providers["coingecko"] = CoinGeckoProvider(
@@ -135,12 +135,6 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     router.register("WBETH:USDC", Capability.HISTORY, wbeth_history_chain)
 
     wbeth_yield_chain: list[Any] = []
-    if settings.ethereum_rpc_urls:
-        ethereum_yield = providers["ethereum_exchange_rate"] = EthereumExchangeRateYieldProvider(
-            settings.ethereum_rpc_urls,
-            request_timeout=settings.provider_timeout_seconds,
-        )
-        wbeth_yield_chain.append(ethereum_yield)
     if settings.binance_api_key and settings.binance_api_secret:
         binance_yield = providers["binance_wbeth_rate"] = BinanceWbethYieldProvider(
             settings.binance_api_key,
@@ -148,6 +142,12 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             request_timeout=settings.provider_timeout_seconds,
         )
         wbeth_yield_chain.append(binance_yield)
+    if settings.ethereum_rpc_urls:
+        ethereum_yield = providers["ethereum_exchange_rate"] = EthereumExchangeRateYieldProvider(
+            settings.ethereum_rpc_urls,
+            request_timeout=settings.provider_timeout_seconds,
+        )
+        wbeth_yield_chain.append(ethereum_yield)
     market_ratio_yield = providers["staking_market_ratio_proxy"] = StakingMarketRatioYieldProvider(
         router,
         specs=(
@@ -185,6 +185,9 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             settings.twelve_data_api_key,
             usd_cnh_quote_ttl_seconds=settings.usd_cnh_poll_seconds,
             usd_hkd_quote_ttl_seconds=settings.usd_hkd_poll_seconds,
+            calls_per_minute=settings.twelve_calls_per_minute,
+            rate_gate_timeout_seconds=settings.twelve_rate_gate_timeout_seconds,
+            request_timeout=settings.provider_timeout_seconds,
             quota=daily_budget(
                 settings.twelve_daily_credits,
                 reserve=min(

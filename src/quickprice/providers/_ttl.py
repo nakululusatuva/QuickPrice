@@ -18,17 +18,24 @@ class _Entry[V]:
 
 
 class AsyncTtlCache[K, V]:
-    """Cache successful values and expected provider failures for a fixed TTL.
+    """Cache values and expected provider failures with independently bounded TTLs.
 
     Per-key locks collapse concurrent misses. Expected failures are cached too,
     because repeatedly probing a broken emergency feed would consume the same
-    scarce vendor allowance as successful requests.
+    scarce vendor allowance as successful requests. Callers may select a
+    shorter error TTL when recovery must be observed before a long-lived
+    successful value would normally expire.
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._entries: dict[K, _Entry[V]] = {}
         self._locks: dict[K, asyncio.Lock] = {}
+
+    def discard(self, key: K) -> None:
+        """Remove one cached value or error without disturbing its singleflight lock."""
+
+        self._entries.pop(key, None)
 
     @staticmethod
     def _clone_error(error: ProviderError) -> ProviderError:
@@ -59,9 +66,15 @@ class AsyncTtlCache[K, V]:
         key: K,
         ttl_seconds: float,
         loader: Callable[[], Awaitable[V]],
+        *,
+        error_ttl_seconds: float | None = None,
     ) -> V:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if error_ttl_seconds is None:
+            error_ttl_seconds = ttl_seconds
+        if error_ttl_seconds <= 0:
+            raise ValueError("error_ttl_seconds must be positive")
         now = self._clock()
         entry = self._entries.get(key)
         if entry is not None and now < entry.expires_at:
@@ -78,7 +91,7 @@ class AsyncTtlCache[K, V]:
             except ProviderError as exc:
                 cached_error = self._clone_error(exc).with_traceback(None)
                 self._entries[key] = _Entry(
-                    expires_at=started_at + ttl_seconds,
+                    expires_at=started_at + error_ttl_seconds,
                     error=cached_error,
                 )
                 raise

@@ -130,10 +130,42 @@ def test_finnhub_key_and_minute_quota_are_configurable(monkeypatch) -> None:
     assert settings.finnhub_calls_per_minute == 42
 
 
+def test_twelve_short_window_rate_is_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_TWELVE_CALLS_PER_MINUTE", "610")
+    monkeypatch.setenv("QUICKPRICE_TWELVE_RATE_GATE_TIMEOUT_SECONDS", "12.5")
+
+    settings = Settings.from_env()
+    assert settings.twelve_calls_per_minute == 610
+    assert settings.twelve_rate_gate_timeout_seconds == 12.5
+
+
+def test_twelve_short_window_rate_must_be_positive(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_TWELVE_CALLS_PER_MINUTE", "0")
+
+    with pytest.raises(ValueError, match="must be >= 1"):
+        Settings.from_env()
+
+
+def test_twelve_rate_gate_timeout_must_be_positive(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_TWELVE_RATE_GATE_TIMEOUT_SECONDS", "0")
+
+    with pytest.raises(ValueError, match=r"must be >= 0\.1"):
+        Settings.from_env()
+
+
 def test_finnhub_minute_quota_must_be_positive(monkeypatch) -> None:
     monkeypatch.setenv("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", "0")
 
     with pytest.raises(ValueError, match="must be >= 1"):
+        Settings.from_env()
+
+
+def test_metadata_retry_interval_is_configurable_and_bounded(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_METADATA_RETRY_SECONDS", "120")
+    assert Settings.from_env().metadata_retry_seconds == 120
+
+    monkeypatch.setenv("QUICKPRICE_METADATA_RETRY_SECONDS", "59")
+    with pytest.raises(ValueError, match="must be >= 60"):
         Settings.from_env()
 
 

@@ -117,8 +117,13 @@ Income calculations are explicit:
   as a 30-Day SEC Yield.
 - BOXX uses FRED DGS3MO minus 0.1949 percentage points and identifies the result
   as a proxy.
-- WBETH uses protocol exchange-rate growth, then signed Binance history when
-  configured, then a trailing market-ratio estimate.
+- WBETH uses [signed Binance rate history](https://developers.binance.com/en/docs/catalog/investment-and-services-staking/api/rest-api/eth-staking#get-wbeth-rate-history)
+  when configured, then protocol exchange-rate growth, then a trailing
+  market-ratio estimate. Binance's `annualPercentageRate` is already an annual
+  fraction: `0.023` means 2.3%, not a daily rate to annualize again. The on-chain
+  fallback's daily exchange-rate event remains current for 36 hours: one normal
+  24-hour publication interval plus 12 hours of scheduling and RPC/indexing
+  grace.
 - stETH and wstETH use Lido's protocol APR as the primary yield source, with a
   trailing token-to-ETH market-ratio estimate as the final fallback.
 
@@ -254,7 +259,9 @@ Adapters implement uniform quote, history, dividend, yield, and accrual-index
 contracts. Routing is configured per instrument and capability. The router
 applies timeouts, durable quota accounting, single-flight request merging,
 three-failure circuit breakers, 60-second half-open probes, and exponential
-reconnect backoff.
+reconnect backoff. The multi-request Ethereum exchange-rate algorithm has a
+separate finite route budget derived from its per-request timeout; every JSON-
+RPC request remains subject to the shorter provider request timeout.
 
 The default route families are:
 
@@ -263,7 +270,8 @@ The default route families are:
 - POL and TRX: Binance then CoinGecko for quotes; Binance only for history.
 - XMR: Kraken then CoinGecko for quotes; Kraken for history.
 - WBETH: Binance synthetic routes, then CoinGecko normalization for quotes;
-  Binance synthetic routes for history.
+  Binance synthetic routes for history; signed Binance APR, on-chain exchange-
+  rate APY, then the declared 30-day market-ratio proxy for yield.
 - stETH and wstETH: CoinGecko price normalization, Lido protocol yield, then
   the declared 30-day market-ratio yield fallback.
 - Common-stock and ETF quotes: Alpaca IEX, Finnhub, Twelve Data, then Alpha
@@ -469,5 +477,6 @@ connections, task counts, SQLite queues, database size, and WAL size.
   remains explicitly unspecified and its data is not redistributed.
 - Provider data must not be redistributed without the required license.
 - Fund issuer pages are not scraped; BOXX uses the documented FRED proxy.
-- Binance fallback credentials must have no trading or withdrawal permission.
+- Binance WBETH rate-history credentials must have no trading or withdrawal
+  permission.
 - Production disables CORS and API documentation and serves no trading routes.

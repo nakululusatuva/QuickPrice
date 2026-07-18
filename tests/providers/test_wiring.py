@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
+from unittest.mock import AsyncMock
+
 import pytest
 
 from quickprice.config import Settings
+from quickprice.domain import YieldMetric
 from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
 from quickprice.plugin_api import (
     AssetClass,
@@ -11,7 +16,7 @@ from quickprice.plugin_api import (
     ProviderBinding,
 )
 from quickprice.providers.alpaca import AlpacaProvider
-from quickprice.providers.base import Capability
+from quickprice.providers.base import Capability, ProviderUnavailable
 from quickprice.providers.coingecko import CoinGeckoProvider
 from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
@@ -26,8 +31,19 @@ from quickprice.providers.wiring import build_provider_graph
 from quickprice.registry import InstrumentRegistry
 
 
+def _market_ratio_metric(symbol: str) -> YieldMetric:
+    return YieldMetric(
+        symbol=symbol,
+        value=Decimal("2.5"),
+        as_of=datetime(2026, 7, 20, tzinfo=UTC),
+        method="staking_market_ratio_30d_annualized",
+        provider="staking_market_ratio_proxy",
+        is_proxy=True,
+    )
+
+
 @pytest.mark.asyncio
-async def test_wbeth_yield_route_prefers_onchain_then_binance_then_market_ratio() -> None:
+async def test_wbeth_yield_route_prefers_binance_then_onchain_then_market_ratio() -> None:
     settings = Settings(
         require_free_threaded=False,
         background_enabled=False,
@@ -41,16 +57,36 @@ async def test_wbeth_yield_route_prefers_onchain_then_binance_then_market_ratio(
         chain = graph.router.providers_for("WBETH:USDC", Capability.YIELD)
 
         assert tuple(type(provider) for provider in chain) == (
-            EthereumExchangeRateYieldProvider,
             BinanceWbethYieldProvider,
+            EthereumExchangeRateYieldProvider,
             StakingMarketRatioYieldProvider,
         )
         assert tuple(provider.name for provider in chain) == (
-            "ethereum_exchange_rate",
             "binance_wbeth_rate",
+            "ethereum_exchange_rate",
             "staking_market_ratio_proxy",
         )
         assert chain[-1].lookback_days == 30
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_wbeth_yield_route_uses_onchain_before_proxy_without_binance_credentials() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        ethereum_rpc_urls=("https://ethereum-mainnet.invalid",),
+    )
+    graph = build_provider_graph(settings)
+    try:
+        chain = graph.router.providers_for("WBETH:USDC", Capability.YIELD)
+
+        assert tuple(type(provider) for provider in chain) == (
+            EthereumExchangeRateYieldProvider,
+            StakingMarketRatioYieldProvider,
+        )
+        assert "binance_wbeth_rate" not in graph.providers
     finally:
         await graph.close()
 
@@ -74,6 +110,67 @@ async def test_wbeth_yield_route_keeps_market_ratio_as_final_fallback_without_cr
         assert "binance_wbeth_rate" not in graph.providers
     finally:
         await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_wbeth_onchain_failure_assigns_ratio_route_level_one() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        ethereum_rpc_urls=("https://ethereum-mainnet.invalid",),
+    )
+    graph = build_provider_graph(settings)
+    graph.providers["ethereum_exchange_rate"].get_yield = AsyncMock(
+        side_effect=ProviderUnavailable("ethereum_exchange_rate", "unavailable")
+    )
+    graph.providers["staking_market_ratio_proxy"].get_yield = AsyncMock(
+        return_value=_market_ratio_metric("WBETH:USDC")
+    )
+    try:
+        metric = await graph.router.get_yield("WBETH:USDC")
+    finally:
+        await graph.close()
+
+    assert metric.fallback_level == 1
+
+
+@pytest.mark.asyncio
+async def test_wbeth_ratio_only_route_remains_level_zero() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+    )
+    graph = build_provider_graph(settings)
+    graph.providers["staking_market_ratio_proxy"].get_yield = AsyncMock(
+        return_value=_market_ratio_metric("WBETH:USDC")
+    )
+    try:
+        metric = await graph.router.get_yield("WBETH:USDC")
+    finally:
+        await graph.close()
+
+    assert metric.fallback_level == 0
+
+
+@pytest.mark.asyncio
+async def test_lido_failure_assigns_ratio_route_level_one() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+    )
+    graph = build_provider_graph(settings)
+    graph.providers["lido"].get_yield = AsyncMock(
+        side_effect=ProviderUnavailable("lido", "unavailable")
+    )
+    graph.providers["staking_market_ratio_proxy"].get_yield = AsyncMock(
+        return_value=_market_ratio_metric("STETH:USDC")
+    )
+    try:
+        metric = await graph.router.get_yield("STETH:USDC")
+    finally:
+        await graph.close()
+
+    assert metric.fallback_level == 1
 
 
 @pytest.mark.asyncio
@@ -125,6 +222,8 @@ async def test_provider_graph_wires_fx_cache_cadences_and_alpaca_clock_url() -> 
         alpaca = graph.providers["alpaca"]
 
         assert isinstance(twelve, TwelveDataProvider)
+        assert twelve._rate_gate.limit == settings.twelve_calls_per_minute == 8
+        assert twelve.rate_gate_timeout_seconds == settings.twelve_rate_gate_timeout_seconds == 5
         assert twelve.quote_cache_ttl_seconds == {
             "USD:EUR": 1_800,
             "USD:GBP": 1_800,

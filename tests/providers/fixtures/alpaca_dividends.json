@@ -1,17 +1,19 @@
 {
-  "cash_dividends": [
-    {
-      "id": "fixture-dividend-id",
-      "symbol": "QQQM",
-      "cusip": "46090E103",
-      "rate": "0.3215",
-      "special": false,
-      "foreign": false,
-      "process_date": "2026-06-20",
-      "ex_date": "2026-06-23",
-      "record_date": "2026-06-23",
-      "payable_date": "2026-06-27"
-    }
-  ],
+  "corporate_actions": {
+    "cash_dividends": [
+      {
+        "id": "fixture-dividend-id",
+        "symbol": "QQQM",
+        "cusip": "46090E103",
+        "rate": "0.3215",
+        "special": false,
+        "foreign": false,
+        "process_date": "2026-06-20",
+        "ex_date": "2026-06-23",
+        "record_date": "2026-06-23",
+        "payable_date": "2026-06-27"
+      }
+    ]
+  },
   "next_page_token": null
 }

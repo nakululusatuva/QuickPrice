@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
 from bisect import bisect_right
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -24,7 +25,11 @@ from quickprice.domain import (
     ensure_utc,
     utc_now,
 )
-from quickprice.staking import annualize_index_growth
+from quickprice.staking import (
+    ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS,
+    ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
+    annualize_index_growth,
+)
 
 from ._models import decimal_value, utc_datetime
 from .base import (
@@ -113,6 +118,9 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
     """Derive trailing APY from a staking token's on-chain exchange-rate index."""
 
     name = "ethereum_exchange_rate"
+    _minimum_routing_timeout_seconds = 45.0
+    _maximum_routing_timeout_seconds = 300.0
+    _routing_request_budget = 8.0
 
     def __init__(
         self,
@@ -127,6 +135,7 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
         max_parallel_log_requests: int = 4,
         endpoint_race_width: int = 2,
         block_cache_size: int = 2_048,
+        routing_timeout_seconds: float | None = None,
         clock: Callable[[], datetime] = utc_now,
         **kwargs: Any,
     ) -> None:
@@ -156,6 +165,20 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
         self.max_parallel_log_requests = max_parallel_log_requests
         self.endpoint_race_width = min(endpoint_race_width, len(self.rpc_urls))
         self.block_cache_size = block_cache_size
+        if routing_timeout_seconds is None:
+            # Yield discovery combines a current-rate lookup with two concurrent
+            # block-height searches. Give that bounded workflow several HTTP
+            # timeout windows without weakening the timeout on any one request.
+            routing_timeout_seconds = min(
+                self._maximum_routing_timeout_seconds,
+                max(
+                    self._minimum_routing_timeout_seconds,
+                    self.request_timeout * self._routing_request_budget,
+                ),
+            )
+        if not math.isfinite(routing_timeout_seconds) or routing_timeout_seconds <= 0:
+            raise ValueError("Ethereum routing timeout must be finite and positive")
+        self.routing_timeout_seconds = float(routing_timeout_seconds)
         self._clock = clock
         self._verified_endpoints: set[tuple[str, int]] = set()
         self._block_cache: dict[tuple[str, int], Mapping[str, Any]] = {}
@@ -249,7 +272,7 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
             symbol=spec.symbol,
             value=percent,
             as_of=current.as_of,
-            method="onchain_exchange_rate_trailing_apy",
+            method=ONCHAIN_EXCHANGE_RATE_TRAILING_APY_METHOD,
             provider=self.name,
             is_proxy=False,
             components=(
@@ -277,7 +300,7 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
             is_estimate=True,
             accrual_index=current,
             quality=YieldQuality(
-                stale=staleness_ms > 15 * 60 * 1000,
+                stale=staleness_ms > ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS * 1000,
                 staleness_ms=staleness_ms,
                 confidence="high",
             ),
@@ -557,7 +580,7 @@ class _BinanceRateRow:
 
 
 class BinanceWbethYieldProvider(HttpProvider):
-    """Read Binance's signed WBETH APR without converting it to APY."""
+    """Read Binance's signed, provider-reported WBETH APR."""
 
     name = "binance_wbeth_rate"
     base_url = "https://api.binance.com"
@@ -602,6 +625,8 @@ class BinanceWbethYieldProvider(HttpProvider):
         staleness_ms = _staleness_ms(now, row.as_of)
         return YieldMetric(
             symbol=normalized,
+            # Binance encodes APR as a fraction: 0.023 means 2.3 percent.
+            # It is already annualized and must not be multiplied by 365.
             value=row.apr_fraction * Decimal(100),
             as_of=row.as_of,
             method="binance_wbeth_rate_history_apr",
@@ -625,9 +650,9 @@ class BinanceWbethYieldProvider(HttpProvider):
             quality=YieldQuality(
                 stale=staleness_ms > 2 * 24 * 60 * 60 * 1000,
                 staleness_ms=staleness_ms,
-                confidence="medium",
+                confidence="high",
             ),
-            fallback_level=1,
+            fallback_level=0,
         )
 
     async def get_accrual_index(self, symbol: str) -> AccrualIndexPoint:
@@ -696,6 +721,8 @@ class BinanceWbethYieldProvider(HttpProvider):
                 exchange_rate = decimal_value(row["exchangeRate"])
             except (KeyError, ValueError) as exc:
                 raise MalformedResponse(self.name, "invalid WBETH rate row") from exc
+            if apr_fraction < 0:
+                raise MalformedResponse(self.name, "WBETH APR cannot be negative")
             if exchange_rate <= 0:
                 raise MalformedResponse(self.name, "WBETH exchange rate must be positive")
             if start <= as_of <= end:
@@ -930,7 +957,8 @@ class StakingMarketRatioYieldProvider:
                 staleness_ms=staleness_ms,
                 confidence="low",
             ),
-            fallback_level=2,
+            # Route position, not adapter identity, determines fallback level.
+            fallback_level=0,
         )
 
     def _observations(

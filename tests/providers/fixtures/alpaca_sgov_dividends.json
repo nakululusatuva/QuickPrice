@@ -1,0 +1,37 @@
+{
+  "corporate_actions": {
+    "cash_dividends": [
+      {
+        "id": "fixture-return-of-capital-id",
+        "symbol": "SGOV",
+        "rate": "1.500000",
+        "special": false,
+        "foreign": false,
+        "sub_type": "return_of_capital",
+        "ex_date": "2026-07-02",
+        "payable_date": "2026-07-08"
+      },
+      {
+        "id": "fixture-interest-distribution-id",
+        "symbol": "SGOV",
+        "rate": "0.295765",
+        "special": false,
+        "foreign": false,
+        "sub_type": "interest",
+        "ex_date": "2026-07-01",
+        "payable_date": "2026-07-07"
+      },
+      {
+        "id": "fixture-special-distribution-id",
+        "symbol": "SGOV",
+        "rate": "2.000000",
+        "special": true,
+        "foreign": false,
+        "sub_type": "interest",
+        "ex_date": "2026-06-30",
+        "payable_date": "2026-07-07"
+      }
+    ]
+  },
+  "next_page_token": null
+}

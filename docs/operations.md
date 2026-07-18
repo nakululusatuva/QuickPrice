@@ -234,9 +234,10 @@ Check:
    provider 429.
 
 Synthetic prices reject over-age or over-skew components. A last cached value
-must remain explicitly stale. WBETH yield may fall back from contract index to
-Binance rate history and finally the declared 30-day WBETH/ETH market-ratio
-proxy; the method and proxy flags must reveal the fallback. For staking assets
+must remain explicitly stale. WBETH yield may fall back from signed Binance APR
+to the contract exchange-rate estimate and finally the declared 30-day
+WBETH/ETH market-ratio proxy; the method and proxy flags must reveal the
+fallback. For staking assets
 whose rewards increase units rather than unit value, the same declared
 price-ratio fallback can omit those units and must remain a low-confidence
 market proxy rather than a protocol-reported rate.
@@ -251,9 +252,16 @@ market proxy rather than a protocol-reported rate.
   are cached briefly; do not lower the cadence below the calculated floor. A
   separate 29-call-per-second sliding gate protects cold starts, recent stream
   trades suppress REST polling, and closed-market checks use a 15-minute floor.
-- Alpha FX uses a six-hour emergency cadence.
+- Alpaca and Finnhub recovery probes continue at Finnhub's quota-safe floor
+  after a listed-security route falls through. Twelve Data and Alpha Vantage
+  fallback values or expected errors are cached per symbol until the next
+  scheduled US session open; closed sessions use a 15-minute route-wide floor.
+- FX scheduling continues to probe Twelve Data every 240 seconds for USD/CNH
+  and every 900 seconds for the other USD hubs. Alpha FX fallback values and
+  expected Alpha errors are cached per hub for six hours, so those primary
+  probes do not consume another Alpha credit on every scheduler cycle.
 - CoinGecko uses one all-symbol request no more than every five minutes.
-- Binance staking fallback uses only a read-only USER_DATA key.
+- Binance's primary WBETH APR route uses only a read-only USER_DATA key.
 - Accept a disclosed stale value or upgrade to an authorized paid plan.
 
 ### SQLite queue or WAL growth
