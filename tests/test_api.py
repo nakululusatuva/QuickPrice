@@ -118,6 +118,18 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     assert by_symbol["QQQM:USD"]["description"]
     assert by_symbol["SOL:USDC"]["asset_type"] == "spot_crypto"
     assert by_symbol["XMR:USDC"]["asset_type"] == "spot_crypto"
+    assert by_symbol["POL:USDC"]["asset_type"] == "spot_crypto"
+    assert by_symbol["BNB:USDC"]["asset_type"] == "spot_crypto"
+    assert by_symbol["TRX:USDC"]["asset_type"] == "spot_crypto"
+    assert by_symbol["POL:USDC"]["price"] == 0.25
+    assert by_symbol["BNB:USDC"]["price"] == 800
+    assert by_symbol["TRX:USDC"]["price"] == 0.3
+    assert by_symbol["POL:USDC"]["name"] == "Polygon Ecosystem Token"
+    assert by_symbol["BNB:USDC"]["name"] == "BNB"
+    assert by_symbol["TRX:USDC"]["name"] == "TRON"
+    for symbol in ("POL:USDC", "BNB:USDC", "TRX:USDC"):
+        assert by_symbol[symbol]["asset_class"] == "crypto"
+        assert by_symbol[symbol]["estimated_annual_yield"] is None
     assert isinstance(by_symbol["AAPL:USD"]["dividend"]["yield_percent"], float | int)
     assert by_symbol["AMZN:USD"]["dividend"] is None
     assert by_symbol["SPCX:USD"]["name"] == "Space Exploration Technologies Corp."

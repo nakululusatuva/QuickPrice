@@ -60,7 +60,7 @@ COMMON_STOCK_INSTRUMENTS = tuple(_common_stock_instrument(item) for item in COMM
 
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.3.0",
+    version="1.4.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -102,6 +102,39 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             quote="USDC",
             name="Monero",
             description="Monero's privacy-focused native asset spot price quoted in USD Coin.",
+            asset_class=AssetClass.CRYPTO,
+            asset_type="spot_crypto",
+            price_basis="last_trade",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="POL:USDC",
+            base="POL",
+            quote="USDC",
+            name="Polygon Ecosystem Token",
+            description="Polygon's native ecosystem token spot price quoted in USD Coin.",
+            asset_class=AssetClass.CRYPTO,
+            asset_type="spot_crypto",
+            price_basis="last_trade",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="BNB:USDC",
+            base="BNB",
+            quote="USDC",
+            name="BNB",
+            description="BNB Chain's native token spot price quoted in USD Coin.",
+            asset_class=AssetClass.CRYPTO,
+            asset_type="spot_crypto",
+            price_basis="last_trade",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="TRX:USDC",
+            base="TRX",
+            quote="USDC",
+            name="TRON",
+            description="TRON's native token spot price quoted in USD Coin.",
             asset_class=AssetClass.CRYPTO,
             asset_type="spot_crypto",
             price_basis="last_trade",

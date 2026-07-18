@@ -24,23 +24,27 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS[:7] == (
+    assert SYMBOLS[:10] == (
         "BTC:USDC",
         "ETH:USDC",
         "SOL:USDC",
         "XMR:USDC",
+        "POL:USDC",
+        "BNB:USDC",
+        "TRX:USDC",
         "WBETH:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
     )
-    assert SYMBOLS[7:17] == COMMON_STOCK_SYMBOLS
-    assert SYMBOLS[17:20] == (
+    assert SYMBOLS[10:20] == COMMON_STOCK_SYMBOLS
+    assert SYMBOLS[20:23] == (
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
     )
-    assert SYMBOLS[20:] == FX_SYMBOLS
-    assert len(SYMBOLS) == 50
+    assert SYMBOLS[23:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 53
+    assert BUILTIN_PLUGIN.version == "1.4.0"
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND

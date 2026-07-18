@@ -62,13 +62,28 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
         )
 
-    for symbol in ("BTC:USDC", "ETH:USDC", "SOL:USDC"):
+    for symbol in (
+        "BTC:USDC",
+        "ETH:USDC",
+        "SOL:USDC",
+        "BNB:USDC",
+    ):
         quote_chain = [binance, kraken]
         history_chain = [binance, kraken]
         if coingecko is not None:
             quote_chain.append(coingecko)
         router.register(symbol, Capability.QUOTE, quote_chain)
         router.register(symbol, Capability.HISTORY, history_chain)
+
+    # Kraken does not list POL/USDC or TRX/USDC. Keep CoinGecko as a
+    # quota-bounded aggregated quote fallback, but do not claim an unsupported
+    # exchange or ordinary-spot history fallback.
+    for symbol in ("POL:USDC", "TRX:USDC"):
+        quote_chain = [binance]
+        if coingecko is not None:
+            quote_chain.append(coingecko)
+        router.register(symbol, Capability.QUOTE, quote_chain)
+        router.register(symbol, Capability.HISTORY, [binance])
 
     xmr_quote_chain = [kraken]
     if coingecko is not None:
