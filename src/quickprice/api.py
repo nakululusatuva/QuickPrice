@@ -12,7 +12,13 @@ from typing import Annotated, Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
@@ -298,6 +304,10 @@ def create_app(
         return JSONResponse(content, status_code=500)
 
     dashboard_html = (_DASHBOARD_ROOT / "index.html").read_text(encoding="utf-8")
+
+    @app.get("/", response_class=RedirectResponse, include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/dashboard", status_code=307)
 
     @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)

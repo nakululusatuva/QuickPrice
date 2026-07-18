@@ -36,6 +36,19 @@ def _assert_security_headers(response) -> None:
     assert "frame-ancestors 'none'" in policy
 
 
+def test_root_redirects_to_public_dashboard(client) -> None:
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["Location"] == "/dashboard"
+    assert response.headers["Cache-Control"] == "no-store"
+    _assert_security_headers(response)
+
+    dashboard = client.get("/")
+    assert dashboard.status_code == 200
+    assert dashboard.url.path == "/dashboard"
+
+
 @pytest.mark.parametrize("path", ["/dashboard", "/dashboard/"])
 def test_dashboard_shell_is_public_and_hardened(client, path: str) -> None:
     response = client.get(path)
