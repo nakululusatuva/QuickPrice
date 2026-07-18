@@ -16,7 +16,48 @@ from urllib.parse import urlencode
 
 import aiohttp
 
-DEFAULT_SYMBOLS = "BTC:USDC,ETH:USDC,WBETH:USDC,QQQM:USD,BOXX:USD,SGOV:USD,USD:CNH,HKD:CNH"
+DEFAULT_SYMBOLS = ",".join(
+    (
+        "BTC:USDC",
+        "ETH:USDC",
+        "WBETH:USDC",
+        "STETH:USDC",
+        "WSTETH:USDC",
+        "QQQM:USD",
+        "BOXX:USD",
+        "SGOV:USD",
+        "USD:EUR",
+        "USD:GBP",
+        "USD:HKD",
+        "USD:SGD",
+        "USD:CNH",
+        "EUR:USD",
+        "EUR:GBP",
+        "EUR:HKD",
+        "EUR:SGD",
+        "EUR:CNH",
+        "GBP:USD",
+        "GBP:EUR",
+        "GBP:HKD",
+        "GBP:SGD",
+        "GBP:CNH",
+        "HKD:USD",
+        "HKD:EUR",
+        "HKD:GBP",
+        "HKD:SGD",
+        "HKD:CNH",
+        "SGD:USD",
+        "SGD:EUR",
+        "SGD:GBP",
+        "SGD:HKD",
+        "SGD:CNH",
+        "CNH:USD",
+        "CNH:EUR",
+        "CNH:GBP",
+        "CNH:HKD",
+        "CNH:SGD",
+    )
+)
 
 
 class LatencyRecorder:

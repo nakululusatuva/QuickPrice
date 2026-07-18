@@ -1,0 +1,27 @@
+# Optional Caddy example. QuickPrice has no runtime dependency on Caddy.
+{
+	admin off
+}
+
+price.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		format filter {
+			request>headers>X-Api-Key delete
+			request>uri query {
+				delete api_key
+				delete apikey
+				delete key
+			}
+			wrap json
+		}
+	}
+}

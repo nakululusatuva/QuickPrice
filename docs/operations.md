@@ -4,20 +4,22 @@ This guide covers one QuickPrice process on a Linux VPS with a local persistent
 SQLite database. Docker is not supported. Never run two QuickPrice processes
 against the same database.
 
-QuickPrice reads `/etc/quickprice/quickprice.env`. Caddy reads only
-`/etc/caddy/quickprice.env`; it must never inherit provider credentials or the
-QuickPrice API-key hashes. Expected ownership and modes are:
+The supplied systemd unit reads non-secret runtime settings and provider
+credentials from separate files. Expected ownership and modes are:
 
 ```text
-/etc/quickprice/quickprice.env  root:quickprice 0640
-/etc/caddy/quickprice.env       root:caddy      0640
-/var/lib/quickprice             quickprice      0700
+/etc/quickprice/quickprice.env      root:quickprice 0640
+/etc/quickprice/provider-keys.env   root:quickprice 0640
+/var/lib/quickprice                 quickprice      0700
 ```
+
+The reverse proxy must not inherit either application file. QuickPrice is
+proxy-agnostic and expects TLS termination in a separately managed HTTP server.
 
 ## Normal baseline
 
 ```bash
-systemctl status quickprice caddy
+systemctl status quickprice
 journalctl -u quickprice --since '15 minutes ago'
 curl --fail https://price.example.com/health/live
 curl --fail https://price.example.com/health/ready
@@ -49,7 +51,8 @@ Suggested alerts:
 | Event-loop lag | Above 100 ms for five minutes | Above 500 ms for two minutes |
 | SQLite writer queue | Does not drain for five minutes | Grows for 15 minutes |
 | Disk free | Below 20% | Below 10% or 2 GB |
-| Active crypto quote age | Above 15 seconds | Above 60 seconds |
+| Binance/Kraken spot quote age | Above 15 seconds | Above 60 seconds |
+| CoinGecko staking-token quote age | Above 15 minutes | Above 30 minutes |
 | Open equity quote age | Above 30 seconds | Above five minutes |
 | USD/CNH quote age | Above five minutes | Above 15 minutes |
 
@@ -71,7 +74,7 @@ Weekly:
 
 1. Create an online SQLite backup and copy it away from the VPS.
 2. Run `scripts/smoke_test.py` from another host.
-3. Review certificate renewal, NTP, and operating-system updates.
+3. Review reverse-proxy certificate renewal, NTP, and operating-system updates.
 4. Verify that 1-minute, 5-minute, and daily retention is bounded at 48 hours,
    45 days, and 400 days.
 
@@ -150,13 +153,13 @@ UV_PROJECT_ENVIRONMENT=.venv uv sync --locked --no-dev \
   --python /opt/python-3.14.6t/bin/python3.14t
 UV_PROJECT_ENVIRONMENT=.venv uv run quickprice plugins validate
 sudo systemctl restart quickprice
-sudo systemctl restart caddy
 ```
 
-Run the smoke test. If startup fails, save the journal, return to the previous
-commit and lockfile, synchronize again, and restart. If a schema migration was
-applied, follow that release's migration notes; a code rollback alone may not be
-sufficient.
+Reload the independently managed reverse proxy only when its own configuration
+changed. Run the smoke test. If startup fails, save the journal, return to the
+previous commit and lockfile, synchronize again, and restart. If a schema
+migration was applied, follow that release's migration notes; a code rollback
+alone may not be sufficient.
 
 For a Python patch upgrade, update the version and Python.org SHA-256 together.
 Never bypass the source checksum or post-build GIL assertion.
@@ -225,20 +228,31 @@ cold repair.
 
 ### HTTPS failure
 
-1. Confirm A/AAAA records, inbound TCP 80/443, and system time.
-2. Read `journalctl -u caddy`.
-3. Remove an invalid AAAA record if IPv6 is not correctly routed.
-4. Do not expose port 8080 or disable TLS verification as a workaround.
+1. Check the selected reverse proxy's status, logs, certificate, and upstream
+   health result.
+2. Confirm that its upstream is the loopback QuickPrice listener and that it
+   forwards `X-API-Key` unchanged.
+3. Verify `/health/live` directly on loopback, then through the public origin.
+4. Do not expose the application listener or disable TLS verification as a
+   workaround.
 
 ### Key rotation
+
+For the QuickPrice client credential:
 
 1. Generate a new raw key and hash.
 2. Temporarily configure both hashes.
 3. Update Excel and run the smoke test.
 4. Remove the old hash and restart QuickPrice.
-5. Review Caddy source IP logs if compromise is suspected.
+5. Review sanitized reverse-proxy source IP logs if compromise is suspected.
 
 Never solve Power Query authentication by putting the key in the URL.
+
+For provider credentials, prepare a complete replacement
+`provider-keys.env`, validate it with `quickprice plugins validate`, install it
+atomically at the configured path, and restart QuickPrice. Confirm provider
+routes and quota checkpoints before revoking the previous credentials. Do not
+copy provider values into `quickprice.env` or the reverse-proxy environment.
 
 ## Provider fallback drill
 
@@ -269,9 +283,9 @@ python scripts/load_test.py https://price.example.com \
 
 Collect CPU, RSS, threads, file descriptors, TCP states, event-loop lag,
 snapshots, provider quotas, circuits, SQLite queue, database size, WAL size, and
-Caddy TLS errors. Memory, file descriptors, connections, tasks, queues, and WAL
-must not grow without bound. Restore rate limiting and run the smoke test after
-the soak.
+reverse-proxy TLS errors. Memory, file descriptors, connections, tasks, queues,
+and WAL must not grow without bound. Restore rate limiting and run the smoke
+test after the soak.
 
 ## Security incident
 
