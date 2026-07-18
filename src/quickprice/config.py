@@ -18,6 +18,7 @@ _PROVIDER_SECRET_NAMES: Final[frozenset[str]] = frozenset(
         "QUICKPRICE_COINGECKO_API_KEY",
         "QUICKPRICE_ETHEREUM_RPC_URLS",
         "QUICKPRICE_FRED_API_KEY",
+        "QUICKPRICE_FINNHUB_API_KEY",
         "QUICKPRICE_TWELVE_DATA_API_KEY",
     }
 )
@@ -127,6 +128,7 @@ class Settings:
     twelve_daily_credits: int = 790
     twelve_fx_reserve_credits: int = 769
     alpha_vantage_daily_credits: int = 25
+    finnhub_calls_per_minute: int = 60
     coingecko_monthly_credits: int = 9000
     high_frequency_publish_ms: int = 250
     sqlite_batch_size: int = 100
@@ -139,6 +141,7 @@ class Settings:
     alpaca_trading_base_url: str = "https://paper-api.alpaca.markets/v2"
     twelve_data_api_key: str | None = None
     alpha_vantage_api_key: str | None = None
+    finnhub_api_key: str | None = None
     coingecko_api_key: str | None = None
     fred_api_key: str | None = None
     ethereum_rpc_urls: tuple[str, ...] = ()
@@ -195,6 +198,7 @@ class Settings:
             alpha_vantage_daily_credits=_int(
                 "QUICKPRICE_ALPHA_VANTAGE_DAILY_CREDITS", 25, minimum=1
             ),
+            finnhub_calls_per_minute=_int("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", 60, minimum=1),
             coingecko_monthly_credits=_int(
                 "QUICKPRICE_COINGECKO_MONTHLY_CREDITS", 9000, minimum=31
             ),
@@ -224,6 +228,9 @@ class Settings:
                 "QUICKPRICE_ALPHA_VANTAGE_API_KEY",
                 provider_key_values,
                 "ALPHA_VANTAGE_API_KEY",
+            ),
+            finnhub_api_key=_secret(
+                "QUICKPRICE_FINNHUB_API_KEY", provider_key_values, "FINNHUB_API_KEY"
             ),
             coingecko_api_key=_secret(
                 "QUICKPRICE_COINGECKO_API_KEY", provider_key_values, "COINGECKO_API_KEY"

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from quickprice.providers.quota import QuotaBudget, rolling_month_safe_daily_budget
+from quickprice.providers.quota import (
+    QuotaBudget,
+    SlidingWindowRateGate,
+    rolling_month_safe_daily_budget,
+)
 
 
 @pytest.mark.asyncio
@@ -37,6 +41,31 @@ async def test_quota_concurrent_acquisition_never_overshoots():
     budget = QuotaBudget(10, 60)
     results = await asyncio.gather(*(budget.acquire() for _ in range(100)))
     assert sum(results) == 10
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_gate_paces_concurrent_bursts() -> None:
+    import asyncio
+
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def advance(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+        await asyncio.sleep(0)
+
+    gate = SlidingWindowRateGate(
+        3,
+        1.0,
+        clock=lambda: clock[0],
+        sleeper=advance,
+    )
+
+    await asyncio.gather(*(gate.acquire() for _ in range(7)))
+
+    assert clock[0] == 2.0
+    assert sleeps == [1.0, 1.0]
 
 
 @pytest.mark.asyncio

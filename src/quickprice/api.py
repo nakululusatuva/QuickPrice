@@ -72,6 +72,7 @@ def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
         settings.alpaca_api_secret,
         settings.twelve_data_api_key,
         settings.alpha_vantage_api_key,
+        settings.finnhub_api_key,
         settings.coingecko_api_key,
         settings.fred_api_key,
         settings.binance_api_key,

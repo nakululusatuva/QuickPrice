@@ -17,12 +17,14 @@ from quickprice.equities import (
 from quickprice.providers.alpaca import AlpacaProvider
 from quickprice.providers.alpha_vantage import AlphaVantageProvider
 from quickprice.providers.base import Capability, UnsupportedInstrument
+from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.providers.wiring import build_provider_graph
 
 
 def test_listed_ticker_maps_share_one_canonical_source() -> None:
     assert AlpacaProvider.symbols == dict(LISTED_TICKERS)
+    assert FinnhubProvider.symbols == dict(LISTED_TICKERS)
     assert AlphaVantageProvider.equity_symbols == dict(LISTED_TICKERS)
     assert {symbol: TwelveDataProvider.symbols[symbol] for symbol in LISTED_SYMBOLS} == dict(
         LISTED_TICKERS
@@ -75,6 +77,7 @@ async def test_listed_routes_use_all_quote_sources_but_only_alpaca_dividends() -
             background_enabled=False,
             alpaca_api_key="alpaca-key",
             alpaca_api_secret="alpaca-secret",
+            finnhub_api_key="finnhub-key",
             twelve_data_api_key="twelve-key",
             alpha_vantage_api_key="alpha-key",
         )
@@ -83,7 +86,12 @@ async def test_listed_routes_use_all_quote_sources_but_only_alpaca_dividends() -
         for symbol in LISTED_SYMBOLS:
             assert tuple(
                 type(provider) for provider in graph.router.providers_for(symbol, Capability.QUOTE)
-            ) == (AlpacaProvider, TwelveDataProvider, AlphaVantageProvider)
+            ) == (
+                AlpacaProvider,
+                FinnhubProvider,
+                TwelveDataProvider,
+                AlphaVantageProvider,
+            )
             assert tuple(
                 type(provider)
                 for provider in graph.router.providers_for(symbol, Capability.HISTORY)

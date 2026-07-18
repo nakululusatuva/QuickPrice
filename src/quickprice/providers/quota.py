@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -137,8 +138,46 @@ class QuotaBudget:
             )
 
 
+class SlidingWindowRateGate:
+    """Async sliding-window burst limiter for short upstream rate limits."""
+
+    def __init__(
+        self,
+        limit: int,
+        period_seconds: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if limit <= 0 or period_seconds <= 0:
+            raise ValueError("limit and period_seconds must be positive")
+        self.limit = limit
+        self.period_seconds = float(period_seconds)
+        self._clock = clock
+        self._sleeper = sleeper
+        self._events: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = self._clock()
+                cutoff = now - self.period_seconds
+                while self._events and self._events[0] <= cutoff:
+                    self._events.popleft()
+                if len(self._events) < self.limit:
+                    self._events.append(now)
+                    return
+                delay = max(0.0, self._events[0] + self.period_seconds - now)
+            await self._sleeper(delay)
+
+
 def daily_budget(limit: int, *, reserve: int = 0) -> QuotaBudget:
     return QuotaBudget(limit, 86_400, reserve=reserve)
+
+
+def minute_budget(limit: int) -> QuotaBudget:
+    return QuotaBudget(limit, 60)
 
 
 def rolling_month_safe_daily_budget(limit: int) -> QuotaBudget:

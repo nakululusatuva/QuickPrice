@@ -17,6 +17,7 @@ from quickprice.providers.base import (
 )
 from quickprice.providers.binance import BinanceProvider
 from quickprice.providers.coingecko import CoinGeckoProvider
+from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fred import FredProvider
 from quickprice.providers.kraken import KrakenProvider
 from quickprice.providers.twelve_data import TwelveDataProvider
@@ -419,6 +420,223 @@ async def test_alpaca_stream_trade_does_not_claim_market_clock_status():
 
     assert streamed.market_status == "unknown"
     assert streamed.market_status_as_of is None
+
+
+@pytest.mark.asyncio
+async def test_finnhub_quote_uses_header_auth_and_normalizes_trade(fixture_json):
+    vendor_time = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
+    provider = FinnhubProvider("secret-finnhub-key")
+    provider._request_json = AsyncMock(return_value=fixture_json("finnhub_quote.json"))
+
+    result = await provider.get_quote("qqqm:usd")
+
+    assert result.symbol == "QQQM:USD"
+    assert result.price == Decimal("245.18")
+    assert result.as_of == vendor_time
+    assert result.provider == "finnhub"
+    assert result.feed == "finnhub_rest"
+    assert result.price_basis == "last_trade"
+    assert result.market_status == "unknown"
+    assert result.market_status_as_of is None
+    assert result.license_scope == "personal_internal_no_redistribution"
+    assert result.coverage == "us_realtime_unspecified"
+
+    call = provider._request_json.await_args
+    assert call.args == ("GET", "https://api.finnhub.io/api/v1/quote")
+    assert call.kwargs["params"] == {"symbol": "QQQM"}
+    assert call.kwargs["headers"] == {"X-Finnhub-Token": "secret-finnhub-key"}
+    assert "secret-finnhub-key" not in call.args[1]
+    assert "token" not in call.kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_finnhub_rejects_a_non_positive_vendor_timestamp(fixture_json):
+    payload = fixture_json("finnhub_quote.json")
+    payload["t"] = 0
+    provider = FinnhubProvider("key")
+    provider._request_json = AsyncMock(return_value=payload)
+
+    with pytest.raises(ProviderUnavailable, match="no current quote data"):
+        await provider.get_quote("QQQM:USD")
+
+
+@pytest.mark.asyncio
+async def test_finnhub_rejects_an_unmapped_instrument_before_request():
+    provider = FinnhubProvider("key")
+    provider._request_json = AsyncMock()
+
+    with pytest.raises(UnsupportedInstrument, match="unsupported symbol"):
+        await provider.get_quote("PRIVATE:USD")
+
+    provider._request_json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finnhub_all_zero_quote_fails_closed():
+    provider = FinnhubProvider("key")
+    provider._request_json = AsyncMock(
+        return_value={"c": 0, "d": None, "dp": None, "h": 0, "l": 0, "o": 0, "pc": 0}
+    )
+
+    with pytest.raises(ProviderUnavailable, match="quote"):
+        await provider.get_quote("QQQM:USD")
+
+
+@pytest.mark.asyncio
+async def test_finnhub_rest_error_does_not_echo_the_vendor_message():
+    provider = FinnhubProvider("secret-finnhub-key")
+    provider._request_json = AsyncMock(return_value={"error": "Invalid API key secret-finnhub-key"})
+
+    with pytest.raises(ProviderUnavailable) as error:
+        await provider.get_quote("QQQM:USD")
+
+    rendered = str(error.value)
+    assert "secret-finnhub-key" not in rendered
+    assert "Invalid API key" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"c": "not-a-price", "t": 1784561400},
+        {"c": "245.18"},
+        {"t": 1784561400},
+    ],
+)
+async def test_finnhub_malformed_quote_is_rejected(payload):
+    provider = FinnhubProvider("key")
+    provider._request_json = AsyncMock(return_value=payload)
+
+    with pytest.raises(MalformedResponse):
+        await provider.get_quote("QQQM:USD")
+
+
+@pytest.mark.asyncio
+async def test_finnhub_stream_subscribes_once_and_normalizes_millisecond_trades():
+    class FakeMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        @staticmethod
+        def json():
+            return {
+                "type": "trade",
+                "data": [
+                    {
+                        "p": "245.19",
+                        "s": "QQQM",
+                        "t": 1784561400123,
+                        "v": "10",
+                    }
+                ],
+            }
+
+    class FakeWebsocket:
+        def __init__(self):
+            self.messages = iter((FakeMessage(),))
+            self.sent = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class FakeSession:
+        def __init__(self):
+            self.websocket = FakeWebsocket()
+            self.connection = None
+
+        def ws_connect(self, *args, **kwargs):
+            self.connection = (args, kwargs)
+            return self.websocket
+
+    session = FakeSession()
+    provider = FinnhubProvider("secret-finnhub-key", session=session)
+
+    stream = provider.stream_quotes(("QQQM:USD", "AAPL:USD", "QQQM:USD"))
+    result = await anext(stream)
+    await stream.aclose()
+
+    assert session.connection is not None
+    args, kwargs = session.connection
+    assert args == ("wss://ws.finnhub.io",)
+    assert kwargs["params"] == {"token": "secret-finnhub-key"}
+    assert session.websocket.sent == [
+        {"type": "subscribe", "symbol": "QQQM"},
+        {"type": "subscribe", "symbol": "AAPL"},
+    ]
+    assert result.symbol == "QQQM:USD"
+    assert result.price == Decimal("245.19")
+    assert result.as_of == datetime(2026, 7, 20, 15, 30, 0, 123000, tzinfo=UTC)
+    assert result.feed == "finnhub_websocket"
+    assert result.price_basis == "last_trade"
+    assert result.market_status == "unknown"
+    assert result.market_status_as_of is None
+    assert result.license_scope == "personal_internal_no_redistribution"
+    assert result.coverage == "us_realtime_unspecified"
+
+
+@pytest.mark.asyncio
+async def test_finnhub_stream_error_fails_without_echoing_vendor_message_or_key():
+    class FakeMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        @staticmethod
+        def json():
+            return {
+                "type": "error",
+                "msg": "Invalid API key secret-finnhub-key",
+            }
+
+    class FakeWebsocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def send_json(self, payload):
+            del payload
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if hasattr(self, "delivered"):
+                raise StopAsyncIteration
+            self.delivered = True
+            return FakeMessage()
+
+    class FakeSession:
+        @staticmethod
+        def ws_connect(*args, **kwargs):
+            del args, kwargs
+            return FakeWebsocket()
+
+    provider = FinnhubProvider("secret-finnhub-key", session=FakeSession())
+    stream = provider.stream_quotes(("QQQM:USD",))
+
+    with pytest.raises(ProviderUnavailable) as error:
+        await anext(stream)
+    await stream.aclose()
+
+    rendered = str(error.value)
+    assert "secret-finnhub-key" not in rendered
+    assert "Invalid API key" not in rendered
 
 
 @pytest.mark.asyncio

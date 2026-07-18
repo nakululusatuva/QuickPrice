@@ -15,6 +15,7 @@ def test_provider_credentials_load_from_explicit_file(monkeypatch, tmp_path: Pat
 QUICKPRICE_ALPACA_API_KEY='alpaca-key'
 QUICKPRICE_ALPACA_API_SECRET=alpaca-secret
 QUICKPRICE_ETHEREUM_RPC_URLS="https://rpc-one.invalid, https://rpc-two.invalid"
+QUICKPRICE_FINNHUB_API_KEY=finnhub-key
 QUICKPRICE_TWELVE_DATA_API_KEY=twelve-key
 """,
         encoding="utf-8",
@@ -27,6 +28,7 @@ QUICKPRICE_TWELVE_DATA_API_KEY=twelve-key
 
     assert settings.alpaca_api_key == "alpaca-key"
     assert settings.alpaca_api_secret == "alpaca-secret"
+    assert settings.finnhub_api_key == "finnhub-key"
     assert settings.twelve_data_api_key == "twelve-key"
     assert settings.ethereum_rpc_urls == (
         "https://rpc-one.invalid",
@@ -116,6 +118,23 @@ def test_alpaca_trading_clock_defaults_to_paper_and_is_configurable(monkeypatch)
         " https://clock.example.invalid/v2 ",
     )
     assert Settings.from_env().alpaca_trading_base_url == "https://clock.example.invalid/v2"
+
+
+def test_finnhub_key_and_minute_quota_are_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("FINNHUB_API_KEY", " legacy-finnhub-key ")
+    monkeypatch.setenv("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", "42")
+
+    settings = Settings.from_env()
+
+    assert settings.finnhub_api_key == "legacy-finnhub-key"
+    assert settings.finnhub_calls_per_minute == 42
+
+
+def test_finnhub_minute_quota_must_be_positive(monkeypatch) -> None:
+    monkeypatch.setenv("QUICKPRICE_FINNHUB_CALLS_PER_MINUTE", "0")
+
+    with pytest.raises(ValueError, match="must be >= 1"):
+        Settings.from_env()
 
 
 @pytest.mark.parametrize(

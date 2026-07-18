@@ -13,6 +13,7 @@ from quickprice.plugin_api import (
 from quickprice.providers.alpaca import AlpacaProvider
 from quickprice.providers.base import Capability
 from quickprice.providers.coingecko import CoinGeckoProvider
+from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
@@ -170,6 +171,29 @@ async def test_default_twelve_quota_reserves_fx_budget() -> None:
         exhausted = await quota.snapshot()
         assert exhausted.used == 790
         assert exhausted.remaining == 0
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_finnhub_is_quote_only_with_configurable_minute_quota() -> None:
+    graph = build_provider_graph(
+        Settings(
+            require_free_threaded=False,
+            background_enabled=False,
+            finnhub_api_key="finnhub-key",
+            finnhub_calls_per_minute=47,
+        )
+    )
+    try:
+        provider = graph.providers["finnhub"]
+
+        assert isinstance(provider, FinnhubProvider)
+        assert graph.router.providers_for("QQQM:USD", Capability.QUOTE) == (provider,)
+        assert graph.router.providers_for("QQQM:USD", Capability.HISTORY) == ()
+        snapshot = await provider.quota.snapshot()
+        assert snapshot.limit == 47
+        assert provider.quota.period_seconds == 60
     finally:
         await graph.close()
 

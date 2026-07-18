@@ -19,10 +19,11 @@ from .alpha_vantage import AlphaVantageProvider
 from .base import Capability
 from .binance import BinanceProvider
 from .coingecko import CoinGeckoProvider
+from .finnhub import FinnhubProvider
 from .fred import FredProvider
 from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from .kraken import KrakenProvider
-from .quota import daily_budget, rolling_month_safe_daily_budget
+from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
 from .router import ProviderRouter
 from .staking import (
     STETH_MARKET_RATIO_SPEC,
@@ -172,6 +173,12 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             settings.alpaca_api_secret,
             trading_base_url=settings.alpaca_trading_base_url,
         )
+    finnhub = None
+    if settings.finnhub_api_key:
+        finnhub = providers["finnhub"] = FinnhubProvider(
+            settings.finnhub_api_key,
+            quota=minute_budget(settings.finnhub_calls_per_minute),
+        )
     twelve = None
     if settings.twelve_data_api_key:
         twelve = providers["twelve_data"] = TwelveDataProvider(
@@ -194,10 +201,14 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
         )
 
     for symbol in LISTED_SYMBOLS:
-        chain = [provider for provider in (alpaca, twelve, alpha) if provider is not None]
-        if chain:
-            router.register(symbol, Capability.QUOTE, chain)
-            router.register(symbol, Capability.HISTORY, chain)
+        quote_chain = [
+            provider for provider in (alpaca, finnhub, twelve, alpha) if provider is not None
+        ]
+        history_chain = [provider for provider in (alpaca, twelve, alpha) if provider is not None]
+        if quote_chain:
+            router.register(symbol, Capability.QUOTE, quote_chain)
+        if history_chain:
+            router.register(symbol, Capability.HISTORY, history_chain)
 
     # Keep only classified Alpaca events in annualization routes. Alpha Vantage
     # is excluded because its dividend feed cannot reliably distinguish every

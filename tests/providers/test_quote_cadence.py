@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from quickprice.equities import LISTED_SYMBOLS
 from quickprice.providers.alpha_vantage import AlphaVantageProvider
 from quickprice.providers.base import ProviderUnavailable
+from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxQuoteProvider
 from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.registry import INSTRUMENTS
@@ -24,6 +26,33 @@ class VirtualClock:
 
     def now(self) -> datetime:
         return self.origin + timedelta(seconds=self.seconds)
+
+
+@pytest.mark.asyncio
+async def test_finnhub_rest_cache_keeps_the_listed_catalog_below_the_minute_limit() -> None:
+    clock = VirtualClock()
+    calls = 0
+    provider = FinnhubProvider(
+        "key",
+        quote_cache_clock=clock.monotonic,
+    )
+
+    async def request_json(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        await asyncio.sleep(0)
+        return {"c": "100", "t": int(clock.now().timestamp())}
+
+    provider._request_json = request_json
+
+    for seconds in range(0, 60, 5):
+        clock.seconds = float(seconds)
+        await asyncio.gather(*(provider.get_quote(symbol) for symbol in LISTED_SYMBOLS))
+
+    assert provider.minimum_quote_poll_seconds == 20
+    assert calls == len(LISTED_SYMBOLS) * 3
+    assert calls == 39 < 60
 
 
 def test_coingecko_staking_cadence_fits_the_rolling_month_safe_daily_budget() -> None:

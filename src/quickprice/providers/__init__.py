@@ -23,6 +23,7 @@ from .base import (
 )
 from .binance import BinanceProvider
 from .coingecko import CoinGeckoProvider
+from .finnhub import FinnhubProvider
 from .fred import FredProvider
 from .kraken import KrakenProvider
 from .router import ProviderRouter
@@ -62,6 +63,7 @@ __all__ = [
     "DividendProvider",
     "EthereumExchangeRateSpec",
     "EthereumExchangeRateYieldProvider",
+    "FinnhubProvider",
     "FredProvider",
     "HistoryProvider",
     "KrakenProvider",

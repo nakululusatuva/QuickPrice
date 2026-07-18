@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -325,6 +326,127 @@ def test_unknown_market_status_is_conservatively_closed_outside_equity_hours(mon
     )
     normalized = coordinator._normalize_market_status(quote)
     assert normalized.market_status == "closed"
+
+
+@pytest.mark.asyncio
+async def test_finnhub_quote_uses_live_quota_safe_cadence_instead_of_daily_fallback(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    monkeypatch.setattr(
+        collectors,
+        "utc_now",
+        lambda: datetime(2026, 7, 20, 15, 30, tzinfo=UTC),
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            require_free_threaded=False,
+            background_enabled=False,
+            finnhub_api_key="finnhub-key",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["finnhub"]
+        provider._request_json = AsyncMock(return_value={"c": "245.18", "t": 1784561400})
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == provider.minimum_quote_poll_seconds == 20
+        assert coordinator._pending["QQQM:USD"].provider == "finnhub"
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_finnhub_fresh_stream_suppresses_rest_polling(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            require_free_threaded=False,
+            background_enabled=False,
+            finnhub_api_key="finnhub-key",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["finnhub"]
+        provider._request_json = AsyncMock()
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(provider), "QQQM:USD")] = 99.0
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == provider.minimum_quote_poll_seconds == 20
+        provider._request_json.assert_not_awaited()
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_finnhub_stale_stream_observation_allows_rest_fallback(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    monkeypatch.setattr(
+        collectors,
+        "utc_now",
+        lambda: datetime(2026, 7, 20, 15, 30, tzinfo=UTC),
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            require_free_threaded=False,
+            background_enabled=False,
+            finnhub_api_key="finnhub-key",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["finnhub"]
+        provider._request_json = AsyncMock(return_value={"c": "245.18", "t": 1784561400})
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 221.0)
+        coordinator._stream_observed_at[(id(provider), "QQQM:USD")] = 100.0
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == provider.minimum_quote_poll_seconds == 20
+        provider._request_json.assert_awaited_once()
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_finnhub_closed_market_rest_polling_is_reduced(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    monkeypatch.setattr(
+        collectors,
+        "utc_now",
+        lambda: datetime(2026, 7, 19, 16, tzinfo=UTC),
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(
+            production=False,
+            require_free_threaded=False,
+            background_enabled=False,
+            finnhub_api_key="finnhub-key",
+        ),
+    )
+    try:
+        provider = coordinator.graph.providers["finnhub"]
+        provider._request_json = AsyncMock(return_value={"c": "245.18", "t": 1784318400})
+
+        next_interval = await coordinator._poll_quote_once("QQQM:USD")
+
+        assert next_interval == provider.closed_market_quote_poll_seconds == 900
+        assert coordinator._pending["QQQM:USD"].market_status == "closed"
+    finally:
+        await coordinator.graph.close()
 
 
 @pytest.mark.asyncio

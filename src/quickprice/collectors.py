@@ -103,6 +103,7 @@ class MarketDataCoordinator:
         self._last_errors: dict[str, dict[str, Any]] = {}
         self._quota_snapshots: dict[str, dict[str, Any]] = {}
         self._websocket_reconnects: dict[str, int] = {}
+        self._stream_observed_at: dict[tuple[int, str], float] = {}
         self._checkpoint_state: dict[tuple[str, str], dict[str, str]] = {}
         self._equity_history_fallback_at: dict[str, float] = {}
         self._next_fx_history_refresh_at = 0.0
@@ -286,13 +287,46 @@ class MarketDataCoordinator:
     async def _poll_quote_once(self, symbol: str) -> float:
         instrument = self.registry[symbol]
         next_interval = instrument.quote_poll_seconds
+        chain = self.router.providers_for(symbol, Capability.QUOTE)
+        primary_provider = chain[0] if chain else None
+        stream_suppression_seconds = min(
+            instrument.stale_after_seconds,
+            float(getattr(primary_provider, "stream_poll_suppression_seconds", 0.0)),
+        )
+        last_stream_observation = self._stream_observed_at.get((id(primary_provider), symbol))
+        if (
+            stream_suppression_seconds > 0
+            and last_stream_observation is not None
+            and time.monotonic() - last_stream_observation < stream_suppression_seconds
+        ):
+            return max(
+                next_interval,
+                float(getattr(primary_provider, "minimum_quote_poll_seconds", 0.0)),
+            )
         try:
             quote = self._normalize_market_status(await self.router.get_quote(symbol))
             self._queue_quote(quote)
             self._last_errors.pop(f"quote:{symbol}", None)
             if instrument.market_calendar is MarketCalendar.US_EQUITY:
-                if "alpaca" not in self.graph.providers or quote.provider != "alpaca":
+                selected_provider = self.graph.providers.get(quote.provider)
+                minimum_poll_seconds = getattr(
+                    selected_provider, "minimum_quote_poll_seconds", None
+                )
+                if minimum_poll_seconds is not None:
+                    next_interval = max(next_interval, float(minimum_poll_seconds))
+                elif "alpaca" not in self.graph.providers or quote.provider != "alpaca":
                     next_interval = max(next_interval, 24 * 60 * 60)
+                if quote.market_status == "closed":
+                    next_interval = max(
+                        next_interval,
+                        float(
+                            getattr(
+                                selected_provider,
+                                "closed_market_quote_poll_seconds",
+                                0.0,
+                            )
+                        ),
+                    )
             elif quote.provider == "coingecko":
                 next_interval = max(next_interval, 300.0)
             elif quote.provider == "kraken":
@@ -350,11 +384,20 @@ class MarketDataCoordinator:
                 async for quote in provider.stream_quotes(symbols):
                     delay = 1.0
                     if quote.symbol in self.registry:
+                        instrument = self.registry[quote.symbol]
+                        source_age = max(0.0, (utc_now() - quote.as_of).total_seconds())
+                        observation_key = (id(provider), quote.symbol)
+                        if source_age <= instrument.stale_after_seconds:
+                            self._stream_observed_at[observation_key] = time.monotonic()
+                        else:
+                            self._stream_observed_at.pop(observation_key, None)
                         self._queue_quote(quote)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._record_error(f"stream:{provider_name}", exc)
+            for symbol in symbols:
+                self._stream_observed_at.pop((id(provider), symbol), None)
             self._websocket_reconnects[provider_name] = (
                 self._websocket_reconnects.get(provider_name, 0) + 1
             )
