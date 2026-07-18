@@ -535,27 +535,84 @@ function yieldLabel(value) {
   return rateType;
 }
 
+function dividendExplanation(dividend) {
+  const frequency = textValue(dividend?.frequency) || "reported";
+  return `Annualized dividend yield. The latest regular cash dividend is projected using its ${frequency.toLowerCase()} payment frequency, then divided by the current price. This is an estimate, not a guaranteed return.`;
+}
+
+function yieldExplanation(value) {
+  const rateType = textValue(value?.rate_type)?.toLowerCase();
+  const convention = rateType === "apy"
+    ? "APY includes the effect of compounding over one year."
+    : rateType === "apr"
+      ? "APR expresses a one-year rate without assuming compounding."
+      : "The figure is expressed as an estimated annual rate.";
+  const method = textValue(value?.method)?.toLowerCase() || "";
+  const accrualMode = textValue(value?.accrual_mode)?.toLowerCase() || "";
+  let calculation;
+  if (method === "latest_distribution_annualized") {
+    calculation = "It repeats the latest regular cash distribution over a full year and divides the result by the current price.";
+  } else if (method.includes("treasury_3m") || method.includes("expense")) {
+    calculation = "It uses the three-month US Treasury yield minus fund expenses as a proxy, rather than a yield published by the fund.";
+  } else if (method.includes("ratio") || method.includes("growth") || value?.observation_window_days) {
+    const window = Number.isFinite(value?.observation_window_days)
+      ? ` over the most recent ${value.observation_window_days}-day observation window`
+      : " over a recent observation window";
+    calculation = `It annualizes the change in the token-to-underlying conversion ratio${window}. Short observation windows can produce unstable estimates.`;
+  } else if (value?.is_proxy) {
+    calculation = "It is derived from a related market input because a direct issuer or protocol rate was unavailable.";
+  } else if (value?.is_estimate) {
+    calculation = "It is an estimated forward rate based on the latest available provider observation.";
+  } else {
+    calculation = "It is the latest annual rate reported by the named provider.";
+  }
+  let rewards = "";
+  if (accrualMode === "value_accruing") rewards = " Rewards normally accrue by increasing how much underlying asset each token represents, while the token count stays unchanged.";
+  else if (accrualMode === "rebasing_balance") rewards = " Rewards normally accrue by increasing the number of tokens held; the token price does not need to rise for rewards to be earned.";
+  else if (accrualMode === "distributed_units") rewards = " Rewards are normally delivered as additional token units.";
+  else if (accrualMode === "claimable_rewards") rewards = " Rewards normally accumulate separately until claimed.";
+  const provider = textValue(value?.provider);
+  const source = provider ? ` Source: ${provider}.` : "";
+  return `${convention} ${calculation}${rewards}${source} This is not a guaranteed return.`;
+}
+
 function incomeCell(item) {
   const cell = document.createElement("td");
   const dividend = item.quote?.dividend;
   const annualYield = item.quote?.estimated_annual_yield;
+  const explanations = [];
   if (dividend) {
+    const label = textNode("small", `Dividend - ${dividend.frequency}`, "income-label has-help");
+    const explanation = dividendExplanation(dividend);
+    label.title = explanation;
+    explanations.push(explanation);
     cell.append(
       textNode("strong", incomePercent(dividend.yield_percent), "income-value"),
-      textNode("small", `Dividend - ${dividend.frequency}`, "income-label"),
+      label,
     );
   }
   if (annualYield) {
-    const label = textNode("small", yieldLabel(annualYield), "income-label");
+    const label = textNode("small", yieldLabel(annualYield), "income-label has-help");
     if (annualYield.is_proxy) label.classList.add("is-proxy");
     else if (annualYield.is_estimate) label.classList.add("is-estimate");
-    label.title = `${annualYield.provider || "Unknown provider"} - ${annualYield.method || "Unspecified method"}`;
+    const explanation = yieldExplanation(annualYield);
+    label.title = explanation;
+    explanations.push(explanation);
     cell.append(
       textNode("strong", incomePercent(annualYield.percent), "income-value"),
       label,
     );
   }
   if (!dividend && !annualYield) cell.append(textNode("span", "-", "value-empty"));
+  if (explanations.length) {
+    cell.title = explanations.join("\n\n");
+    const displayedRates = [
+      dividend ? `Dividend ${incomePercent(dividend.yield_percent)}` : null,
+      annualYield ? `${yieldLabel(annualYield)} ${incomePercent(annualYield.percent)}` : null,
+    ].filter(Boolean).join(". ");
+    cell.tabIndex = 0;
+    cell.setAttribute("aria-label", `${displayedRates}. ${explanations.join(" ")}`);
+  }
   return cell;
 }
 

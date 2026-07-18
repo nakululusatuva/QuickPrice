@@ -25,6 +25,7 @@
     </nav>
     <div class="header-actions">
       <span id="connection-badge" class="status-badge status-neutral">Not connected</span>
+      <a class="button button-secondary admin-link" href="/admin">Administration</a>
       <button id="theme-toggle" class="icon-button" type="button" aria-label="Toggle color theme">Theme</button>
     </div>
   </header>
@@ -43,13 +44,13 @@
         </div>
       </div>
 
-      <form id="credential-form" class="credential-panel">
+      <form id="credential-form" class="credential-panel" method="post" action="/dashboard" autocomplete="off">
         <div>
           <label for="api-key">API key</label>
           <p>Held in this tab's session storage only.</p>
         </div>
         <div class="credential-input">
-          <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Enter your QuickPrice API key" required>
+          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Enter your QuickPrice API key" required>
           <button class="button button-primary" type="submit">Connect</button>
           <button id="forget-key" class="button button-secondary" type="button">Forget</button>
         </div>

@@ -59,6 +59,7 @@ def test_dashboard_shell_is_public_and_hardened(client, path: str) -> None:
     assert 'href="/dashboard/assets/dashboard.css"' in response.text
     assert 'src="/dashboard/assets/dashboard.js"' in response.text
     assert 'autocomplete="off"' in response.text
+    assert 'method="post" action="/dashboard"' in response.text
     assert 'autocomplete="current-password"' not in response.text
     assert "<canvas" not in response.text.lower()
     assert 'id="fixture-warning"' in response.text

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -20,19 +21,32 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
+from .admin_api import install_admin_routes
+from .admin_security import AdminRateLimitError, AdminSecurity
+from .api_keys import ApiKeyManager
 from .auth import AuthenticationError, Authenticator, RateLimitError
 from .config import Settings
 from .dashboard_logs import DashboardLogBroker, DashboardLogCapacityError
 from .domain import utc_now
+from .managed_config import (
+    InstrumentPolicyStore,
+    ManagedEnvironmentStore,
+    ProviderKeyStore,
+    build_managed_registry,
+)
 from .registry import InstrumentRegistry, build_registry, normalize_symbol
 from .schemas import EnvelopeModel, ErrorModel, instrument_to_wire
 from .service import DataUnavailableError, QuickPriceService
 
 _LOGGER = logging.getLogger(__name__)
 _DASHBOARD_ROOT = Path(__file__).with_name("dashboard")
+_ADMIN_ROOT = Path(__file__).with_name("admin")
 _LOG_STREAM_PATH = "/internal/logs/stream"
+_ADMIN_BODY_LIMIT = 64 * 1024
 _CONTENT_SECURITY_POLICY = "; ".join(
     (
         "default-src 'self'",
@@ -67,6 +81,118 @@ class APIError(Exception):
         self.headers = headers or {}
 
 
+class _AdminRequestBodyTooLarge(RuntimeError):
+    pass
+
+
+class _AdminRequestGuardMiddleware:
+    """Rate-limit and cap admin requests before JSON parsing or validation."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum_bytes: int,
+        security: AdminSecurity,
+    ) -> None:
+        self.app = app
+        self.maximum_bytes = maximum_bytes
+        self.security = security
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path", ""))
+        method = str(scope.get("method", "GET")).upper()
+        if scope["type"] != "http" or not path.startswith("/admin-api/"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers", ())}
+        peer = scope.get("client")
+        peer_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        forwarded_ip = headers.get(b"x-real-ip")
+        try:
+            self.security.throttle_browser_request(
+                self.security.resolve_client_ip(
+                    peer_ip,
+                    forwarded_ip.decode("ascii", errors="ignore") if forwarded_ip else None,
+                )
+            )
+        except AdminRateLimitError as exc:
+            await self._error(
+                scope,
+                receive,
+                send,
+                status_code=429,
+                code="admin_rate_limited",
+                message="administrator request rate limit exceeded",
+                retry_after=exc.retry_after,
+            )
+            return
+
+        if method in {"GET", "HEAD", "OPTIONS"}:
+            await self.app(scope, receive, send)
+            return
+
+        raw_length = headers.get(b"content-length")
+        if b"transfer-encoding" in headers:
+            await self._body_too_large(scope, receive, send)
+            return
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                await self._body_too_large(scope, receive, send)
+                return
+            if content_length < 0 or content_length > self.maximum_bytes:
+                await self._body_too_large(scope, receive, send)
+                return
+
+        received = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.maximum_bytes:
+                    raise _AdminRequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _AdminRequestBodyTooLarge:
+            await self._body_too_large(scope, receive, send)
+
+    @staticmethod
+    async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+        await _AdminRequestGuardMiddleware._error(
+            scope,
+            receive,
+            send,
+            status_code=413,
+            code="request_too_large",
+            message="administrator request body exceeds the safe limit",
+        )
+
+    @staticmethod
+    async def _error(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        retry_after: int | None = None,
+    ) -> None:
+        response = JSONResponse(
+            {"error": {"code": code, "message": message}},
+            status_code=status_code,
+            headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
+        )
+        await response(scope, receive, send)
+
+
 def _request_id() -> str:
     return str(uuid.uuid7())
 
@@ -74,6 +200,8 @@ def _request_id() -> str:
 def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
     return (
         *settings.api_key_hashes,
+        settings.admin_key_verifier,
+        settings.admin_totp_secret,
         settings.alpaca_api_key,
         settings.alpaca_api_secret,
         settings.twelve_data_api_key,
@@ -83,6 +211,9 @@ def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
         settings.fred_api_key,
         settings.binance_api_key,
         settings.binance_api_secret,
+        settings.okx_api_key,
+        settings.okx_api_secret,
+        settings.okx_api_passphrase,
         settings.provider_proxy_url,
         *settings.ethereum_rpc_urls,
     )
@@ -112,15 +243,38 @@ def create_app(
     registry: InstrumentRegistry | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
+    admin_catalog: InstrumentRegistry
     if service is not None:
         if registry is not None and registry is not service.registry:
             raise ValueError("the API registry must match the service registry")
         registry = service.registry
+        admin_catalog = registry
     else:
         if registry is None:
-            registry = build_registry(settings.enabled_plugins)
+            registry = build_managed_registry(settings)
+            admin_catalog = build_registry(settings.enabled_plugins)
+        else:
+            admin_catalog = registry
         service = QuickPriceService(settings, registry)
-    authenticator = Authenticator(settings)
+    api_key_manager = ApiKeyManager(settings.api_key_hashes)
+    authenticator = Authenticator(settings, api_key_manager)
+    service.bind_api_key_state(lambda: authenticator.configured)
+    admin_security = AdminSecurity(
+        key_verifier=settings.admin_key_verifier,
+        totp_secret=settings.admin_totp_secret,
+        expected_origin=settings.admin_origin,
+        require_https=settings.admin_require_https,
+        idle_seconds=settings.admin_session_idle_seconds,
+        absolute_seconds=settings.admin_session_absolute_seconds,
+        production=settings.production,
+        trusted_proxy_ips=settings.admin_trusted_proxy_ips,
+    )
+    managed_configuration = ManagedEnvironmentStore(settings.managed_config_path, settings)
+    managed_provider_keys = ProviderKeyStore(settings.managed_provider_keys_path)
+    managed_instruments = InstrumentPolicyStore(
+        settings.managed_instruments_path,
+        admin_catalog,
+    )
     dashboard_logs = DashboardLogBroker(
         max_subscribers=settings.dashboard_max_log_streams,
         redacted_values=_dashboard_redacted_values(settings),
@@ -138,6 +292,7 @@ def create_app(
             _LOGGER.info("QuickPrice startup initiated")
             try:
                 await service.start()
+                await api_key_manager.start(service.storage)
             except Exception as exc:
                 _LOGGER.error("QuickPrice startup failed error_type=%s", type(exc).__name__)
                 raise
@@ -167,10 +322,29 @@ def create_app(
         openapi_url="/openapi.json" if settings.docs_enabled else None,
         lifespan=lifespan,
     )
+    app.add_middleware(
+        _AdminRequestGuardMiddleware,
+        maximum_bytes=_ADMIN_BODY_LIMIT,
+        security=admin_security,
+    )
+    if settings.admin_origin:
+        admin_hostname = urlsplit(settings.admin_origin).hostname
+        if not admin_hostname:
+            raise ValueError("QUICKPRICE_ADMIN_ORIGIN must contain a valid hostname")
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=[admin_hostname],
+            www_redirect=False,
+        )
     app.state.settings = settings
     app.state.service = service
     app.state.registry = registry
     app.state.authenticator = authenticator
+    app.state.api_key_manager = api_key_manager
+    app.state.admin_security = admin_security
+    app.state.managed_configuration = managed_configuration
+    app.state.managed_provider_keys = managed_provider_keys
+    app.state.managed_instruments = managed_instruments
     app.state.dashboard_logs = dashboard_logs
     readiness_cache: tuple[float, bool, dict[str, Any]] | None = None
 
@@ -193,8 +367,11 @@ def create_app(
             or path.startswith("/v1/")
             or path == "/internal"
             or path.startswith("/internal/")
-        ):
-            client_ip = request.client.host if request.client else "unknown"
+        ) and response is None:
+            client_ip = admin_security.resolve_client_ip(
+                request.client.host if request.client else None,
+                request.headers.get("X-Real-IP"),
+            )
             try:
                 authenticator.authenticate(request.headers.get("X-API-Key"), client_ip)
             except RateLimitError as exc:
@@ -246,6 +423,10 @@ def create_app(
         response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=()"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
+        if path == "/admin" or path.startswith("/admin/") or path.startswith("/admin-api/"):
+            response.headers["Vary"] = "Origin, Sec-Fetch-Site"
+        if settings.production:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
         return response
 
     @app.exception_handler(APIError)
@@ -304,6 +485,7 @@ def create_app(
         return JSONResponse(content, status_code=500)
 
     dashboard_html = (_DASHBOARD_ROOT / "index.html").read_text(encoding="utf-8")
+    admin_html = (_ADMIN_ROOT / "index.html").read_text(encoding="utf-8")
 
     @app.get("/", response_class=RedirectResponse, include_in_schema=False)
     async def root() -> RedirectResponse:
@@ -325,6 +507,22 @@ def create_app(
     async def dashboard_script() -> FileResponse:
         return FileResponse(
             _DASHBOARD_ROOT / "assets" / "dashboard.js",
+            media_type="text/javascript",
+        )
+
+    @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/admin/", response_class=HTMLResponse, include_in_schema=False)
+    async def admin_dashboard() -> HTMLResponse:
+        return HTMLResponse(admin_html)
+
+    @app.get("/admin/assets/admin.css", include_in_schema=False)
+    async def admin_stylesheet() -> FileResponse:
+        return FileResponse(_ADMIN_ROOT / "assets" / "admin.css", media_type="text/css")
+
+    @app.get("/admin/assets/admin.js", include_in_schema=False)
+    async def admin_script() -> FileResponse:
+        return FileResponse(
+            _ADMIN_ROOT / "assets" / "admin.js",
             media_type="text/javascript",
         )
 
@@ -463,6 +661,16 @@ def create_app(
             request,
             data=[instrument_to_wire(item).model_dump(mode="json") for item in registry.values()],
         )
+
+    install_admin_routes(
+        app,
+        security=admin_security,
+        api_keys=api_key_manager,
+        configuration=managed_configuration,
+        provider_keys=managed_provider_keys,
+        instruments=managed_instruments,
+        service=service,
+    )
 
     @app.get("/v1/quotes")
     async def quotes(

@@ -10,6 +10,8 @@ dist/
 build/
 *.egg-info/
 .env
+admin-auth.env
+quickprice.env
 provider-keys.env
 provider-keys.*.env
 data/

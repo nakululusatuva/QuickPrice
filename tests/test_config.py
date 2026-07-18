@@ -109,6 +109,18 @@ def test_dashboard_log_stream_limit_is_configurable_and_positive(monkeypatch) ->
         Settings.from_env()
 
 
+def test_admin_trusted_proxies_require_explicit_ip_addresses(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS",
+        " 127.0.0.1,::1,127.0.0.1 ",
+    )
+    assert Settings.from_env().admin_trusted_proxy_ips == ("127.0.0.1", "::1")
+
+    monkeypatch.setenv("QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS", "localhost")
+    with pytest.raises(ValueError, match="explicit IP addresses"):
+        Settings.from_env()
+
+
 def test_alpaca_trading_clock_defaults_to_paper_and_is_configurable(monkeypatch) -> None:
     monkeypatch.delenv("QUICKPRICE_ALPACA_TRADING_BASE_URL", raising=False)
     assert Settings.from_env().alpaca_trading_base_url == ("https://paper-api.alpaca.markets/v2")

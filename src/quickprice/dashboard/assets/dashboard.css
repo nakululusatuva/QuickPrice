@@ -278,6 +278,12 @@ a:focus-visible {
   background: var(--surface-muted);
 }
 
+.admin-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
 .button.compact {
   align-self: end;
   min-height: 36px;
@@ -757,6 +763,12 @@ a:focus-visible {
   display: block;
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.income-label.has-help {
+  width: fit-content;
+  border-bottom: 1px dotted currentColor;
+  cursor: help;
 }
 
 .income-label.is-proxy {

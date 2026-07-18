@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,9 @@ _PROVIDER_SECRET_NAMES: Final[frozenset[str]] = frozenset(
         "QUICKPRICE_ETHEREUM_RPC_URLS",
         "QUICKPRICE_FRED_API_KEY",
         "QUICKPRICE_FINNHUB_API_KEY",
+        "QUICKPRICE_OKX_API_KEY",
+        "QUICKPRICE_OKX_API_PASSPHRASE",
+        "QUICKPRICE_OKX_API_SECRET",
         "QUICKPRICE_TWELVE_DATA_API_KEY",
     }
 )
@@ -91,6 +95,22 @@ def _float(name: str, default: float, *, minimum: float = 0) -> float:
     return value
 
 
+def _ip_addresses(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "")
+    values: list[str] = []
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            normalized = str(ipaddress.ip_address(candidate))
+        except ValueError as exc:
+            raise ValueError(f"{name} must contain only explicit IP addresses") from exc
+        if normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
 def _provider_proxy_configuration() -> tuple[str | None, tuple[str, ...]]:
     raw_url = os.getenv("QUICKPRICE_PROVIDER_PROXY_URL", "").strip()
     raw_names = os.getenv("QUICKPRICE_PROVIDER_PROXY_NAMES", "")
@@ -146,6 +166,20 @@ class Settings:
     background_enabled: bool = True
     database_path: Path = field(default_factory=lambda: Path("data/quickprice.db"))
     api_key_hashes: tuple[str, ...] = ()
+    admin_key_verifier: str | None = None
+    admin_totp_secret: str | None = None
+    admin_origin: str | None = None
+    admin_require_https: bool = True
+    admin_session_idle_seconds: int = 900
+    admin_session_absolute_seconds: int = 3600
+    admin_trusted_proxy_ips: tuple[str, ...] = ()
+    managed_config_path: Path = field(default_factory=lambda: Path("data/config/quickprice.env"))
+    managed_provider_keys_path: Path = field(
+        default_factory=lambda: Path("data/config/provider-keys.env")
+    )
+    managed_instruments_path: Path = field(
+        default_factory=lambda: Path("data/config/instruments.json")
+    )
     rate_limit_enabled: bool = True
     requests_per_minute: int = 120
     request_burst: int = 20
@@ -188,6 +222,9 @@ class Settings:
     ethereum_rpc_urls: tuple[str, ...] = ()
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
+    okx_api_key: str | None = None
+    okx_api_secret: str | None = None
+    okx_api_passphrase: str | None = None
     staking_yield_market_fallback_days: int = 30
     enabled_plugins: tuple[str, ...] = ()
 
@@ -216,6 +253,38 @@ class Settings:
             background_enabled=_bool("QUICKPRICE_BACKGROUND_ENABLED", True),
             database_path=Path(os.getenv("QUICKPRICE_DATABASE_PATH", "data/quickprice.db")),
             api_key_hashes=hashes,
+            admin_key_verifier=(os.getenv("QUICKPRICE_ADMIN_KEY_VERIFIER", "").strip() or None),
+            admin_totp_secret=(os.getenv("QUICKPRICE_ADMIN_TOTP_SECRET", "").strip() or None),
+            admin_origin=(os.getenv("QUICKPRICE_ADMIN_ORIGIN", "").strip() or None),
+            admin_require_https=_bool("QUICKPRICE_ADMIN_REQUIRE_HTTPS", True),
+            admin_session_idle_seconds=_int(
+                "QUICKPRICE_ADMIN_SESSION_IDLE_SECONDS", 900, minimum=300
+            ),
+            admin_session_absolute_seconds=_int(
+                "QUICKPRICE_ADMIN_SESSION_ABSOLUTE_SECONDS", 3600, minimum=900
+            ),
+            admin_trusted_proxy_ips=_ip_addresses("QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS"),
+            managed_config_path=Path(
+                os.getenv(
+                    "QUICKPRICE_MANAGED_CONFIG_FILE",
+                    "data/config/quickprice.env",
+                )
+            ),
+            managed_provider_keys_path=Path(
+                os.getenv(
+                    "QUICKPRICE_MANAGED_PROVIDER_KEYS_FILE",
+                    os.getenv(
+                        "QUICKPRICE_PROVIDER_KEYS_FILE",
+                        "data/config/provider-keys.env",
+                    ),
+                )
+            ),
+            managed_instruments_path=Path(
+                os.getenv(
+                    "QUICKPRICE_MANAGED_INSTRUMENTS_FILE",
+                    "data/config/instruments.json",
+                )
+            ),
             rate_limit_enabled=_bool("QUICKPRICE_RATE_LIMIT_ENABLED", True),
             requests_per_minute=_int("QUICKPRICE_REQUESTS_PER_MINUTE", 120, minimum=1),
             request_burst=_int("QUICKPRICE_REQUEST_BURST", 20, minimum=1),
@@ -288,6 +357,9 @@ class Settings:
             ethereum_rpc_urls=ethereum_rpc_urls,
             binance_api_key=_secret("QUICKPRICE_BINANCE_API_KEY", provider_key_values),
             binance_api_secret=_secret("QUICKPRICE_BINANCE_API_SECRET", provider_key_values),
+            okx_api_key=_secret("QUICKPRICE_OKX_API_KEY", provider_key_values),
+            okx_api_secret=_secret("QUICKPRICE_OKX_API_SECRET", provider_key_values),
+            okx_api_passphrase=_secret("QUICKPRICE_OKX_API_PASSPHRASE", provider_key_values),
             staking_yield_market_fallback_days=_int(
                 "QUICKPRICE_STAKING_YIELD_MARKET_FALLBACK_DAYS", 30, minimum=7
             ),

@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="QuickPrice secure administration console">
+  <title>QuickPrice Administration</title>
+  <link rel="stylesheet" href="/admin/assets/admin.css">
+  <script src="/admin/assets/admin.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">QP</span>
+        <div>
+          <strong>QuickPrice</strong>
+          <span>Administration console</span>
+        </div>
+      </div>
+      <div class="security-emblem" aria-hidden="true">
+        <span></span>
+      </div>
+      <p class="eyebrow">Restricted control plane</p>
+      <h1 id="login-title">Administrator verification</h1>
+      <p class="login-intro">Enter the dedicated administrator key and a current authenticator code. API keys cannot open this console.</p>
+
+      <form id="login-form" class="login-form" method="post" action="/admin" autocomplete="off">
+        <label>
+          <span>Administrator key</span>
+          <input id="admin-key" type="password" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label>
+          <span>Authenticator code</span>
+          <input id="totp" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required>
+        </label>
+        <button id="login-submit" class="button button-primary button-wide" type="submit">Verify and continue</button>
+      </form>
+      <p id="login-notice" class="notice" role="status" aria-live="polite">The console creates a short-lived, server-side session. Credentials are never stored by this page.</p>
+      <div class="security-notes" aria-label="Session security">
+        <span>Two-factor authentication</span>
+        <span>Same-origin access</span>
+        <span>Audited changes</span>
+      </div>
+      <a class="back-link" href="/dashboard">Return to market dashboard</a>
+    </section>
+  </main>
+
+  <div id="console-view" class="console-shell" hidden>
+    <header class="app-header">
+      <div class="brand" aria-label="QuickPrice Administration">
+        <span class="brand-mark" aria-hidden="true">QP</span>
+        <div>
+          <strong>QuickPrice</strong>
+          <small>Administration</small>
+        </div>
+      </div>
+      <div class="header-context">
+        <span class="environment-badge">Private control plane</span>
+        <span id="session-expiry" class="session-expiry">Session active</span>
+        <button id="theme-toggle" class="button button-quiet" type="button">Dark mode</button>
+        <button id="logout-button" class="button button-secondary" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-label="Administration sections">
+        <p class="sidebar-label">Management</p>
+        <nav class="admin-tabs" role="tablist" aria-orientation="vertical">
+          <button id="api-keys-tab" class="admin-tab is-active" type="button" role="tab" data-panel="api-keys" aria-selected="true" aria-controls="api-keys-panel">
+            <span class="tab-icon" aria-hidden="true">AK</span><span>API keys</span>
+          </button>
+          <button id="provider-keys-tab" class="admin-tab" type="button" role="tab" data-panel="provider-keys" aria-selected="false" aria-controls="provider-keys-panel" tabindex="-1">
+            <span class="tab-icon" aria-hidden="true">PK</span><span>Provider keys</span>
+          </button>
+          <button id="instruments-tab" class="admin-tab" type="button" role="tab" data-panel="instruments" aria-selected="false" aria-controls="instruments-panel" tabindex="-1">
+            <span class="tab-icon" aria-hidden="true">IN</span><span>Instruments</span>
+          </button>
+          <button id="configuration-tab" class="admin-tab" type="button" role="tab" data-panel="configuration" aria-selected="false" aria-controls="configuration-panel" tabindex="-1">
+            <span class="tab-icon" aria-hidden="true">CF</span><span>Configuration</span>
+          </button>
+          <button id="provider-statistics-tab" class="admin-tab" type="button" role="tab" data-panel="provider-statistics" aria-selected="false" aria-controls="provider-statistics-panel" tabindex="-1">
+            <span class="tab-icon" aria-hidden="true">ST</span><span>Provider statistics</span>
+          </button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div><strong>Authenticated</strong><small>Changes are audited</small></div>
+        </div>
+      </aside>
+
+      <main id="main-content" class="admin-main">
+        <div id="global-notice" class="toast" role="status" aria-live="polite" hidden></div>
+
+        <section id="api-keys-panel" class="admin-panel" role="tabpanel" aria-labelledby="api-keys-tab">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Client access</p>
+              <h1>API keys</h1>
+              <p>Issue, expire, and revoke credentials used by Excel and API clients.</p>
+            </div>
+            <div class="heading-actions">
+              <button id="import-api-keys" class="button button-secondary" type="button">Import keys</button>
+              <button id="create-api-key" class="button button-primary" type="button">Create API key</button>
+            </div>
+          </div>
+          <div class="summary-strip" aria-label="API key summary">
+            <article><span>Active</span><strong id="key-active-count">0</strong></article>
+            <article><span>Expiring soon</span><strong id="key-expiring-count">0</strong></article>
+            <article><span>Expired or revoked</span><strong id="key-inactive-count">0</strong></article>
+          </div>
+          <section class="data-card" aria-label="Managed API keys">
+            <div class="card-toolbar">
+              <label class="search-field"><span>Search</span><input id="api-key-search" type="search" placeholder="Name, identifier, or key hint"></label>
+              <button id="refresh-api-keys" class="button button-quiet" type="button">Refresh</button>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th scope="col">Name</th><th scope="col">Key hint</th><th scope="col">Created</th><th scope="col">Expires</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                <tbody id="api-keys-body"></tbody>
+              </table>
+            </div>
+            <div id="api-keys-empty" class="empty-state" hidden>No API keys match the current view.</div>
+          </section>
+        </section>
+
+        <section id="provider-keys-panel" class="admin-panel" role="tabpanel" aria-labelledby="provider-keys-tab" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Secret inventory</p>
+              <h1>Provider keys</h1>
+              <p>Replace provider credentials without exposing their stored values.</p>
+            </div>
+            <button id="refresh-provider-keys" class="button button-quiet" type="button">Refresh status</button>
+          </div>
+          <aside class="security-banner">
+            <strong>Write-only secret handling</strong>
+            <p>Existing values are never returned to the browser. A replacement becomes effective after the indicated restart or reload.</p>
+          </aside>
+          <section class="data-card" aria-label="Provider key status">
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th scope="col">Provider</th><th scope="col">Credential</th><th scope="col">Status</th><th scope="col">Replacement value</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                <tbody id="provider-keys-body"></tbody>
+              </table>
+            </div>
+            <div id="provider-keys-empty" class="empty-state" hidden>No managed provider credentials are available.</div>
+          </section>
+        </section>
+
+        <section id="instruments-panel" class="admin-panel" role="tabpanel" aria-labelledby="instruments-tab" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Market coverage</p>
+              <h1>Instruments</h1>
+              <p>Enable or disable instruments installed by trusted provider plugins.</p>
+            </div>
+            <div class="heading-actions">
+              <button id="refresh-instruments" class="button button-quiet" type="button">Refresh</button>
+              <button id="save-instruments" class="button button-primary" type="button" disabled>Save changes</button>
+            </div>
+          </div>
+          <aside class="info-banner">
+            <strong>Trusted definitions only</strong>
+            <p>This console cannot install arbitrary code or create unreviewed provider routes. Add new instrument definitions through a signed or locally reviewed plugin, then enable them here.</p>
+          </aside>
+          <section class="data-card" aria-label="Installed instruments">
+            <div class="card-toolbar">
+              <label class="search-field"><span>Search</span><input id="instrument-search" type="search" placeholder="Symbol, name, class, or provider"></label>
+              <label><span>State</span><select id="instrument-filter"><option value="">All instruments</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th scope="col">Instrument</th><th scope="col">Classification</th><th scope="col">Provider route</th><th scope="col">State</th></tr></thead>
+                <tbody id="instruments-body"></tbody>
+              </table>
+            </div>
+            <div id="instruments-empty" class="empty-state" hidden>No instruments match the current view.</div>
+          </section>
+        </section>
+
+        <section id="configuration-panel" class="admin-panel" role="tabpanel" aria-labelledby="configuration-tab" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Runtime policy</p>
+              <h1>Configuration</h1>
+              <p>Edit validated QuickPrice settings. Security-critical settings remain outside web administration.</p>
+            </div>
+            <div class="heading-actions">
+              <button id="reset-configuration" class="button button-secondary" type="button" disabled>Discard changes</button>
+              <button id="save-configuration" class="button button-primary" type="button" disabled>Save configuration</button>
+            </div>
+          </div>
+          <aside id="restart-banner" class="warning-banner" hidden>
+            <strong>Restart required</strong>
+            <p>Saved values differ from the running process. Restart QuickPrice through the host's normal service manager when convenient.</p>
+          </aside>
+          <form id="configuration-form" class="settings-grid" method="post" action="/admin" autocomplete="off"></form>
+          <div id="configuration-empty" class="empty-state" hidden>No web-editable settings are exposed by this server.</div>
+        </section>
+
+        <section id="provider-statistics-panel" class="admin-panel" role="tabpanel" aria-labelledby="provider-statistics-tab" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Operational intelligence</p>
+              <h1>Provider statistics</h1>
+              <p>Operation results, recent response time, stream health, fallback behavior, and locally accounted quota usage.</p>
+            </div>
+            <div class="heading-actions">
+              <span id="statistics-updated" class="updated-label">Not loaded</span>
+              <button id="refresh-statistics" class="button button-primary" type="button">Refresh</button>
+            </div>
+          </div>
+          <div class="stats-grid" aria-label="Provider summary">
+            <article><span>Requests</span><strong id="stats-requests">0</strong><small>Observed operations</small></article>
+            <article><span>Operation success</span><strong id="stats-success-rate">-</strong><small>Across provider operations</small></article>
+            <article><span>Slowest P95</span><strong id="stats-p95">-</strong><small>Recent provider samples</small></article>
+            <article><span>Fallbacks</span><strong id="stats-fallbacks">0</strong><small>Alternate routes used</small></article>
+          </div>
+          <section class="data-card" aria-label="Provider performance">
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th scope="col">Provider</th><th scope="col">Operation result</th><th scope="col">Operations</th><th scope="col">P50 / P95</th><th scope="col">Local quota</th><th scope="col">Fallbacks</th><th scope="col">Circuit</th><th scope="col">Last outcome</th></tr></thead>
+                <tbody id="provider-statistics-body"></tbody>
+              </table>
+            </div>
+            <div id="provider-statistics-empty" class="empty-state" hidden>No provider telemetry has been observed since startup.</div>
+          </section>
+          <section class="audit-card" aria-labelledby="audit-title">
+            <div class="card-toolbar"><div><p class="eyebrow">Security record</p><h2 id="audit-title">Recent administration events</h2></div><button id="refresh-audit" class="button button-quiet" type="button">Refresh</button></div>
+            <ol id="audit-events" class="audit-list"></ol>
+            <div id="audit-empty" class="empty-state" hidden>No administration events are available.</div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="create-key-dialog" aria-labelledby="create-key-title">
+    <form id="create-key-form" class="dialog-card" method="post" action="/admin" autocomplete="off">
+      <div class="dialog-heading"><div><p class="eyebrow">New client credential</p><h2 id="create-key-title">Create API key</h2></div><button class="dialog-close" type="button" data-close-dialog="create-key-dialog" aria-label="Close">&times;</button></div>
+      <label><span>Name</span><input id="new-key-name" type="text" maxlength="100" autocomplete="off" placeholder="Excel workstation" required></label>
+      <label><span>Expiration <small>optional</small></span><input id="new-key-expiry" type="datetime-local"></label>
+      <p class="field-help">The complete key is displayed once after creation. QuickPrice stores only its cryptographic hash.</p>
+      <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="create-key-dialog">Cancel</button><button class="button button-primary" type="submit">Create key</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="import-keys-dialog" aria-labelledby="import-keys-title">
+    <form id="import-keys-form" class="dialog-card dialog-wide" method="post" action="/admin" autocomplete="off">
+      <div class="dialog-heading"><div><p class="eyebrow">Controlled migration</p><h2 id="import-keys-title">Import API keys</h2></div><button class="dialog-close" type="button" data-close-dialog="import-keys-dialog" aria-label="Close">&times;</button></div>
+      <label><span>JSON key records</span><textarea id="import-keys-json" rows="10" autocomplete="off" spellcheck="false" placeholder='[{"name":"Excel workstation","api_key":"qp_...","expires_at":"2027-01-01T00:00:00Z"}]' required></textarea></label>
+      <p class="field-help">Each record requires <code>name</code> and <code>api_key</code>. <code>expires_at</code> may be omitted or set to <code>null</code>. Plaintext exists only for this request.</p>
+      <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="import-keys-dialog">Cancel</button><button class="button button-primary" type="submit">Import keys</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="reveal-key-dialog" aria-labelledby="reveal-key-title">
+    <div class="dialog-card">
+      <div class="dialog-heading"><div><p class="eyebrow">One-time disclosure</p><h2 id="reveal-key-title">Save this API key now</h2></div></div>
+      <p>The full value cannot be recovered after this dialog closes.</p>
+      <div class="secret-reveal"><code id="revealed-api-key"></code><button id="copy-api-key" class="button button-secondary" type="button">Copy</button></div>
+      <p id="copy-key-status" class="field-help" role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="close-reveal-key" class="button button-primary" type="button">I have saved the key</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <div class="dialog-card">
+      <div class="dialog-heading"><div><p class="eyebrow">Confirmation required</p><h2 id="confirm-title">Confirm change</h2></div></div>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions"><button id="confirm-cancel" class="button button-secondary" type="button">Cancel</button><button id="confirm-accept" class="button button-danger" type="button">Confirm</button></div>
+    </div>
+  </dialog>
+</body>
+</html>
