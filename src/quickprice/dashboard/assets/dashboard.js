@@ -260,6 +260,11 @@ function changePercent(item, windowName) {
   return finiteNumber(item.quote?.changes?.[windowName]?.percent);
 }
 
+function incomeSortPercent(item) {
+  if (item.quote?.dividend) return finiteNumber(item.quote.dividend.yield_percent);
+  return finiteNumber(item.quote?.estimated_annual_yield?.percent);
+}
+
 function marketStatus(item) {
   return textValue(item.quote?.market_status)?.toLowerCase() ?? "unavailable";
 }
@@ -280,6 +285,7 @@ const SORT_FIELDS = Object.freeze({
   "1w": { kind: "number", read: (item) => changePercent(item, "1w") },
   "1m": { kind: "number", read: (item) => changePercent(item, "1mo") },
   "1y": { kind: "number", read: (item) => changePercent(item, "1y") },
+  income: { kind: "number", read: incomeSortPercent },
   market: {
     kind: "market",
     read: marketStatus,

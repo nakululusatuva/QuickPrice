@@ -219,6 +219,7 @@ def test_dashboard_sort_controls_offer_all_fields_and_accessible_headers(client)
         "1w",
         "1m",
         "1y",
+        "income",
         "market",
         "source",
     ]
@@ -634,7 +635,7 @@ function order(items, field, ascending) {
 }
 
 const expectedFields = [
-  "instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "market", "source",
+  "instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "income", "market", "source",
 ];
 assertEqual(Object.keys(SORT_FIELDS), expectedFields, "sort field registry");
 
@@ -684,6 +685,31 @@ for (const field of ["1h", "4h", "1d", "1w", "1m", "1y"]) {
     `${field} desc with missing last`,
   );
 }
+
+const income = [
+  row("DIVIDEND", { dividend: { yield_percent: 5 } }),
+  row("ANNUAL", { estimated_annual_yield: { percent: 3 } }),
+  row("BOTH", {
+    dividend: { yield_percent: 1 },
+    estimated_annual_yield: { percent: 9 },
+  }),
+  row("ZERO", { estimated_annual_yield: { percent: 0 } }),
+  row("INVALID", {
+    dividend: { yield_percent: Number.NaN },
+    estimated_annual_yield: { percent: 8 },
+  }),
+  row("MISSING"),
+];
+assertEqual(
+  order(income, "income", true),
+  ["ZERO", "BOTH", "ANNUAL", "DIVIDEND", "INVALID", "MISSING"],
+  "income asc with visible dividend precedence and missing last",
+);
+assertEqual(
+  order(income, "income", false),
+  ["DIVIDEND", "ANNUAL", "BOTH", "ZERO", "INVALID", "MISSING"],
+  "income desc with visible dividend precedence and missing last",
+);
 
 const markets = [
   row("UNKNOWN", { market_status: "unknown", as_of: "2026-07-20T08:00:00Z" }),
@@ -778,7 +804,9 @@ function sortHeader(field) {
   };
 }
 
-const fields = ["instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "market", "source"];
+const fields = [
+  "instrument", "price", "1h", "4h", "1d", "1w", "1m", "1y", "income", "market", "source",
+];
 const headers = fields.map(sortHeader);
 const ui = {
   sortField: { value: "" },
@@ -840,7 +868,7 @@ function assertCondition(condition, label) {
   if (!condition) throw new Error(label);
 }
 
-const SORT_FIELDS = { instrument: {}, price: {}, market: {} };
+const SORT_FIELDS = { instrument: {}, price: {}, income: {}, market: {} };
 const state = {
   sortField: "instrument",
   ascending: false,
@@ -856,10 +884,12 @@ assertCondition(state.sortField === "price", "new field is selected");
 assertCondition(state.ascending === true, "new field starts ascending");
 selectSortField("price", { toggleIfActive: true });
 assertCondition(state.ascending === false, "active header toggles direction");
+selectSortField("income", { toggleIfActive: true });
+assertCondition(state.sortField === "income" && state.ascending, "income starts ascending");
 selectSortField("market", { toggleIfActive: true });
 assertCondition(state.sortField === "market" && state.ascending, "new header starts ascending");
 selectSortField("unsupported", { toggleIfActive: true });
-assertCondition(controlUpdates === 3 && renders === 3, "unsupported fields are ignored");
+assertCondition(controlUpdates === 4 && renders === 4, "unsupported fields are ignored");
 assertCondition(
   [...state.expandedSymbols].join() === "BTC:USDC,ETH:USDC",
   "sorting preserves expanded instruments",
