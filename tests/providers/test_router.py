@@ -195,13 +195,22 @@ async def test_singleflight_merges_concurrent_identical_calls():
 async def test_cancelled_only_waiter_does_not_leave_orphaned_flight():
     provider = ScriptedProvider("one", [fixed_quote("one")], delay=0.02)
     router = ProviderRouter({("BTC:USDC", Capability.QUOTE): [provider]})
+    cleanup_finished = asyncio.Event()
+    original_cleanup = router._cleanup_flight
+
+    async def observed_cleanup(key, task):
+        await original_cleanup(key, task)
+        cleanup_finished.set()
+
+    router._cleanup_flight = observed_cleanup
     waiter = asyncio.create_task(router.get_quote("BTC:USDC"))
     await asyncio.sleep(0)
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
 
-    await asyncio.sleep(0.03)
+    async with asyncio.timeout(1):
+        await cleanup_finished.wait()
 
     assert router._flights == {}
 
