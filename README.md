@@ -51,13 +51,13 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in plugin contains 53 canonical instruments. Additional trusted
+The built-in plugin contains 54 canonical instruments. Additional trusted
 plugins can extend the catalog without modifying the application core.
 
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
 | Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC`, `POL:USDC`, `BNB:USDC`, `TRX:USDC` | `crypto / spot_crypto` | None |
-| Liquid staking | `WBETH:USDC`, `STETH:USDC`, `WSTETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
+| Liquid staking | `WBETH:USDC`, `BETH:USDC`, `STETH:USDC`, `WSTETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
 | Common stock | `AAPL:USD`, `MSFT:USD`, `GOOGL:USD`, `META:USD`, `NVDA:USD` | `equity / common_stock` | Latest regular quarterly cash dividend |
 | Common stock | `AMZN:USD`, `TSLA:USD`, `SPCX:USD`, `MSTR:USD`, `CRCL:USD` | `equity / common_stock` | No current regular dividend; returns `null` |
 | Equity ETF | `QQQM:USD` | `equity / equity_etf` | Latest regular cash dividend |
@@ -124,6 +124,12 @@ Income calculations are explicit:
   fallback's daily exchange-rate event remains current for 36 hours: one normal
   24-hour publication interval plus 12 hours of scheduling and RPC/indexing
   grace.
+- BETH uses OKX's public 30-day ETH staking rate history and selects the latest
+  provider-reported annualized rate. OKX distributes rewards as additional
+  BETH units, so QuickPrice reports `rate_type=apr` and
+  `reward_accrual_mode=distributed_units`. It deliberately has no market-ratio
+  yield fallback because a price ratio does not measure separately distributed
+  units.
 - stETH and wstETH use Lido's protocol APR as the primary yield source, with a
   trailing token-to-ETH market-ratio estimate as the final fallback.
 
@@ -272,6 +278,10 @@ The default route families are:
 - WBETH: Binance synthetic routes, then CoinGecko normalization for quotes;
   Binance synthetic routes for history; signed Binance APR, on-chain exchange-
   rate APY, then the declared 30-day market-ratio proxy for yield.
+- BETH: same-venue OKX `BETH/ETH * ETH/USDC`, then
+  `BETH/USDT / USDC/USDT`; CoinGecko is the final price/history fallback. Yield
+  uses only OKX's provider-reported ETH staking rate, while SQLite can retain
+  the last successful metric with explicit stale metadata during an outage.
 - stETH and wstETH: CoinGecko price normalization, Lido protocol yield, then
   the declared 30-day market-ratio yield fallback.
 - Common-stock and ETF quotes: Alpaca IEX, Finnhub, Twelve Data, then Alpha
@@ -316,22 +326,33 @@ route when a tighter service level is required.
 configuration template, not an automatically loaded dotenv file. Supply those
 values through the process environment or the host service manager.
 
-Provider credentials have a separate lifecycle:
+Provider credentials have a separate, write-only lifecycle:
 
-1. Copy [provider-keys.env.example](provider-keys.env.example) to
-   `provider-keys.env` or another protected path.
+1. Copy [provider-keys.env.example](provider-keys.env.example) to a protected
+   path for initial bootstrap, or enter replacements in `/admin` after the
+   administrator control plane is configured.
 2. Keep the populated file outside version control. The repository ignores
    `provider-keys.env` and `provider-keys.*.env`.
 3. For direct Windows, macOS, or Linux runs, set
    `QUICKPRICE_PROVIDER_KEYS_FILE` to its path.
-4. The supplied systemd unit reads `/etc/quickprice/provider-keys.env` as a
-   second `EnvironmentFile`.
+4. The supplied systemd unit points QuickPrice at
+   `/var/lib/quickprice/config/provider-keys.env`. The file is owned by the
+   unprivileged service account and is never interpreted by a shell.
 
 The file format is UTF-8 `NAME=VALUE`, with blank lines, full-line comments,
 and optional single or double quotes. It performs no shell expansion. Only
 recognized provider credential names are accepted. Process environment values
 override file values, which allows a service manager or CI secret store to
 replace individual credentials without editing the file.
+
+The administrator API never returns provider values. It reports only
+configured/unconfigured state and whether a value is externally managed.
+Replacements are schema-checked, written with an atomic mode-0600 replacement,
+and become active after a host-managed service restart. A process environment
+value remains authoritative and deliberately cannot be overwritten in the UI.
+Network destinations, including `QUICKPRICE_ETHEREUM_RPC_URLS`, remain
+host-managed even when stored in the same protected file; the web console does
+not expose or modify them.
 
 Provider egress can use an explicit HTTP CONNECT proxy without changing the
 inbound reverse proxy. Set `QUICKPRICE_PROVIDER_PROXY_URL` to proxy every REST
@@ -344,9 +365,12 @@ names include `binance`, `kraken`, `coingecko`, `binance_wbeth_rate`,
 secret even though local unauthenticated proxy addresses normally belong in
 the non-secret application configuration.
 
-`QUICKPRICE_API_KEY_HASHES` remains in application configuration because it is
-the service's client-authentication state, not a market-data provider secret.
-Generate a raw key and its stored hash with:
+`QUICKPRICE_API_KEY_HASHES` is a one-time compatibility bootstrap. On the first
+schema-v2 start, its hashes are imported into SQLite and a durable bootstrap
+marker prevents later environment changes from silently adding credentials.
+After bootstrap, create, import, expire, or revoke client keys in `/admin`.
+Generated raw keys are displayed once and only SHA-256 digests are retained.
+For an initial client key, generate a raw value and stored digest with:
 
 ```bash
 quickprice hash-key --generate
@@ -354,6 +378,66 @@ quickprice hash-key --generate
 
 Store only the `sha256:<hex>` value on the server. Keep the raw key in the Excel
 credential store or a password manager.
+
+## Secure administration
+
+`/admin` is a separate control plane. Quote API keys cannot authorize any
+administrator endpoint. Bootstrap administrator credentials only from a local
+terminal on the host or another trusted workstation:
+
+```bash
+quickprice admin-credentials --origin https://quickprice.example.com
+```
+
+The command generates a 256-bit administrator key, an scrypt verifier, a
+160-bit TOTP seed, and an `otpauth://` enrollment URI. Save the raw key in a
+password manager, enroll the TOTP seed immediately, and place only the emitted
+`QUICKPRICE_ADMIN_*` configuration values in the root-controlled
+`/etc/quickprice/admin-auth.env`; [admin-auth.env.example](admin-auth.env.example)
+documents the boundary without containing usable credentials. The web UI
+cannot read or change this file.
+
+Successful verification creates an opaque process-local session. The browser
+receives only a `Secure`, `HttpOnly`, `SameSite=Strict`, path-root cookie and an
+in-memory synchronizer token. Administrator mutations require the token,
+`application/json`, the exact configured origin, and a same-origin Fetch
+context. Sessions have 15-minute idle and one-hour absolute defaults, are
+bounded in memory, and disappear on restart. Login and mutation budgets are
+rate-limited independently. A pre-parse guard also rate-limits every admin API
+request, rejects chunked mutation bodies, and enforces the 64 KiB body limit
+without trusting `Content-Length`. TOTP codes cannot be replayed within the
+running process.
+
+`quickprice serve` disables Uvicorn's implicit forwarding-header trust.
+QuickPrice accepts `X-Real-IP` and `X-Forwarded-Proto` only from exact addresses
+listed in the root-controlled `QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS` setting. The
+supplied loopback Nginx/systemd layout explicitly trusts `127.0.0.1`; direct
+application deployments should leave the list empty.
+
+The control plane deliberately exposes only bounded operations:
+
+- client API-key creation, import, expiry changes, and immediate revocation;
+- write-only provider credential replacement and clearing;
+- enable/disable and safe cadence settings for already installed instruments;
+- an allowlist of non-secret runtime and provider-routing settings;
+- redacted audit events and in-memory provider availability, latency,
+  fallback, circuit, stream, and locally accounted credit statistics.
+
+Provider success is an operation-result rate, not a claim about exchange
+uptime. Provider-operation counts and upstream HTTP samples remain separate;
+the headline count uses operations only. Stream connection state and reconnects
+are reported independently. P50/P95 values use at most the latest 2,048 samples
+per provider surface, local quota snapshots refresh every 60 seconds, and the
+response includes the quota observation time. Locally reserved credits are not
+provider billing statements.
+
+It cannot install plugins, import Python objects, edit arbitrary files, choose
+arbitrary provider/RPC destinations, execute commands, modify Nginx/systemd,
+or restart itself. Configuration and catalog changes are revisioned and show a
+restart-required state; use the host's normal service manager to apply them.
+For a public deployment, place an identity-aware proxy, mTLS, VPN, or strict IP
+policy in front of `/admin` as a second boundary. TOTP is strong protection
+against a stolen administrator key but is not phishing-resistant.
 
 ## Extending the catalog
 
@@ -422,13 +506,17 @@ The supplied Linux service layout is:
 ```text
 /opt/quickprice                         application and virtual environment
 /etc/quickprice/quickprice.env          non-secret runtime configuration
-/etc/quickprice/provider-keys.env       provider credentials
-/var/lib/quickprice                     SQLite database and backups
+/etc/quickprice/admin-auth.env          root-controlled administrator factors
+/var/lib/quickprice/config/quickprice.env       web-managed allowlisted settings
+/var/lib/quickprice/config/provider-keys.env    web-managed provider credentials
+/var/lib/quickprice/config/instruments.json     declarative instrument policy
+/var/lib/quickprice                     SQLite database, configuration, backups
 /etc/systemd/system/quickprice.service  application service unit
 ```
 
 [deploy/systemd/quickprice.service](deploy/systemd/quickprice.service) binds
-the application to `127.0.0.1:8080` and loads both configuration files. Install
+the application to `127.0.0.1:8080`, loads root-controlled launch and
+administrator configuration, and grants writes only below `/var/lib/quickprice`. Install
 these assets through the host's normal configuration-management workflow; the
 repository does not prescribe account, firewall, DNS, or certificate tooling.
 
@@ -437,8 +525,16 @@ repository does not prescribe account, firewall, DNS, or certificate tooling.
 The selected HTTP server must:
 
 - terminate HTTPS and forward to `http://127.0.0.1:8080` over HTTP/1.1;
+- preserve the exact public host and `X-Forwarded-Proto`, and overwrite rather
+  than append client-controlled forwarding headers; list the proxy's exact
+  peer address in `QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS`;
+- restore the real visitor address only through an explicitly trusted proxy
+  chain; when using Cloudflare, maintain its published address allowlist and
+  block direct origin bypass;
 - preserve the method, path, query, and `X-API-Key` request header;
 - avoid shared caching of authenticated responses;
+- cap administrator request bodies at 64 KiB and never cache `/admin` or
+  `/admin-api/*`;
 - redact `X-API-Key` and credential-like query parameters from access logs;
 - apply appropriate request-header, body, upstream, and idle timeouts;
 - stream `/internal/logs/stream` without response buffering, transformation,

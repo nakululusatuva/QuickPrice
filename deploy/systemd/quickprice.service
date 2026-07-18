@@ -9,7 +9,13 @@ User=quickprice
 Group=quickprice
 WorkingDirectory=/opt/quickprice
 EnvironmentFile=/etc/quickprice/quickprice.env
-EnvironmentFile=/etc/quickprice/provider-keys.env
+EnvironmentFile=/etc/quickprice/admin-auth.env
+EnvironmentFile=-/var/lib/quickprice/config/quickprice.env
+Environment=QUICKPRICE_MANAGED_CONFIG_FILE=/var/lib/quickprice/config/quickprice.env
+Environment=QUICKPRICE_PROVIDER_KEYS_FILE=/var/lib/quickprice/config/provider-keys.env
+Environment=QUICKPRICE_MANAGED_PROVIDER_KEYS_FILE=/var/lib/quickprice/config/provider-keys.env
+Environment=QUICKPRICE_MANAGED_INSTRUMENTS_FILE=/var/lib/quickprice/config/instruments.json
+Environment=QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS=127.0.0.1
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/quickprice/.venv/bin/quickprice serve --host 127.0.0.1 --port 8080

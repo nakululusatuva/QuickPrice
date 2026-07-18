@@ -124,13 +124,16 @@ jobs:
         run: |
           git check-ignore --quiet provider-keys.env
           git check-ignore --quiet provider-keys.production.env
+          git check-ignore --quiet admin-auth.env
+          git check-ignore --quiet quickprice.env
           test -f provider-keys.env.example
+          test -f admin-auth.env.example
           test -f examples/reverse-proxy/nginx.conf
           test -f examples/reverse-proxy/Caddyfile
           QUICKPRICE_PROVIDER_KEYS_FILE=provider-keys.env.example \
             uv run --frozen --python 3.14.6 python -c \
             "from quickprice.config import Settings; Settings.from_env()"
-          if grep -Eq '^QUICKPRICE_(ALPACA_API_KEY|ALPACA_API_SECRET|FINNHUB_API_KEY|TWELVE_DATA_API_KEY|ALPHA_VANTAGE_API_KEY|COINGECKO_API_KEY|FRED_API_KEY|ETHEREUM_RPC_URLS|BINANCE_API_KEY|BINANCE_API_SECRET)=' .env.example; then
+          if grep -Eq '^QUICKPRICE_(ALPACA_API_KEY|ALPACA_API_SECRET|FINNHUB_API_KEY|TWELVE_DATA_API_KEY|ALPHA_VANTAGE_API_KEY|COINGECKO_API_KEY|FRED_API_KEY|ETHEREUM_RPC_URLS|BINANCE_API_KEY|BINANCE_API_SECRET|OKX_API_KEY|OKX_API_SECRET|OKX_API_PASSPHRASE)=' .env.example; then
             echo "provider credentials must not be declared in .env.example"
             exit 1
           fi
