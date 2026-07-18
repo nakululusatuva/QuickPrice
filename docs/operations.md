@@ -207,7 +207,8 @@ market proxy rather than a protocol-reported rate.
 ### Provider quota exhausted
 
 - Do not rotate keys to bypass a free plan.
-- Twelve Data reserves its final credits for FX components.
+- Twelve Data protects 769 of its 790 daily credits for FX: 744 hub quotes plus
+  25 cold-start history pages. The remaining 21 credits fund listed-security fallback.
 - Alpha FX uses a six-hour emergency cadence.
 - CoinGecko uses one all-symbol request no more than every five minutes.
 - Binance staking fallback uses only a read-only USER_DATA key.

@@ -52,13 +52,15 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in plugin contains 38 canonical instruments. Additional trusted
+The built-in plugin contains 50 canonical instruments. Additional trusted
 plugins can extend the catalog without modifying the application core.
 
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
-| Spot crypto | `BTC:USDC`, `ETH:USDC` | `crypto / spot_crypto` | None |
+| Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC` | `crypto / spot_crypto` | None |
 | Liquid staking | `WBETH:USDC`, `STETH:USDC`, `WSTETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
+| Common stock | `AAPL:USD`, `MSFT:USD`, `GOOGL:USD`, `META:USD`, `NVDA:USD` | `equity / common_stock` | Latest regular quarterly cash dividend |
+| Common stock | `AMZN:USD`, `TSLA:USD`, `SPCX:USD`, `MSTR:USD`, `CRCL:USD` | `equity / common_stock` | No current regular dividend; returns `null` |
 | Equity ETF | `QQQM:USD` | `equity / equity_etf` | Latest regular cash dividend |
 | Bond ETF | `BOXX:USD` | `bond / growth_bond_etf` | Treasury proxy minus expense ratio |
 | Bond ETF | `SGOV:USD` | `bond / income_bond_etf` | Latest distribution annualized |
@@ -66,6 +68,10 @@ plugins can extend the catalog without modifying the application core.
 
 The FX catalog includes all 30 ordered pairs: `USD:EUR` and `EUR:USD` are
 distinct instruments, as are every other base/counter direction.
+
+`SPCX:USD` identifies Nasdaq-listed SpaceX following its June 2026 listing. All
+common-stock symbols use USD quotes and the United States equity market
+calendar.
 
 Every instrument exposes a canonical `BASE:QUOTE` symbol, official English
 name, English description, asset class, asset type, price basis, market
@@ -104,6 +110,10 @@ last snapshot only when `quality.stale=true` discloses its age.
 Income calculations are explicit:
 
 - QQQM annualizes the latest ordinary cash dividend at quarterly frequency.
+- AAPL, MSFT, GOOGL, META, and NVDA annualize the latest ordinary quarterly cash
+  dividend. AMZN, TSLA, SPCX, MSTR, and CRCL return `dividend=null` because they
+  do not currently have a regular dividend policy; QuickPrice does not
+  fabricate a zero-yield distribution.
 - SGOV annualizes the latest ordinary monthly distribution. It is not labeled
   as a 30-Day SEC Yield.
 - BOXX uses FRED DGS3MO minus 0.1949 percentage points and identifies the result
@@ -138,7 +148,7 @@ deduplicated, and resolved through the active plugin registry.
 ```bash
 curl --get \
   --header "X-API-Key: ${QUICKPRICE_API_KEY}" \
-  --data-urlencode 'symbols=BTC:USDC,WSTETH:USDC,QQQM:USD,EUR:GBP' \
+  --data-urlencode 'symbols=SOL:USDC,WSTETH:USDC,SPCX:USD,EUR:GBP' \
   https://price.example.com/v1/quotes
 ```
 
@@ -208,15 +218,21 @@ reconnect backoff.
 
 The default route families are:
 
-- BTC and ETH: Binance Spot, Kraken, then CoinGecko aggregated prices.
-- WBETH: Binance synthetic routes, then CoinGecko normalization.
+- BTC and ETH: Binance, Kraken, then CoinGecko for quotes; Binance then Kraken
+  for history.
+- SOL: Binance, Kraken, then CoinGecko for quotes; Binance then Kraken for
+  history.
+- XMR: Kraken then CoinGecko for quotes; Kraken for history.
+- WBETH: Binance synthetic routes, then CoinGecko normalization for quotes;
+  Binance synthetic routes for history.
 - stETH and wstETH: CoinGecko price normalization, Lido protocol yield, then
   the declared 30-day market-ratio yield fallback.
-- Equities and ETFs: Alpaca IEX, Twelve Data, then delayed Alpha Vantage data.
+- Common stocks and ETFs: Alpaca IEX, Twelve Data, then Alpha Vantage end-of-day
+  data.
 - FX: quota-bounded USD hub quotes and histories, with reciprocal and cross
   rates derived from common timestamped components.
-- QQQM and SGOV income: classified corporate actions and the last valid SQLite
-  event.
+- Dividend-paying common stocks, QQQM, and SGOV income: classified corporate
+  actions and the last valid SQLite event.
 - BOXX yield: FRED DGS3MO and the last valid SQLite metric.
 
 Synthetic responses expose every component timestamp. Components that exceed
