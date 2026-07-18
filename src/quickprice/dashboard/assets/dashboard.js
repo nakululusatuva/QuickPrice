@@ -5,6 +5,14 @@ const THEME_KEY = "quickprice-dashboard-theme";
 const REFRESH_INTERVAL_MS = 10_000;
 const LOG_LIMIT = 500;
 const LEVEL_WEIGHT = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+const FIXTURE_SOURCE_PATTERN = /(^|[^a-z0-9])fixture([^a-z0-9]|$)/i;
+
+function isFixtureSource(source) {
+  if (!source || typeof source !== "object") return false;
+  return [source.provider, source.feed].some(
+    (value) => typeof value === "string" && FIXTURE_SOURCE_PATTERN.test(value),
+  );
+}
 
 const state = {
   apiKey: sessionStorage.getItem(SESSION_KEY) || "",
@@ -44,6 +52,8 @@ const ui = {
   sortField: element("sort-field"),
   sortDirection: element("sort-direction"),
   refreshMarket: element("refresh-market"),
+  fixtureWarning: element("fixture-warning"),
+  fixtureWarningMessage: element("fixture-warning-message"),
   marketNotice: element("market-notice"),
   marketBody: element("market-body"),
   marketEmpty: element("market-empty"),
@@ -392,6 +402,16 @@ function updateSummary() {
   ui.stale.textContent = String(values.filter((item) => item.quote?.quality?.stale).length);
 }
 
+function updateFixtureWarning() {
+  const fixtureCount = [...state.quotes.values()].filter((quote) => isFixtureSource(quote.source)).length;
+  ui.fixtureWarning.hidden = fixtureCount === 0;
+  if (fixtureCount === 0) return;
+  const allQuotesAreFixtures = fixtureCount === state.quotes.size;
+  ui.fixtureWarningMessage.textContent = allQuotesAreFixtures
+    ? "All displayed prices are generated test fixtures, not live market data. Do not use them for trading, valuation, or financial decisions."
+    : `${fixtureCount} displayed ${fixtureCount === 1 ? "quote comes" : "quotes come"} from a test fixture and ${fixtureCount === 1 ? "is" : "are"} not live market data. Do not use fixture prices for trading, valuation, or financial decisions.`;
+}
+
 async function refreshQuotes() {
   if (!state.apiKey || state.refreshing || state.instruments.length === 0) return;
   state.refreshing = true;
@@ -421,6 +441,7 @@ async function refreshQuotes() {
       missing ? "neutral" : "success",
     );
     setBadge(ui.connectionBadge, missing ? "Partial" : "Connected", missing ? "warn" : "good");
+    updateFixtureWarning();
     updateSummary();
     renderMarket();
   } catch (error) {
@@ -485,6 +506,7 @@ function clearDashboardData() {
   renderMarket();
   renderLogs();
   ui.lastRefresh.textContent = "Never";
+  updateFixtureWarning();
   ui.pausedCount.textContent = "Live view";
   setNotice(ui.logNotice, "Connect with an API key to open the log stream.");
 }

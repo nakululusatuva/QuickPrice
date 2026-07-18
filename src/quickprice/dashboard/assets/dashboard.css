@@ -325,6 +325,44 @@ a:focus-visible {
   background: var(--negative-soft);
 }
 
+.fixture-warning {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 15px 18px;
+  color: var(--warning);
+  background: var(--warning-soft);
+  border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border));
+  border-left: 4px solid var(--warning);
+  border-radius: 11px;
+  box-shadow: 0 7px 22px rgb(20 36 58 / 5%);
+}
+
+.fixture-warning-label {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  color: var(--warning-soft);
+  background: var(--warning);
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  line-height: 1.4;
+}
+
+.fixture-warning strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.fixture-warning p {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 12px;
+}
+
 .page-shell {
   width: min(1680px, 100%);
   min-height: calc(100vh - 132px);
@@ -966,6 +1004,12 @@ a:focus-visible {
     align-items: flex-start;
     flex-direction: column;
     gap: 2px;
+  }
+
+  .fixture-warning {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
   }
 }
 

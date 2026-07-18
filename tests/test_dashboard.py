@@ -41,6 +41,11 @@ def test_dashboard_shell_is_public_and_hardened(client, path: str) -> None:
     assert 'autocomplete="off"' in response.text
     assert 'autocomplete="current-password"' not in response.text
     assert "<canvas" not in response.text.lower()
+    assert 'id="fixture-warning"' in response.text
+    assert 'role="alert"' in response.text
+    assert 'aria-live="assertive"' in response.text
+    assert "Non-live test fixture data" in response.text
+    assert "not live market data" in response.text
     _assert_security_headers(response)
 
 
@@ -52,6 +57,7 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert css.headers["content-type"].startswith("text/css")
     assert ".market-table" in css.text
     assert ".log-list" in css.text
+    assert ".fixture-warning" in css.text
     assert javascript.status_code == 200
     assert "javascript" in javascript.headers["content-type"]
     assert "sessionStorage.setItem(SESSION_KEY" in javascript.text
@@ -62,6 +68,12 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert '"X-API-Key"' in javascript.text
     assert 'headers["Last-Event-ID"]' in javascript.text
     assert "chunks(symbols, 100)" in javascript.text
+    assert "FIXTURE_SOURCE_PATTERN" in javascript.text
+    assert "isFixtureSource(quote.source)" in javascript.text
+    assert "updateFixtureWarning();" in javascript.text
+    assert "source.provider" in javascript.text
+    assert "source.feed" in javascript.text
+    assert "not live market data" in javascript.text
     assert "JSON.stringify({ instrument, quote, error: item.error }" in javascript.text
     assert "new EventSource" not in javascript.text
     assert "Chart(" not in javascript.text
@@ -251,6 +263,38 @@ def test_lifespan_attaches_and_removes_log_handler_and_request_logs_omit_queries
     messages = [event.message for event in broker.snapshot()]
     assert "QuickPrice shutdown initiated" in messages
     assert "QuickPrice shutdown complete" in messages
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_fixture_source_detection_uses_provider_or_feed() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    classifier = source[
+        source.index("const FIXTURE_SOURCE_PATTERN") : source.index("\n\nconst state =")
+    ]
+    assertions = """
+const cases = [
+  [null, false],
+  [{ provider: "fixture", feed: "fixture_feed" }, true],
+  [{ provider: "fixture_staking", feed: "derived" }, true],
+  [{ provider: "binance", feed: "fixture_feed" }, true],
+  [{ provider: "binance", feed: "spot" }, false],
+  [{ provider: "fixtureless", feed: "spot" }, false],
+];
+for (const [source, expected] of cases) {
+  if (isFixtureSource(source) !== expected) process.exit(1);
+}
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", classifier + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
