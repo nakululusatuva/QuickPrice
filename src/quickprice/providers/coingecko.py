@@ -47,6 +47,7 @@ class CoinGeckoProvider(HttpProvider):
         "BNB:USDC": "binancecoin",
         "TRX:USDC": "tron",
         "WBETH:USDC": "wrapped-beacon-eth",
+        "BETH:USDC": "okx-beth",
         "STETH:USDC": "staked-ether",
         "WSTETH:USDC": "wrapped-steth",
         "ETH:USD": "ethereum",
@@ -55,6 +56,7 @@ class CoinGeckoProvider(HttpProvider):
     }
     history_symbols: ClassVar[frozenset[str]] = frozenset(
         {
+            "BETH:USDC",
             "STETH:USDC",
             "WSTETH:USDC",
             "ETH:USD",
@@ -67,6 +69,7 @@ class CoinGeckoProvider(HttpProvider):
         # A sub-minute skew is expected and remains visible in ``components``;
         # applying the exchange-leg two-second policy here rejected valid data.
         "WBETH:USDC": timedelta(seconds=60),
+        "BETH:USDC": timedelta(seconds=60),
         "STETH:USDC": timedelta(seconds=60),
         "WSTETH:USDC": timedelta(seconds=60),
     }

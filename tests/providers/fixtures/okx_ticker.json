@@ -1,0 +1,17 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "instType": "SPOT",
+      "instId": "BETH-ETH",
+      "last": "0.9998",
+      "lastSz": "0.25",
+      "askPx": "0.9999",
+      "askSz": "300",
+      "bidPx": "0.9997",
+      "bidSz": "2100",
+      "ts": "1784604228062"
+    }
+  ]
+}

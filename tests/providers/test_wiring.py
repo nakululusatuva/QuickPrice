@@ -20,6 +20,7 @@ from quickprice.providers.base import Capability, ProviderUnavailable
 from quickprice.providers.coingecko import CoinGeckoProvider
 from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
+from quickprice.providers.okx import OkxBethYieldProvider, OkxMarketProvider
 from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
@@ -108,6 +109,56 @@ async def test_wbeth_yield_route_keeps_market_ratio_as_final_fallback_without_cr
         assert chain[0].lookback_days == 37
         assert "ethereum_exchange_rate" not in graph.providers
         assert "binance_wbeth_rate" not in graph.providers
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_beth_uses_same_venue_okx_synthetics_and_only_official_yield() -> None:
+    settings = Settings(require_free_threaded=False, background_enabled=False)
+    graph = build_provider_graph(settings)
+    try:
+        quote_chain = graph.router.providers_for("BETH:USDC", Capability.QUOTE)
+        history_chain = graph.router.providers_for("BETH:USDC", Capability.HISTORY)
+        yield_chain = graph.router.providers_for("BETH:USDC", Capability.YIELD)
+
+        assert len(quote_chain) == len(history_chain) == 2
+        assert quote_chain[0]._recipes["BETH:USDC"].left_symbol == "OKX_BETH:ETH"
+        assert quote_chain[0]._recipes["BETH:USDC"].right_symbol == "OKX_ETH:USDC"
+        assert quote_chain[1]._recipes["BETH:USDC"].left_symbol == "OKX_BETH:USDT"
+        assert quote_chain[1]._recipes["BETH:USDC"].right_symbol == "OKX_USDC:USDT"
+        assert tuple(type(provider) for provider in yield_chain) == (OkxBethYieldProvider,)
+        assert "staking_market_ratio_proxy" not in tuple(provider.name for provider in yield_chain)
+
+        okx = graph.providers["okx"]
+        assert isinstance(okx, OkxMarketProvider)
+        for symbol in (
+            "OKX_BETH:ETH",
+            "OKX_ETH:USDC",
+            "OKX_BETH:USDT",
+            "OKX_USDC:USDT",
+        ):
+            assert graph.router.providers_for(symbol, Capability.QUOTE) == (okx,)
+            assert graph.router.providers_for(symbol, Capability.HISTORY) == (okx,)
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_beth_adds_coingecko_only_after_both_okx_price_routes() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        coingecko_api_key="coingecko-demo-key",
+    )
+    graph = build_provider_graph(settings)
+    try:
+        quote_chain = graph.router.providers_for("BETH:USDC", Capability.QUOTE)
+        history_chain = graph.router.providers_for("BETH:USDC", Capability.HISTORY)
+
+        assert len(quote_chain) == len(history_chain) == 3
+        assert isinstance(quote_chain[-1], CoinGeckoProvider)
+        assert history_chain[-1] is quote_chain[-1]
     finally:
         await graph.close()
 

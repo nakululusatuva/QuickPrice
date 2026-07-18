@@ -31,6 +31,7 @@ FX_HISTORY_REFRESH_SECONDS = 24 * 60 * 60
 FX_HISTORY_RETRY_SECONDS = 60
 FX_STARTUP_PRESEED_TIMEOUT_SECONDS = 15.0
 DAILY_PREFIX_RETRY_SECONDS = 24 * 60 * 60
+QUOTA_METRICS_REFRESH_SECONDS = 60.0
 
 
 def derive_cross_history(
@@ -96,6 +97,7 @@ class MarketDataCoordinator:
             settings,
             self.registry,
             strict=settings.production and settings.background_enabled,
+            metrics=getattr(service, "metrics", None),
         )
         self.router = self.graph.router
         self._stop = asyncio.Event()
@@ -105,7 +107,9 @@ class MarketDataCoordinator:
         self._pending: dict[str, ProviderQuote] = {}
         self._last_errors: dict[str, dict[str, Any]] = {}
         self._quota_snapshots: dict[str, dict[str, Any]] = {}
+        self._quota_updated_at: str | None = None
         self._websocket_reconnects: dict[str, int] = {}
+        self._stream_statistics: dict[str, dict[str, Any]] = {}
         self._stream_observed_at: dict[tuple[int, str], float] = {}
         self._checkpoint_state: dict[tuple[str, str], dict[str, str]] = {}
         self._equity_history_fallback_at: dict[str, float] = {}
@@ -123,6 +127,7 @@ class MarketDataCoordinator:
         if self._supervisor is not None:
             return
         await self._restore_and_bind_provider_state()
+        await self._update_quota_metrics()
         self._fatal_error = None
         self._supervisor = asyncio.create_task(self._supervise(), name="market-data-coordinator")
         await self._started.wait()
@@ -221,6 +226,7 @@ class MarketDataCoordinator:
                     )
             tasks.append(group.create_task(self._metadata_loop(), name="metadata"))
             tasks.append(group.create_task(self._history_loop(), name="history"))
+            tasks.append(group.create_task(self._quota_metrics_loop(), name="quota-metrics"))
             tasks.append(group.create_task(self._maintenance_loop(), name="maintenance"))
             self._started.set()
             await self._stop.wait()
@@ -519,10 +525,41 @@ class MarketDataCoordinator:
         symbols: tuple[str, ...],
     ) -> None:
         delay = 1.0
+        statistics = self._stream_statistics.setdefault(
+            provider_name,
+            {
+                "state": "idle",
+                "connect_attempts": 0,
+                "successful_connections": 0,
+                "messages": 0,
+                "last_connect_attempt_at": None,
+                "connected_at": None,
+                "last_message_at": None,
+                "last_disconnect_at": None,
+            },
+        )
         while True:
+            attempt_started = time.perf_counter()
+            observed_message = False
+            statistics["state"] = "connecting"
+            statistics["connect_attempts"] += 1
+            statistics["last_connect_attempt_at"] = utc_now().isoformat().replace("+00:00", "Z")
             try:
                 async for quote in provider.stream_quotes(symbols):
                     delay = 1.0
+                    if not observed_message:
+                        observed_message = True
+                        statistics["state"] = "connected"
+                        statistics["successful_connections"] += 1
+                        statistics["connected_at"] = utc_now().isoformat().replace("+00:00", "Z")
+                        self.service.metrics.observe_provider_operation(
+                            provider_name,
+                            "stream",
+                            "success",
+                            (time.perf_counter() - attempt_started) * 1000,
+                        )
+                    statistics["messages"] += 1
+                    statistics["last_message_at"] = utc_now().isoformat().replace("+00:00", "Z")
                     if quote.symbol in self.registry:
                         instrument = self.registry[quote.symbol]
                         source_age = max(0.0, (utc_now() - quote.as_of).total_seconds())
@@ -536,6 +573,15 @@ class MarketDataCoordinator:
                 raise
             except Exception as exc:
                 self._record_error(f"stream:{provider_name}", exc)
+            if not observed_message:
+                self.service.metrics.observe_provider_operation(
+                    provider_name,
+                    "stream",
+                    "unavailable",
+                    (time.perf_counter() - attempt_started) * 1000,
+                )
+            statistics["state"] = "disconnected"
+            statistics["last_disconnect_at"] = utc_now().isoformat().replace("+00:00", "Z")
             for symbol in symbols:
                 self._stream_observed_at.pop((id(provider), symbol), None)
             self._websocket_reconnects[provider_name] = (
@@ -544,6 +590,11 @@ class MarketDataCoordinator:
             self.service.metrics.websocket_reconnect(provider_name)
             await asyncio.sleep(delay)
             delay = min(60.0, delay * 2)
+
+    async def _quota_metrics_loop(self) -> None:
+        while True:
+            await asyncio.sleep(QUOTA_METRICS_REFRESH_SECONDS)
+            await self._update_quota_metrics()
 
     async def _metadata_loop(self) -> None:
         next_refresh_at: dict[str, float] = {}
@@ -1009,7 +1060,6 @@ class MarketDataCoordinator:
     async def _maintenance_loop(self) -> None:
         while True:
             await asyncio.sleep(10)
-            await self._update_quota_metrics()
             await self._persist_provider_checkpoints()
             storage = getattr(self.service, "_storage", None)
             if storage is not None:
@@ -1027,13 +1077,56 @@ class MarketDataCoordinator:
         for name, provider in self.graph.providers.items():
             quota = getattr(provider, "quota", None)
             if quota is None:
+                result[name] = {
+                    "tracked": False,
+                    "accounting": "untracked",
+                    "provider_reported": False,
+                    "unit": None,
+                    "limit": None,
+                    "used": None,
+                    "remaining": None,
+                    "resets_at": None,
+                    "reserve": None,
+                    "usable_limit": None,
+                    "usable_remaining": None,
+                    "period_seconds": None,
+                }
                 continue
             try:
                 value = await quota.snapshot()
-                result[name] = dataclasses.asdict(value)
+                snapshot = dataclasses.asdict(value)
+                reserve = int(getattr(quota, "reserve", 0))
+                usable_limit = max(0, value.limit - reserve)
+                result[name] = {
+                    **snapshot,
+                    "tracked": True,
+                    "accounting": "local_request_reservations",
+                    "provider_reported": False,
+                    "unit": "credits",
+                    "reserve": reserve,
+                    "usable_limit": usable_limit,
+                    "usable_remaining": max(0, usable_limit - value.used),
+                    "period_seconds": float(getattr(quota, "period_seconds", 0.0)),
+                }
             except Exception as exc:
                 self._record_error(f"quota:{name}", exc)
+                result[name] = {
+                    "tracked": True,
+                    "accounting": "local_request_reservations",
+                    "provider_reported": False,
+                    "unit": "credits",
+                    "limit": getattr(quota, "limit", None),
+                    "used": None,
+                    "remaining": None,
+                    "resets_at": None,
+                    "reserve": getattr(quota, "reserve", None),
+                    "usable_limit": None,
+                    "usable_remaining": None,
+                    "period_seconds": getattr(quota, "period_seconds", None),
+                    "status": "temporarily_unavailable",
+                }
         self._quota_snapshots = result
+        self._quota_updated_at = utc_now().isoformat().replace("+00:00", "Z")
 
     def _note_checkpoint(self, quote: ProviderQuote) -> None:
         key = (quote.provider, quote.feed)
@@ -1109,6 +1202,8 @@ class MarketDataCoordinator:
             "fallback_counts": self.router.fallback_counts(),
             "circuits": [dataclasses.asdict(item) for item in self.router.circuit_snapshots()],
             "quota": self._quota_snapshots,
+            "quota_updated_at": self._quota_updated_at,
             "websocket_reconnects": dict(self._websocket_reconnects),
+            "streams": {name: dict(value) for name, value in self._stream_statistics.items()},
             "last_errors": dict(self._last_errors),
         }

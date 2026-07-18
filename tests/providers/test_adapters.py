@@ -328,6 +328,7 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "binancecoin": {"usd": 800, "last_updated_at": timestamp},
         "tron": {"usd": 0.30, "last_updated_at": timestamp},
         "wrapped-beacon-eth": {"usd": 4_500, "last_updated_at": timestamp},
+        "okx-beth": {"usd": 3_995, "last_updated_at": timestamp},
         "staked-ether": {"usd": 3_990, "last_updated_at": timestamp},
         "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
         "usd-coin": {"usd": 1, "last_updated_at": timestamp},
@@ -349,11 +350,12 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         provider.get_quote("BNB:USDC"),
         provider.get_quote("TRX:USDC"),
         provider.get_quote("WBETH:USDC"),
+        provider.get_quote("BETH:USDC"),
         provider.get_quote("STETH:USDC"),
         provider.get_quote("WSTETH:USDC"),
     )
 
-    assert len(results) == 10
+    assert len(results) == 11
     assert results[2].price == Decimal("180")
     assert results[3].price == Decimal("325")
     assert results[4].price == Decimal("0.25")
@@ -370,6 +372,7 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "binancecoin",
         "tron",
         "wrapped-beacon-eth",
+        "okx-beth",
         "staked-ether",
         "wrapped-steth",
         "usd-coin",

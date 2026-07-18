@@ -108,6 +108,12 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     assert wbeth["underlying_asset"] == "ETH"
     assert wbeth["estimated_annual_yield"]["rate_type"] == "apy"
     assert wbeth["estimated_annual_yield"]["quality"]["confidence"] == "high"
+    beth = by_symbol["BETH:USDC"]
+    assert beth["name"] == "OKX Staked Ether"
+    assert beth["reward_accrual_mode"] == "distributed_units"
+    assert beth["underlying_asset"] == "ETH"
+    assert beth["estimated_annual_yield"]["rate_type"] == "apr"
+    assert beth["estimated_annual_yield"]["accrual_index"] is None
     assert by_symbol["STETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
     assert by_symbol["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
     assert by_symbol["STETH:USDC"]["estimated_annual_yield"] is not None
@@ -265,6 +271,8 @@ def test_instruments_documents_classification_and_methods(client, auth_headers):
     assert items["SGOV:USD"]["yield_method"] == "latest_distribution_annualized"
     assert items["WBETH:USDC"]["yield_method"] == "staking_provider_metric"
     assert items["WBETH:USDC"]["reward_accrual_mode"] == "value_accruing"
+    assert items["BETH:USDC"]["yield_method"] == "staking_provider_metric"
+    assert items["BETH:USDC"]["reward_accrual_mode"] == "distributed_units"
     assert items["STETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
     assert items["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
     assert items["EUR:GBP"]["asset_class"] == "fx"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -18,6 +19,7 @@ from quickprice.domain import (
     ProviderQuote,
     YieldMetric,
 )
+from quickprice.metrics import Metrics
 
 from .quota import QuotaBudget
 
@@ -148,6 +150,7 @@ class HttpProvider:
         request_timeout: float = 10.0,
         user_agent: str = "QuickPrice/1.1",
         proxy_url: str | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self._session = session
         self._owns_session = session is None
@@ -155,6 +158,16 @@ class HttpProvider:
         self.request_timeout = request_timeout
         self.user_agent = user_agent
         self.proxy_url = proxy_url
+        self._metrics = metrics
+        if metrics is not None:
+            metrics.register_provider(self.name)
+
+    def set_metrics(self, metrics: Metrics | None) -> None:
+        """Bind the shared registry after a plugin has built its providers."""
+
+        self._metrics = metrics
+        if metrics is not None:
+            metrics.register_provider(self.name)
 
     async def __aenter__(self) -> Self:
         await self._ensure_session()
@@ -205,6 +218,7 @@ class HttpProvider:
             raise ProviderRateLimited(self.name, "local quota exhausted")
 
         session = await self._ensure_session()
+        started = time.perf_counter()
         try:
             async with session.request(
                 method,
@@ -224,7 +238,7 @@ class HttpProvider:
                     # URLs/response bodies can contain credentials.  Never include either.
                     raise ProviderError(self.name, "upstream request rejected", status=status)
                 try:
-                    return await response.json(content_type=None)
+                    payload = await response.json(content_type=None)
                 except (
                     aiohttp.ContentTypeError,
                     json.JSONDecodeError,
@@ -232,13 +246,44 @@ class HttpProvider:
                     ValueError,
                 ):
                     raise MalformedResponse(self.name, "invalid JSON response") from None
-        except ProviderError:
+        except ProviderError as exc:
+            self._observe_http(provider_error_outcome(exc), started)
             raise
-        except (aiohttp.ClientError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            self._observe_http("timeout", started)
+            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+        except aiohttp.ClientError as exc:
             # aiohttp exceptions may embed the request URL, including vendor
             # keys passed as query parameters. Suppress that cause so even an
             # accidental traceback log cannot disclose credentials.
+            self._observe_http("unavailable", started)
             raise ProviderUnavailable(self.name, type(exc).__name__) from None
+        self._observe_http("success", started)
+        return payload
+
+    def _observe_http(self, outcome: str, started: float) -> None:
+        if self._metrics is not None:
+            self._metrics.observe_provider_http(
+                self.name,
+                outcome,
+                (time.perf_counter() - started) * 1000,
+            )
+
+
+def provider_error_outcome(error: ProviderError) -> str:
+    """Map provider exceptions to a fixed, non-sensitive telemetry label."""
+
+    if isinstance(error, ProviderBusy):
+        return "busy"
+    if isinstance(error, ProviderRateLimited):
+        return "rate_limited"
+    if isinstance(error, MalformedResponse):
+        return "malformed"
+    if isinstance(error, UnsupportedInstrument):
+        return "unsupported"
+    if isinstance(error, ProviderUnavailable):
+        return "unavailable"
+    return "rejected"
 
 
 def require_mapping(payload: Any, provider: str, context: str = "response") -> Mapping[str, Any]:

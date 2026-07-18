@@ -11,6 +11,7 @@ from typing import Any
 from quickprice.config import Settings
 from quickprice.equities import DIVIDEND_SYMBOLS, LISTED_SYMBOLS
 from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
+from quickprice.metrics import Metrics
 from quickprice.plugin_api import ProviderInstallContext, YieldStrategy
 from quickprice.registry import InstrumentRegistry, build_registry
 
@@ -23,6 +24,7 @@ from .finnhub import FinnhubProvider
 from .fred import FredProvider
 from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from .kraken import KrakenProvider
+from .okx import OkxBethYieldProvider, OkxMarketProvider
 from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
 from .router import ProviderRouter
 from .staking import (
@@ -171,6 +173,57 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     wbeth_yield_chain.append(market_ratio_yield)
     router.register("WBETH:USDC", Capability.YIELD, wbeth_yield_chain)
 
+    # BETH rewards are distributed as additional token units, so its official
+    # OKX rate is not interchangeable with a token/ETH market-ratio estimate.
+    # Provider-qualified internal legs keep both synthetic formulas on the
+    # same exchange while preserving the existing public ETH:USDC route.
+    okx = providers["okx"] = OkxMarketProvider(
+        request_timeout=settings.provider_timeout_seconds,
+        **_proxy_options(settings, "okx"),
+    )
+    for symbol in (
+        "OKX_BETH:ETH",
+        "OKX_ETH:USDC",
+        "OKX_BETH:USDT",
+        "OKX_USDC:USDT",
+    ):
+        router.register(symbol, Capability.QUOTE, [okx])
+        router.register(symbol, Capability.HISTORY, [okx])
+
+    beth_primary = SyntheticQuoteProvider(
+        router.get_quote,
+        (SyntheticRecipe.beth_okx_primary(),),
+    )
+    beth_alternate = SyntheticQuoteProvider(
+        router.get_quote,
+        (SyntheticRecipe.beth_okx_usdt_fallback(),),
+    )
+    beth_history_primary = SyntheticHistoryProvider(
+        router.get_history,
+        (SyntheticRecipe.beth_okx_primary(),),
+    )
+    beth_history_alternate = SyntheticHistoryProvider(
+        router.get_history,
+        (SyntheticRecipe.beth_okx_usdt_fallback(),),
+    )
+    providers["synthetic_beth_primary"] = beth_primary
+    providers["synthetic_beth_alternate"] = beth_alternate
+    providers["synthetic_beth_history_primary"] = beth_history_primary
+    providers["synthetic_beth_history_alternate"] = beth_history_alternate
+    beth_quote_chain = [beth_primary, beth_alternate]
+    beth_history_chain = [beth_history_primary, beth_history_alternate]
+    if coingecko is not None:
+        beth_quote_chain.append(coingecko)
+        beth_history_chain.append(coingecko)
+    router.register("BETH:USDC", Capability.QUOTE, beth_quote_chain)
+    router.register("BETH:USDC", Capability.HISTORY, beth_history_chain)
+
+    okx_beth_yield = providers["okx_beth_yield"] = OkxBethYieldProvider(
+        request_timeout=settings.provider_timeout_seconds,
+        **_proxy_options(settings, "okx"),
+    )
+    router.register("BETH:USDC", Capability.YIELD, [okx_beth_yield])
+
     lido = providers["lido"] = LidoAprProvider(
         request_timeout=settings.provider_timeout_seconds,
         **_proxy_options(settings, "lido"),
@@ -277,6 +330,7 @@ def build_provider_graph(
     registry: InstrumentRegistry | None = None,
     *,
     strict: bool = False,
+    metrics: Metrics | None = None,
 ) -> ProviderGraph:
     """Construct routes declared by the enabled trusted plugins."""
 
@@ -286,6 +340,7 @@ def build_provider_graph(
         timeout_seconds=settings.provider_timeout_seconds,
         failure_threshold=settings.circuit_failure_threshold,
         half_open_after_seconds=settings.circuit_open_seconds,
+        metrics=metrics,
     )
     context = ProviderInstallContext(
         settings=settings,
@@ -348,6 +403,13 @@ def build_provider_graph(
             router.register(symbol, Capability.QUOTE, quote_chain)
         if history_chain:
             router.register(symbol, Capability.HISTORY, history_chain)
+    if metrics is not None:
+        for provider in context.providers.values():
+            provider_name = str(getattr(provider, "name", provider.__class__.__name__))
+            metrics.register_provider(provider_name)
+            set_metrics = getattr(provider, "set_metrics", None)
+            if callable(set_metrics):
+                set_metrics(metrics)
     graph = ProviderGraph(router=router, providers=context.providers)
     if strict:
         validate_provider_graph(graph, registry)

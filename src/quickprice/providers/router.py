@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any, ClassVar
 
 from quickprice.domain import DividendEvent, PricePoint, ProviderQuote, YieldMetric
+from quickprice.metrics import Metrics
 
 from ._models import replace_metadata
 from .base import (
@@ -22,6 +23,7 @@ from .base import (
     ProviderRateLimited,
     ProviderUnavailable,
     UnsupportedInstrument,
+    provider_error_outcome,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,6 +72,8 @@ class ProviderRouter:
         half_open_after_seconds: float = 60.0,
         max_backoff_seconds: float = 900.0,
         clock: Any = time.monotonic,
+        latency_clock: Any = time.perf_counter,
+        metrics: Metrics | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -80,6 +84,8 @@ class ProviderRouter:
         self.half_open_after_seconds = half_open_after_seconds
         self.max_backoff_seconds = max_backoff_seconds
         self._clock = clock
+        self._latency_clock = latency_clock
+        self._metrics = metrics
         self._routes: dict[tuple[str, Capability], tuple[Any, ...]] = {}
         self._circuits: dict[tuple[int, str, Capability], _Circuit] = defaultdict(_Circuit)
         self._flights: dict[Hashable, asyncio.Task[Any]] = {}
@@ -108,6 +114,10 @@ class ProviderRouter:
         for provider in chain:
             if not callable(getattr(provider, method, None)):
                 raise TypeError(f"{getattr(provider, 'name', provider)!r} lacks {method}")
+            if self._metrics is not None:
+                self._metrics.register_provider(
+                    str(getattr(provider, "name", provider.__class__.__name__))
+                )
         key = (self._symbol(symbol), cap)
         if key in self._routes:
             raise ValueError(f"duplicate provider route: {key[0]}/{cap.value}")
@@ -232,6 +242,7 @@ class ProviderRouter:
                 attempts.append((name, "circuit_open"))
                 continue
 
+            started = self._latency_clock()
             try:
                 method = getattr(provider, method_name)
                 routing_timeout = getattr(provider, "routing_timeout_seconds", self.timeout_seconds)
@@ -241,6 +252,7 @@ class ProviderRouter:
                     async with asyncio.timeout(float(routing_timeout)):
                         result = await method(symbol, **kwargs)
             except TimeoutError:
+                self._observe_operation(name, capability, "timeout", started)
                 error: ProviderError = ProviderUnavailable(name, "timeout")
                 self._record_failure(
                     circuit,
@@ -252,10 +264,12 @@ class ProviderRouter:
                 attempts.append((name, error.message))
                 continue
             except UnsupportedInstrument as error:
+                self._observe_operation(name, capability, "unsupported", started)
                 circuit.probing = False
                 attempts.append((name, error.message))
                 continue
             except ProviderBusy as error:
+                self._observe_operation(name, capability, "busy", started)
                 # Local pacing saturation is not an upstream failure and must
                 # not burn the next provider's scarce reserve. Retry this
                 # route after the collector's bounded backoff instead.
@@ -263,6 +277,12 @@ class ProviderRouter:
                 attempts.append((name, error.message))
                 break
             except (ProviderRateLimited, ProviderError) as error:
+                self._observe_operation(
+                    name,
+                    capability,
+                    provider_error_outcome(error),
+                    started,
+                )
                 self._record_failure(
                     circuit,
                     provider=name,
@@ -273,6 +293,7 @@ class ProviderRouter:
                 attempts.append((name, error.message))
                 continue
             except Exception as error:  # Keep malformed adapters from killing collectors.
+                self._observe_operation(name, capability, "unexpected", started)
                 self._record_failure(
                     circuit,
                     provider=name,
@@ -290,9 +311,11 @@ class ProviderRouter:
                 capability=capability,
             )
             if capability is Capability.DIVIDEND and result is None:
+                self._observe_operation(name, capability, "no_data", started)
                 attempts.append((name, "no_data"))
                 continue
             if capability is Capability.HISTORY and not result:
+                self._observe_operation(name, capability, "no_data", started)
                 attempts.append((name, "no_data"))
                 continue
             if capability is Capability.HISTORY:
@@ -300,6 +323,7 @@ class ProviderRouter:
                 if getattr(
                     provider, "history_prefix_limited", False
                 ) and not self._history_covers_start(attached, kwargs):
+                    self._observe_operation(name, capability, "partial", started)
                     history_segments.append(attached)
                     if fallback_level:
                         self._record_route_selection(
@@ -311,6 +335,7 @@ class ProviderRouter:
                     attempts.append((name, "incomplete_prefix"))
                     continue
                 if history_segments:
+                    self._observe_operation(name, capability, "success", started)
                     history_segments.append(attached)
                     self._record_route_selection(
                         symbol,
@@ -319,6 +344,7 @@ class ProviderRouter:
                         fallback_level,
                     )
                     return self._merge_history(history_segments, kwargs.get("limit"))
+                self._observe_operation(name, capability, "success", started)
                 self._record_route_selection(
                     symbol,
                     capability,
@@ -326,6 +352,7 @@ class ProviderRouter:
                     fallback_level,
                 )
                 return attached
+            self._observe_operation(name, capability, "success", started)
             self._record_route_selection(
                 symbol,
                 capability,
@@ -337,6 +364,21 @@ class ProviderRouter:
         if history_segments:
             return self._merge_history(history_segments, kwargs.get("limit"))
         raise AllProvidersFailed(symbol, capability, attempts)
+
+    def _observe_operation(
+        self,
+        provider: str,
+        capability: Capability,
+        outcome: str,
+        started: float,
+    ) -> None:
+        if self._metrics is not None:
+            self._metrics.observe_provider_operation(
+                provider,
+                capability.value,
+                outcome,
+                (self._latency_clock() - started) * 1000,
+            )
 
     @staticmethod
     def _history_covers_start(points: Sequence[PricePoint], kwargs: Mapping[str, Any]) -> bool:

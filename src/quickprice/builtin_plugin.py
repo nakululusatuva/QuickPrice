@@ -60,7 +60,7 @@ COMMON_STOCK_INSTRUMENTS = tuple(_common_stock_instrument(item) for item in COMM
 
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.4.0",
+    version="1.6.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -154,6 +154,23 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             price_basis="synthetic_cross",
             yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
             reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+            underlying_asset="ETH",
+            quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="BETH:USDC",
+            base="BETH",
+            quote="USDC",
+            name="OKX Staked Ether",
+            description=(
+                "An OKX liquid-staking token representing staked Ether; rewards are "
+                "distributed daily as additional BETH units."
+            ),
+            asset_class=AssetClass.CRYPTO,
+            asset_type="liquid_staking_token",
+            price_basis="synthetic_cross",
+            yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+            reward_accrual_mode=RewardAccrualMode.DISTRIBUTED_UNITS,
             underlying_asset="ETH",
             quote_poll_seconds=1.0,
         ),

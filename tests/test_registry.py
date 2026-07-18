@@ -24,7 +24,7 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS[:10] == (
+    assert SYMBOLS[:11] == (
         "BTC:USDC",
         "ETH:USDC",
         "SOL:USDC",
@@ -33,18 +33,19 @@ def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> Non
         "BNB:USDC",
         "TRX:USDC",
         "WBETH:USDC",
+        "BETH:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
     )
-    assert SYMBOLS[10:20] == COMMON_STOCK_SYMBOLS
-    assert SYMBOLS[20:23] == (
+    assert SYMBOLS[11:21] == COMMON_STOCK_SYMBOLS
+    assert SYMBOLS[21:24] == (
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
     )
-    assert SYMBOLS[23:] == FX_SYMBOLS
-    assert len(SYMBOLS) == 53
-    assert BUILTIN_PLUGIN.version == "1.4.0"
+    assert SYMBOLS[24:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 54
+    assert BUILTIN_PLUGIN.version == "1.6.0"
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND
@@ -100,6 +101,15 @@ def test_lido_tokens_distinguish_rebasing_and_value_accrual() -> None:
     assert steth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert wsteth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert steth.underlying_asset == wsteth.underlying_asset == "ETH"
+
+
+def test_okx_beth_declares_distributed_unit_rewards() -> None:
+    beth = INSTRUMENTS["BETH:USDC"]
+
+    assert beth.name == "OKX Staked Ether"
+    assert beth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
+    assert beth.reward_accrual_mode is RewardAccrualMode.DISTRIBUTED_UNITS
+    assert beth.underlying_asset == "ETH"
 
 
 @pytest.mark.parametrize(

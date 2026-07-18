@@ -31,6 +31,7 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
         "BNB:USDC": Decimal("800"),
         "TRX:USDC": Decimal("0.30"),
         "WBETH:USDC": Decimal("5500"),
+        "BETH:USDC": Decimal("4995"),
         "STETH:USDC": Decimal("4990"),
         "WSTETH:USDC": Decimal("6000"),
         "QQQM:USD": Decimal("250"),
@@ -115,11 +116,24 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
         persist=False,
     )
     staking_metrics = {
-        "WBETH:USDC": (RewardAccrualMode.VALUE_ACCRUING, Decimal("1.10")),
-        "STETH:USDC": (RewardAccrualMode.REBASING_BALANCE, Decimal("0.998")),
-        "WSTETH:USDC": (RewardAccrualMode.VALUE_ACCRUING, Decimal("1.20")),
+        "WBETH:USDC": (
+            RewardAccrualMode.VALUE_ACCRUING,
+            YieldRateType.APY,
+            Decimal("1.10"),
+        ),
+        "BETH:USDC": (RewardAccrualMode.DISTRIBUTED_UNITS, YieldRateType.APR, None),
+        "STETH:USDC": (
+            RewardAccrualMode.REBASING_BALANCE,
+            YieldRateType.APY,
+            Decimal("0.998"),
+        ),
+        "WSTETH:USDC": (
+            RewardAccrualMode.VALUE_ACCRUING,
+            YieldRateType.APY,
+            Decimal("1.20"),
+        ),
     }
-    for symbol, (accrual_mode, index_value) in staking_metrics.items():
+    for symbol, (accrual_mode, rate_type, index_value) in staking_metrics.items():
         service.publish_yield_metric(
             YieldMetric(
                 symbol=symbol,
@@ -127,17 +141,21 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
                 as_of=NOW - timedelta(minutes=1),
                 method="staking_fixture_apy",
                 provider="fixture_staking",
-                rate_type=YieldRateType.APY,
+                rate_type=rate_type,
                 observation_window_days=Decimal("7"),
                 accrual_mode=accrual_mode,
                 underlying_asset="ETH",
                 is_estimate=True,
-                accrual_index=AccrualIndexPoint(
-                    symbol=f"{symbol.split(':', 1)[0]}:ETH",
-                    underlying_asset="ETH",
-                    value=index_value,
-                    as_of=NOW - timedelta(minutes=1),
-                    provider="fixture_staking",
+                accrual_index=(
+                    None
+                    if index_value is None
+                    else AccrualIndexPoint(
+                        symbol=f"{symbol.split(':', 1)[0]}:ETH",
+                        underlying_asset="ETH",
+                        value=index_value,
+                        as_of=NOW - timedelta(minutes=1),
+                        provider="fixture_staking",
+                    )
                 ),
                 quality=YieldQuality(stale=False, staleness_ms=60_000, confidence="high"),
             ),

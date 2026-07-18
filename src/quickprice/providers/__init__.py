@@ -26,6 +26,7 @@ from .coingecko import CoinGeckoProvider
 from .finnhub import FinnhubProvider
 from .fred import FredProvider
 from .kraken import KrakenProvider
+from .okx import OkxBethYieldProvider, OkxMarketProvider
 from .router import ProviderRouter
 from .staking import (
     WBETH_ETHEREUM_SPEC,
@@ -68,6 +69,8 @@ __all__ = [
     "HistoryProvider",
     "KrakenProvider",
     "MalformedResponse",
+    "OkxBethYieldProvider",
+    "OkxMarketProvider",
     "ProviderError",
     "ProviderGraph",
     "ProviderRateLimited",

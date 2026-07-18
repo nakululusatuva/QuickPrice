@@ -264,6 +264,36 @@ class SyntheticRecipe:
         )
 
     @classmethod
+    def beth_okx_primary(cls) -> SyntheticRecipe:
+        """Primary BETH formula using only synchronized OKX spot books."""
+
+        return cls(
+            symbol="BETH:USDC",
+            left_symbol="OKX_BETH:ETH",
+            right_symbol="OKX_ETH:USDC",
+            operation="multiply",
+            max_skew=timedelta(seconds=2),
+            left_max_age=timedelta(seconds=15),
+            right_max_age=timedelta(seconds=15),
+            provider_name="synthetic_okx",
+        )
+
+    @classmethod
+    def beth_okx_usdt_fallback(cls) -> SyntheticRecipe:
+        """Alternate BETH formula using only synchronized OKX spot books."""
+
+        return cls(
+            symbol="BETH:USDC",
+            left_symbol="OKX_BETH:USDT",
+            right_symbol="OKX_USDC:USDT",
+            operation="divide",
+            max_skew=timedelta(seconds=2),
+            left_max_age=timedelta(seconds=15),
+            right_max_age=timedelta(seconds=15),
+            provider_name="synthetic_okx",
+        )
+
+    @classmethod
     def hkd_cnh(cls) -> SyntheticRecipe:
         return cls(
             symbol="HKD:CNH",
