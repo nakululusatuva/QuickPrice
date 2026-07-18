@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaTooNewError(RuntimeError):
@@ -104,7 +104,49 @@ MIGRATION_1: tuple[str, ...] = (
 )
 
 
-MIGRATIONS: dict[int, Sequence[str]] = {1: MIGRATION_1}
+MIGRATION_2: tuple[str, ...] = (
+    """
+    CREATE TABLE api_keys (
+        key_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        key_hint TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        origin TEXT NOT NULL CHECK (origin IN ('generated', 'imported', 'legacy'))
+    ) STRICT, WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX api_keys_expiry_idx
+    ON api_keys(expires_at)
+    WHERE revoked_at IS NULL
+    """,
+    """
+    CREATE TABLE auth_metadata (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    ) STRICT, WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE admin_audit_events (
+        event_id TEXT PRIMARY KEY,
+        occurred_at TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        client_ip TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        details_json TEXT NOT NULL
+    ) STRICT, WITHOUT ROWID
+    """,
+    "CREATE INDEX admin_audit_events_time_idx ON admin_audit_events(occurred_at DESC)",
+)
+
+
+MIGRATIONS: dict[int, Sequence[str]] = {1: MIGRATION_1, 2: MIGRATION_2}
 
 
 def migration_checksum(statements: Sequence[str]) -> str:

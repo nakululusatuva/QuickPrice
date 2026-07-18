@@ -15,16 +15,22 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .records import (
+    AdminAuditEventRecord,
     AggregatePriceRecord,
+    ApiKeyRecord,
+    BootstrapApiKeysCommand,
     CheckpointResult,
     CleanupCommand,
     CleanupResult,
     DividendEventRecord,
+    ImportApiKeysCommand,
     LatestSnapshotRecord,
     MinutePriceRecord,
     ProviderCheckpointRecord,
     RestoredState,
+    RevokeApiKeyCommand,
     StorageMetrics,
+    UpdateApiKeyCommand,
     WriteCommand,
     WriteResult,
     YieldMetricRecord,
@@ -63,6 +69,22 @@ class StorageCorruptionError(StorageError):
 
 type FaultInjector = Callable[[str, Sequence[WriteCommand]], None]
 type WriteOutcome = WriteResult | CleanupResult
+
+_WRITE_COMMAND_TYPES = (
+    MinutePriceRecord,
+    AggregatePriceRecord,
+    LatestSnapshotRecord,
+    DividendEventRecord,
+    YieldMetricRecord,
+    ProviderCheckpointRecord,
+    ApiKeyRecord,
+    AdminAuditEventRecord,
+    BootstrapApiKeysCommand,
+    ImportApiKeysCommand,
+    UpdateApiKeyCommand,
+    RevokeApiKeyCommand,
+    CleanupCommand,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,18 +330,7 @@ class SQLiteStorage:
             self._max_queue_depth = max(self._max_queue_depth, depth)
 
     async def enqueue(self, command: WriteCommand, *, wait: bool = False) -> WriteOutcome | None:
-        if not isinstance(
-            command,
-            (
-                MinutePriceRecord,
-                AggregatePriceRecord,
-                LatestSnapshotRecord,
-                DividendEventRecord,
-                YieldMetricRecord,
-                ProviderCheckpointRecord,
-                CleanupCommand,
-            ),
-        ):
+        if not isinstance(command, _WRITE_COMMAND_TYPES):
             raise TypeError(f"unsupported storage command: {type(command).__name__}")
         future: concurrent.futures.Future[Any] | None = (
             concurrent.futures.Future() if wait else None
@@ -334,18 +345,7 @@ class SQLiteStorage:
     ) -> tuple[WriteOutcome, ...] | None:
         futures: list[concurrent.futures.Future[Any]] = []
         for command in commands:
-            if not isinstance(
-                command,
-                (
-                    MinutePriceRecord,
-                    AggregatePriceRecord,
-                    LatestSnapshotRecord,
-                    DividendEventRecord,
-                    YieldMetricRecord,
-                    ProviderCheckpointRecord,
-                    CleanupCommand,
-                ),
-            ):
+            if not isinstance(command, _WRITE_COMMAND_TYPES):
                 raise TypeError(f"unsupported storage command: {type(command).__name__}")
             future: concurrent.futures.Future[Any] | None = (
                 concurrent.futures.Future() if wait else None
@@ -416,6 +416,125 @@ class SQLiteStorage:
         self, record: ProviderCheckpointRecord, *, wait: bool = False
     ) -> WriteOutcome | None:
         return await self.enqueue(record, wait=wait)
+
+    def load_api_keys(self) -> tuple[ApiKeyRecord, ...]:
+        """Load credential metadata without exposing it through market-data reads."""
+
+        self.initialize()
+        with self._reader_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT key_id, name, key_hash, key_hint, created_at, updated_at,
+                       expires_at, revoked_at, origin
+                FROM api_keys
+                ORDER BY created_at, key_id
+                """
+            ).fetchall()
+        return tuple(
+            ApiKeyRecord(
+                key_id=str(row["key_id"]),
+                name=str(row["name"]),
+                key_hash=str(row["key_hash"]),
+                key_hint=None if row["key_hint"] is None else str(row["key_hint"]),
+                created_at=decode_timestamp(str(row["created_at"])),
+                updated_at=decode_timestamp(str(row["updated_at"])),
+                expires_at=(
+                    None if row["expires_at"] is None else decode_timestamp(str(row["expires_at"]))
+                ),
+                revoked_at=(
+                    None if row["revoked_at"] is None else decode_timestamp(str(row["revoked_at"]))
+                ),
+                origin=str(row["origin"]),
+            )
+            for row in rows
+        )
+
+    def api_key_bootstrap_complete(self) -> bool:
+        self.initialize()
+        with self._reader_connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM auth_metadata WHERE name = 'legacy_api_key_bootstrap'"
+            ).fetchone()
+        return row is not None and str(row["value"]) == "complete"
+
+    def load_admin_audit_events(self, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        """Return a bounded, already-redacted administrator audit projection."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("audit event limit must be between 1 and 500")
+        self.initialize()
+        with self._reader_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, occurred_at, request_id, client_ip, action,
+                       target_type, target_id, details_json
+                FROM admin_audit_events
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(
+            {
+                "event_id": str(row["event_id"]),
+                "occurred_at": str(row["occurred_at"]),
+                "request_id": str(row["request_id"]),
+                "client_ip": str(row["client_ip"]),
+                "action": str(row["action"]),
+                "target_type": str(row["target_type"]),
+                "target_id": None if row["target_id"] is None else str(row["target_id"]),
+                "details": decode_json(str(row["details_json"])),
+            }
+            for row in rows
+        )
+
+    async def bootstrap_api_keys(
+        self,
+        records: Iterable[ApiKeyRecord],
+        *,
+        completed_at: datetime,
+    ) -> WriteOutcome | None:
+        return await self.enqueue(
+            BootstrapApiKeysCommand(tuple(records), completed_at),
+            wait=True,
+        )
+
+    async def create_api_key(self, record: ApiKeyRecord) -> WriteOutcome | None:
+        return await self.enqueue(record, wait=True)
+
+    async def import_api_keys(
+        self,
+        records: Iterable[ApiKeyRecord],
+        *,
+        audit: AdminAuditEventRecord,
+    ) -> WriteOutcome | None:
+        return await self.enqueue(ImportApiKeysCommand(tuple(records), audit), wait=True)
+
+    async def update_api_key(
+        self,
+        *,
+        key_id: str,
+        name: str,
+        expires_at: datetime | None,
+        updated_at: datetime,
+        audit: AdminAuditEventRecord,
+    ) -> WriteOutcome | None:
+        return await self.enqueue(
+            UpdateApiKeyCommand(key_id, name, expires_at, updated_at, audit),
+            wait=True,
+        )
+
+    async def revoke_api_key(
+        self,
+        *,
+        key_id: str,
+        revoked_at: datetime,
+        audit: AdminAuditEventRecord,
+    ) -> WriteOutcome | None:
+        return await self.enqueue(RevokeApiKeyCommand(key_id, revoked_at, audit), wait=True)
+
+    async def append_admin_audit(self, record: AdminAuditEventRecord) -> WriteOutcome | None:
+        return await self.enqueue(record, wait=True)
 
     async def flush(self) -> None:
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
@@ -764,6 +883,81 @@ class SQLiteStorage:
             )
             return WriteResult(cursor.rowcount)
 
+        if isinstance(command, ApiKeyRecord):
+            cursor = self._insert_api_key(connection, command)
+            return WriteResult(cursor.rowcount)
+
+        if isinstance(command, AdminAuditEventRecord):
+            cursor = self._insert_admin_audit(connection, command)
+            return WriteResult(cursor.rowcount)
+
+        if isinstance(command, BootstrapApiKeysCommand):
+            affected = 0
+            for record in command.records:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO api_keys(
+                        key_id, name, key_hash, key_hint, created_at, updated_at,
+                        expires_at, revoked_at, origin
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(key_hash) DO NOTHING
+                    """,
+                    self._api_key_values(record),
+                )
+                affected += cursor.rowcount
+            metadata = connection.execute(
+                """
+                INSERT INTO auth_metadata(name, value, updated_at)
+                VALUES ('legacy_api_key_bootstrap', 'complete', ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (encode_timestamp(command.completed_at),),
+            )
+            return WriteResult(affected + metadata.rowcount)
+
+        if isinstance(command, ImportApiKeysCommand):
+            affected = 0
+            for record in command.records:
+                affected += self._insert_api_key(connection, record).rowcount
+            affected += self._insert_admin_audit(connection, command.audit).rowcount
+            return WriteResult(affected)
+
+        if isinstance(command, UpdateApiKeyCommand):
+            cursor = connection.execute(
+                """
+                UPDATE api_keys
+                SET name = ?, expires_at = ?, updated_at = ?
+                WHERE key_id = ? AND revoked_at IS NULL
+                """,
+                (
+                    command.name,
+                    None if command.expires_at is None else encode_timestamp(command.expires_at),
+                    encode_timestamp(command.updated_at),
+                    command.key_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"active API key not found: {command.key_id}")
+            self._insert_admin_audit(connection, command.audit)
+            return WriteResult(cursor.rowcount)
+
+        if isinstance(command, RevokeApiKeyCommand):
+            timestamp = encode_timestamp(command.revoked_at)
+            cursor = connection.execute(
+                """
+                UPDATE api_keys
+                SET revoked_at = ?, updated_at = ?
+                WHERE key_id = ? AND revoked_at IS NULL
+                """,
+                (timestamp, timestamp, command.key_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"active API key not found: {command.key_id}")
+            self._insert_admin_audit(connection, command.audit)
+            return WriteResult(cursor.rowcount)
+
         if isinstance(command, CleanupCommand):
             minute_cursor = connection.execute(
                 "DELETE FROM minute_prices WHERE timestamp < ?",
@@ -833,6 +1027,60 @@ class SQLiteStorage:
                 yield_metrics_deleted=yield_cursor.rowcount,
             )
         raise TypeError(f"unsupported storage command: {type(command).__name__}")
+
+    @staticmethod
+    def _api_key_values(record: ApiKeyRecord) -> tuple[Any, ...]:
+        return (
+            record.key_id,
+            record.name,
+            record.key_hash,
+            record.key_hint,
+            encode_timestamp(record.created_at),
+            encode_timestamp(record.updated_at),
+            None if record.expires_at is None else encode_timestamp(record.expires_at),
+            None if record.revoked_at is None else encode_timestamp(record.revoked_at),
+            record.origin,
+        )
+
+    @classmethod
+    def _insert_api_key(
+        cls,
+        connection: sqlite3.Connection,
+        record: ApiKeyRecord,
+    ) -> sqlite3.Cursor:
+        return connection.execute(
+            """
+            INSERT INTO api_keys(
+                key_id, name, key_hash, key_hint, created_at, updated_at,
+                expires_at, revoked_at, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            cls._api_key_values(record),
+        )
+
+    @staticmethod
+    def _insert_admin_audit(
+        connection: sqlite3.Connection,
+        record: AdminAuditEventRecord,
+    ) -> sqlite3.Cursor:
+        return connection.execute(
+            """
+            INSERT INTO admin_audit_events(
+                event_id, occurred_at, request_id, client_ip, action,
+                target_type, target_id, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.event_id,
+                encode_timestamp(record.occurred_at),
+                record.request_id,
+                record.client_ip,
+                record.action,
+                record.target_type,
+                record.target_id,
+                encode_json(record.details),
+            ),
+        )
 
     def _fail_pending(self, error: BaseException) -> None:
         while True:

@@ -9,8 +9,12 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .config import Settings
+
+if TYPE_CHECKING:
+    from .api_keys import ApiKeyManager
 
 _SHA256_PATTERN = re.compile(r"^sha256:([0-9a-f]{64})$")
 
@@ -83,8 +87,9 @@ class TokenBucketLimiter:
 
 
 class Authenticator:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, key_manager: ApiKeyManager | None = None) -> None:
         self._enabled = settings.rate_limit_enabled
+        self._key_manager = key_manager
         self._hashes = tuple(self._validate_hash(item) for item in settings.api_key_hashes)
         self._valid_limiter = TokenBucketLimiter(
             settings.requests_per_minute, settings.request_burst
@@ -102,18 +107,25 @@ class Authenticator:
 
     @property
     def configured(self) -> bool:
+        if self._key_manager is not None:
+            return self._key_manager.configured()
         return bool(self._hashes)
 
-    def authenticate(self, raw_key: str | None, client_ip: str) -> str:
+    def authenticate(self, raw_key: str | None, client_ip: str) -> Any:
         candidate = hash_api_key(raw_key) if raw_key else "sha256:" + "0" * 64
-        matched = False
-        # Compare every configured digest so timing does not disclose its position.
-        for configured in self._hashes:
-            matched = hmac.compare_digest(candidate, configured) or matched
+        context = None
+        if self._key_manager is not None:
+            context = self._key_manager.authenticate_digest(candidate)
+            matched = context is not None
+        else:
+            matched = False
+            # Compare every configured digest so timing does not disclose its position.
+            for configured in self._hashes:
+                matched = hmac.compare_digest(candidate, configured) or matched
         if not matched:
             if self._enabled:
                 self._invalid_limiter.consume(client_ip)
             raise AuthenticationError("invalid API key")
         if self._enabled:
             self._valid_limiter.consume(candidate)
-        return candidate
+        return context if context is not None else candidate

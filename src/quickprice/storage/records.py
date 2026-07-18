@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -10,6 +11,9 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+_API_KEY_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_API_KEY_ORIGINS = frozenset({"generated", "imported", "legacy"})
 
 
 def utc_datetime(value: datetime) -> datetime:
@@ -365,6 +369,122 @@ class ProviderCheckpointRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKeyRecord:
+    key_id: str
+    name: str
+    key_hash: str
+    key_hint: str | None
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    origin: str = "generated"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key_id", _required_text(self.key_id, "key_id"))
+        name = _required_text(self.name, "name")
+        if len(name) > 80:
+            raise ValueError("API key name cannot exceed 80 characters")
+        object.__setattr__(self, "name", name)
+        key_hash = self.key_hash.strip().lower()
+        if not _API_KEY_HASH_PATTERN.fullmatch(key_hash):
+            raise ValueError("key_hash must use sha256:<64 lowercase hex chars>")
+        object.__setattr__(self, "key_hash", key_hash)
+        if self.key_hint is not None:
+            hint = _required_text(self.key_hint, "key_hint")
+            if len(hint) > 32:
+                raise ValueError("API key hint cannot exceed 32 characters")
+            object.__setattr__(self, "key_hint", hint)
+        object.__setattr__(self, "created_at", utc_datetime(self.created_at))
+        object.__setattr__(self, "updated_at", utc_datetime(self.updated_at))
+        if self.expires_at is not None:
+            object.__setattr__(self, "expires_at", utc_datetime(self.expires_at))
+        if self.revoked_at is not None:
+            object.__setattr__(self, "revoked_at", utc_datetime(self.revoked_at))
+        origin = self.origin.strip().lower()
+        if origin not in _API_KEY_ORIGINS:
+            raise ValueError(f"unsupported API key origin: {origin!r}")
+        object.__setattr__(self, "origin", origin)
+
+
+@dataclass(frozen=True, slots=True)
+class AdminAuditEventRecord:
+    event_id: str
+    occurred_at: datetime
+    request_id: str
+    client_ip: str
+    action: str
+    target_type: str
+    target_id: str | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("event_id", "request_id", "client_ip", "action", "target_type"):
+            object.__setattr__(self, name, _required_text(getattr(self, name), name))
+        object.__setattr__(self, "occurred_at", utc_datetime(self.occurred_at))
+        if self.target_id is not None:
+            object.__setattr__(self, "target_id", _required_text(self.target_id, "target_id"))
+        if not isinstance(self.details, Mapping):
+            raise TypeError("audit details must be a mapping")
+        encode_json(self.details)
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapApiKeysCommand:
+    records: tuple[ApiKeyRecord, ...]
+    completed_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "records", tuple(self.records))
+        if any(not isinstance(item, ApiKeyRecord) for item in self.records):
+            raise TypeError("bootstrap records must contain ApiKeyRecord values")
+        object.__setattr__(self, "completed_at", utc_datetime(self.completed_at))
+
+
+@dataclass(frozen=True, slots=True)
+class ImportApiKeysCommand:
+    records: tuple[ApiKeyRecord, ...]
+    audit: AdminAuditEventRecord
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "records", tuple(self.records))
+        if not self.records:
+            raise ValueError("API key import cannot be empty")
+        if any(not isinstance(item, ApiKeyRecord) for item in self.records):
+            raise TypeError("import records must contain ApiKeyRecord values")
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateApiKeyCommand:
+    key_id: str
+    name: str
+    expires_at: datetime | None
+    updated_at: datetime
+    audit: AdminAuditEventRecord
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key_id", _required_text(self.key_id, "key_id"))
+        name = _required_text(self.name, "name")
+        if len(name) > 80:
+            raise ValueError("API key name cannot exceed 80 characters")
+        object.__setattr__(self, "name", name)
+        if self.expires_at is not None:
+            object.__setattr__(self, "expires_at", utc_datetime(self.expires_at))
+        object.__setattr__(self, "updated_at", utc_datetime(self.updated_at))
+
+
+@dataclass(frozen=True, slots=True)
+class RevokeApiKeyCommand:
+    key_id: str
+    revoked_at: datetime
+    audit: AdminAuditEventRecord
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key_id", _required_text(self.key_id, "key_id"))
+        object.__setattr__(self, "revoked_at", utc_datetime(self.revoked_at))
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupCommand:
     minute_before: datetime
     aggregate_before: datetime
@@ -383,6 +503,12 @@ WriteCommand = (
     | DividendEventRecord
     | YieldMetricRecord
     | ProviderCheckpointRecord
+    | ApiKeyRecord
+    | AdminAuditEventRecord
+    | BootstrapApiKeysCommand
+    | ImportApiKeysCommand
+    | UpdateApiKeyCommand
+    | RevokeApiKeyCommand
     | CleanupCommand
 )
 

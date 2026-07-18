@@ -75,6 +75,25 @@ class QuickPriceService:
         self._persistence_tasks: set[asyncio.Task[Any]] = set()
         self._started = False
         self._storage_ready = False
+        self._api_key_configured: Any = None
+
+    @property
+    def storage(self) -> Any:
+        """Expose the initialized persistence boundary to control-plane managers."""
+
+        return self._storage
+
+    def bind_api_key_state(self, configured: Any) -> None:
+        """Bind a zero-I/O callable used by readiness after durable key bootstrap."""
+
+        if not callable(configured):
+            raise TypeError("configured must be callable")
+        self._api_key_configured = configured
+
+    def _has_active_api_key(self) -> bool:
+        if self._api_key_configured is not None:
+            return bool(self._api_key_configured())
+        return bool(self.settings.api_key_hashes)
 
     async def start(self) -> None:
         if self._started:
@@ -803,7 +822,7 @@ class QuickPriceService:
             complete_count = len(self._complete_symbols)
         return (
             runtime_ok
-            and bool(self.settings.api_key_hashes)
+            and self._has_active_api_key()
             and self._storage_ready
             and (collectors_running or not self.settings.background_enabled)
             and complete_count == len(self.registry)
@@ -833,7 +852,7 @@ class QuickPriceService:
             "ready": False,
             "runtime": runtime.as_dict(),
             "free_threaded_required": self.settings.require_free_threaded,
-            "api_key_configured": bool(self.settings.api_key_hashes),
+            "api_key_configured": self._has_active_api_key(),
             "storage_ready": self._storage_ready,
             "collectors_running": collectors_running,
             "collector_failure": (
