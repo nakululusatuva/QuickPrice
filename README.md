@@ -333,6 +333,17 @@ recognized provider credential names are accepted. Process environment values
 override file values, which allows a service manager or CI secret store to
 replace individual credentials without editing the file.
 
+Provider egress can use an explicit HTTP CONNECT proxy without changing the
+inbound reverse proxy. Set `QUICKPRICE_PROVIDER_PROXY_URL` to proxy every REST
+and WebSocket provider by default. Set `QUICKPRICE_PROVIDER_PROXY_NAMES` to a
+comma-separated allowlist when only selected providers should use it. Built-in
+names include `binance`, `kraken`, `coingecko`, `binance_wbeth_rate`,
+`ethereum_exchange_rate`, `lido`, `alpaca`, `finnhub`, `twelve_data`,
+`alpha_vantage`, and `fred`. A plugin installer can apply the same policy with
+`settings.proxy_url_for_provider(name)`. Treat an authenticated proxy URL as a
+secret even though local unauthenticated proxy addresses normally belong in
+the non-secret application configuration.
+
 `QUICKPRICE_API_KEY_HASHES` remains in application configuration because it is
 the service's client-authentication state, not a market-data provider secret.
 Generate a raw key and its stored hash with:

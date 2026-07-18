@@ -16,6 +16,15 @@ credentials from separate files. Expected ownership and modes are:
 The reverse proxy must not inherit either application file. QuickPrice is
 proxy-agnostic and expects TLS termination in a separately managed HTTP server.
 
+An outbound provider proxy is independent from that inbound reverse proxy.
+`QUICKPRICE_PROVIDER_PROXY_URL` alone applies to every provider. Define
+`QUICKPRICE_PROVIDER_PROXY_NAMES` as a comma-separated allowlist when some
+providers should remain direct. Validate both REST and WebSocket endpoints from
+the service host before enabling a provider; Binance streaming additionally
+requires CONNECT access to port 9443. After a change, inspect source and
+fallback metadata rather than assuming that an HTTP 200 liveness response
+proves provider reachability.
+
 ## Normal baseline
 
 ```bash
