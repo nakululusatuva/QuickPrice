@@ -788,6 +788,111 @@ assertEqual(order(tied, "price", false), ["ALPHA", "BETA"], "descending tie brea
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_refresh_reapplies_active_sort_after_live_values_change() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    rows_helper = source[
+        source.index("function rows()") : source.index("\n\nfunction instrumentExpansion")
+    ]
+    sort_helpers = source[
+        source.index("function finiteNumber") : source.index("\n\nfunction updateSortControls")
+    ]
+    visible_rows_helper = source[
+        source.index("function visibleRows") : source.index("\n\nfunction metadataItem")
+    ]
+    refresh_helper = source[
+        source.index("async function refreshQuotes") : source.index("\n\nasync function connect")
+    ]
+    assertions = r"""
+const instruments = [
+  { symbol: "ALPHA", name: "Alpha", description: "Alpha", asset_class: "equity", asset_type: "stock" },
+  { symbol: "BETA", name: "Beta", description: "Beta", asset_class: "equity", asset_type: "stock" },
+];
+const state = {
+  apiKey: "test-key",
+  refreshing: false,
+  instruments,
+  quotes: new Map(),
+  quoteErrors: new Map(),
+  sortField: "price",
+  ascending: true,
+};
+const ui = {
+  search: { value: "" },
+  assetFilter: { value: "" },
+  statusFilter: { value: "" },
+  refreshMarket: { disabled: false },
+  lastRefresh: { textContent: "" },
+  marketNotice: {},
+  connectionBadge: {},
+};
+const quote = (symbol, price, oneHour) => ({
+  symbol,
+  price,
+  changes: { "1h": { percent: oneHour } },
+  market_status: "open",
+  source: { provider: "fixture", feed: "fixture" },
+  quality: { stale: false },
+});
+const responses = [
+  { data: [quote("ALPHA", 1, 0), quote("BETA", 2, 0)], errors: [] },
+  { data: [quote("ALPHA", 3, 0), quote("BETA", 2, 0)], errors: [] },
+  { data: [quote("ALPHA", 3, -1), quote("BETA", 2, 2)], errors: [] },
+  { data: [quote("ALPHA", 3, 4), quote("BETA", 2, 2)], errors: [] },
+];
+const renderedOrders = [];
+
+function chunks(values) { return [values]; }
+async function apiJson() { return responses.shift(); }
+function dateTime(value) { return value; }
+function setNotice() {}
+function setBadge() {}
+function updateFixtureWarning() {}
+function updateSummary() {}
+function handleConnectionError(error) { throw error; }
+function renderMarket() {
+  renderedOrders.push(visibleRows().map((item) => item.instrument.symbol));
+}
+function assertOrder(index, expected, label) {
+  const actual = renderedOrders[index];
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+(async () => {
+  await refreshQuotes();
+  await refreshQuotes();
+  state.sortField = "1h";
+  await refreshQuotes();
+  await refreshQuotes();
+
+  assertOrder(0, ["ALPHA", "BETA"], "initial price order");
+  assertOrder(1, ["BETA", "ALPHA"], "updated price order");
+  assertOrder(2, ["ALPHA", "BETA"], "initial change order");
+  assertOrder(3, ["BETA", "ALPHA"], "updated change order");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        [
+            shutil.which("node") or "node",
+            "-e",
+            rows_helper + sort_helpers + visible_rows_helper + refresh_helper + assertions,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
 def test_dashboard_sort_header_accessibility_tracks_the_active_sort() -> None:
     script_path = (
         Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
