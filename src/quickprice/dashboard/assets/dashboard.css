@@ -669,6 +669,23 @@ a:focus-visible {
   background: color-mix(in srgb, var(--primary-soft) 38%, var(--surface));
 }
 
+.market-row.availability-incomplete td,
+.market-row.availability-incomplete td:first-child {
+  background: color-mix(in srgb, var(--warning-soft) 24%, var(--surface));
+}
+
+.market-row.availability-unavailable td,
+.market-row.availability-unavailable td:first-child {
+  background: color-mix(in srgb, var(--negative-soft) 18%, var(--surface));
+}
+
+.market-row.availability-incomplete:hover td,
+.market-row.availability-incomplete:hover td:first-child,
+.market-row.availability-unavailable:hover td,
+.market-row.availability-unavailable:hover td:first-child {
+  background: color-mix(in srgb, var(--primary-soft) 32%, var(--surface));
+}
+
 .instrument-symbol {
   display: block;
   font-weight: 800;
@@ -682,6 +699,28 @@ a:focus-visible {
   color: var(--text-muted);
   font-size: 11px;
   text-overflow: ellipsis;
+}
+
+.availability-label {
+  display: inline-block;
+  margin-top: 5px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.availability-label.is-incomplete {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.availability-label.is-unavailable {
+  color: var(--negative);
+  background: var(--negative-soft);
 }
 
 .price-value {
@@ -720,6 +759,16 @@ a:focus-visible {
   font-size: 10px;
 }
 
+.income-label.is-proxy {
+  color: var(--warning);
+  font-weight: 750;
+}
+
+.income-label.is-estimate {
+  color: var(--primary);
+  font-weight: 700;
+}
+
 .market-state,
 .source-provider,
 .source-feed {
@@ -738,6 +787,27 @@ a:focus-visible {
 .source-feed {
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.source-unavailable {
+  color: var(--negative);
+}
+
+.availability-reason {
+  display: block;
+  width: 190px;
+  margin-top: 4px;
+  margin-left: auto;
+  overflow-wrap: anywhere;
+  color: var(--warning);
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: right;
+  white-space: normal;
+}
+
+.availability-unavailable .availability-reason {
+  color: var(--negative);
 }
 
 .inspect-button {

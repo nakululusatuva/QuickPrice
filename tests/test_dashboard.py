@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+from datetime import timedelta
 from importlib.resources import files
 from pathlib import Path
 
@@ -14,6 +15,11 @@ from fastapi.testclient import TestClient
 
 from quickprice.api import create_app
 from quickprice.dashboard_logs import DashboardLogBroker, DashboardLogCapacityError
+from quickprice.domain import ProviderQuote, YieldMetric
+from quickprice.plugin_api import AssetClass, InstrumentPlugin, InstrumentSpec, YieldStrategy
+from quickprice.registry import InstrumentRegistry
+from quickprice.service import DataUnavailableError, QuickPriceService
+from tests.helpers import NOW, seed_complete
 
 
 def _assert_security_headers(response) -> None:
@@ -69,6 +75,7 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert '"X-API-Key"' in javascript.text
     assert 'headers["Last-Event-ID"]' in javascript.text
     assert "chunks(symbols, 100)" in javascript.text
+    assert "/internal/dashboard/quotes?symbols=" in javascript.text
     assert "expandedSymbols: new Set()" in javascript.text
     assert "state.expandedSymbols.clear()" in javascript.text
     assert 'inspect.setAttribute("aria-expanded", String(expansion.expanded))' in javascript.text
@@ -77,12 +84,121 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert "updateFixtureWarning();" in javascript.text
     assert "source.provider" in javascript.text
     assert "source.feed" in javascript.text
+    assert "Yield is proxy" in javascript.text
+    assert 'label.classList.add("is-proxy")' in javascript.text
     assert "not live market data" in javascript.text
     assert "JSON.stringify({ instrument, quote, error: item.error }" in javascript.text
+    assert "availability-reason" in javascript.text
     assert "new EventSource" not in javascript.text
     assert "Chart(" not in javascript.text
     _assert_security_headers(css)
     _assert_security_headers(javascript)
+
+
+def test_dashboard_quote_projection_keeps_price_with_exact_metadata_error(
+    settings,
+    auth_headers,
+) -> None:
+    service = QuickPriceService(settings)
+    seed_complete(service, missing={"ETH:USDC"})
+    aapl_quote = service._last_quotes["AAPL:USD"]
+    service._dividends.pop("AAPL:USD")
+    service.publish_quote(aapl_quote, persist=False)
+
+    with TestClient(create_app(settings, service)) as local_client:
+        unauthorized = local_client.get("/internal/dashboard/quotes")
+        public = local_client.get("/v1/quotes/AAPL:USD", headers=auth_headers)
+        dashboard = local_client.get(
+            "/internal/dashboard/quotes?symbols=AAPL:USD,ETH:USDC",
+            headers=auth_headers,
+        )
+
+    assert unauthorized.status_code == 401
+    assert unauthorized.json()["errors"][0]["code"] == "unauthorized"
+    assert public.status_code == 503
+    assert public.json()["errors"][0]["message"] == (
+        "required latest regular dividend is unavailable"
+    )
+    assert dashboard.status_code == 200
+    body = dashboard.json()
+    assert body["partial"] is True
+    assert [(item["symbol"], item["price"]) for item in body["data"]] == [("AAPL:USD", 225.0)]
+    assert body["data"][0]["dividend"] is None
+    assert {(item["symbol"], item["message"]) for item in body["errors"]} == {
+        ("AAPL:USD", "required latest regular dividend is unavailable"),
+        ("ETH:USDC", "no valid price has ever been received"),
+    }
+    _assert_security_headers(dashboard)
+
+
+def test_best_effort_quote_projection_preserves_dynamic_stale_yield_quality(settings) -> None:
+    symbol = "MIXED:USD"
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="mixed-income-test",
+                version="1",
+                instruments=(
+                    InstrumentSpec(
+                        symbol=symbol,
+                        base="MIXED",
+                        quote="USD",
+                        name="Mixed Income Test Fund",
+                        description="Test instrument requiring both yield and dividend metadata.",
+                        asset_class=AssetClass.BOND,
+                        asset_type="income_bond_etf",
+                        price_basis="last_trade",
+                        yield_strategy=YieldStrategy.TREASURY_3M_PROXY_MINUS_EXPENSE,
+                        dividend_strategy="latest_regular_cash_annualized_x4",
+                    ),
+                ),
+                provider_installer=lambda _: None,
+            ),
+        )
+    )
+    service = QuickPriceService(settings, registry)
+    service.publish_yield_metric(
+        YieldMetric(
+            symbol=symbol,
+            value="4.25",
+            as_of=NOW,
+            method="DGS3MO",
+            provider="fred",
+            is_proxy=True,
+        ),
+        persist=False,
+    )
+    service.publish_quote(
+        ProviderQuote(
+            symbol=symbol,
+            price="100",
+            as_of=NOW,
+            provider="fixture",
+            feed="fixture",
+            market_status="open",
+        ),
+        persist=False,
+    )
+    projected_at = NOW + timedelta(days=8)
+
+    with pytest.raises(
+        DataUnavailableError,
+        match="required latest regular dividend is unavailable",
+    ):
+        service.get_quote(symbol, now=projected_at)
+    quote = service.get_quote(
+        symbol,
+        now=projected_at,
+        require_complete_metadata=False,
+    )
+
+    assert quote.dividend is None
+    assert quote.quality.stale is True
+    assert quote.quality.staleness_ms == 8 * 24 * 60 * 60 * 1000
+    assert quote.estimated_annual_yield is not None
+    assert quote.estimated_annual_yield.quality.stale is True
+    assert quote.estimated_annual_yield.quality.staleness_ms == 8 * 24 * 60 * 60 * 1000
+    assert quote.estimated_annual_yield.quality.stale_after_seconds == 7 * 24 * 60 * 60
 
 
 def test_dashboard_static_files_are_installed_package_resources() -> None:
@@ -326,6 +442,126 @@ for (const [source, expected] of cases) {
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-e", classifier + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_availability_distinguishes_incomplete_and_missing_prices() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function textValue") : source.index("\n\nfunction changePercent")
+    ]
+    assertions = r"""
+function assertAvailability(item, kind, label, reason, code) {
+  const actual = availability(item);
+  if (
+    actual.kind !== kind
+    || actual.label !== label
+    || actual.reason !== reason
+    || actual.code !== code
+  ) {
+    throw new Error(`unexpected availability: ${JSON.stringify(actual)}`);
+  }
+}
+
+assertAvailability(
+  { quote: { price: 225 }, error: null },
+  "available", "Available", null, null,
+);
+assertAvailability(
+  {
+    quote: { price: 225 },
+    error: { code: "data_unavailable", message: "required dividend is unavailable" },
+  },
+  "incomplete", "Metadata incomplete", "required dividend is unavailable", "data_unavailable",
+);
+assertAvailability(
+  {
+    quote: null,
+    error: { code: "data_unavailable", message: "no valid price has ever been received" },
+  },
+  "unavailable", "Price unavailable", "no valid price has ever been received", "data_unavailable",
+);
+assertAvailability(
+  { quote: null, error: null },
+  "unavailable", "Price unavailable", "No valid price snapshot is available.", "data_unavailable",
+);
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helpers + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_yield_labels_distinguish_official_estimates_and_proxies() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    text_value = source[
+        source.index("function textValue") : source.index("\n\nfunction availability")
+    ]
+    yield_label = source[
+        source.index("function yieldLabel") : source.index("\n\nfunction incomeCell")
+    ]
+    assertions = r"""
+const cases = [
+  [{ rate_type: "apr", is_proxy: false, is_estimate: false }, "APR"],
+  [{ rate_type: "apy", is_proxy: false, is_estimate: true }, "Estimated APY"],
+  [{ rate_type: "apy", is_proxy: true, is_estimate: true }, "Proxy APY"],
+  [{ method: "custom" }, "YIELD"],
+];
+for (const [value, expected] of cases) {
+  const actual = yieldLabel(value);
+  if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
+}
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", text_value + yield_label + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_income_percentage_does_not_use_a_price_change_sign() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helper = source[
+        source.index("function incomePercent") : source.index("\n\nfunction changeClass")
+    ]
+    assertions = r"""
+const cases = [
+  [2.41868, "2.42%"],
+  [0, "0.00%"],
+  [-0.25, "-0.25%"],
+  [Number.NaN, "-"],
+];
+for (const [value, expected] of cases) {
+  const actual = incomePercent(value);
+  if (actual !== expected) throw new Error(`expected ${expected}, got ${actual}`);
+}
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helper + assertions],
         check=False,
         capture_output=True,
         text=True,

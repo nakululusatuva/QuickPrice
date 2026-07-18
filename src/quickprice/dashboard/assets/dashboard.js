@@ -178,6 +178,11 @@ function percent(value) {
   return `${sign}${value.toFixed(2)}%`;
 }
 
+function incomePercent(value) {
+  if (!Number.isFinite(value)) return "-";
+  return `${value.toFixed(2)}%`;
+}
+
 function changeClass(value) {
   if (!Number.isFinite(value) || value === 0) return "change-flat";
   return value > 0 ? "change-positive" : "change-negative";
@@ -227,6 +232,28 @@ function finiteNumber(value) {
 
 function textValue(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function availability(item) {
+  const reason = textValue(item.error?.message);
+  const code = textValue(item.error?.code);
+  if (!item.quote) {
+    return {
+      kind: "unavailable",
+      label: "Price unavailable",
+      reason: reason ?? "No valid price snapshot is available.",
+      code: code ?? "data_unavailable",
+    };
+  }
+  if (item.error) {
+    return {
+      kind: "incomplete",
+      label: "Metadata incomplete",
+      reason: reason ?? "Required instrument metadata is unavailable.",
+      code: code ?? "data_incomplete",
+    };
+  }
+  return { kind: "available", label: "Available", reason: null, code: null };
 }
 
 function changePercent(item, windowName) {
@@ -391,6 +418,9 @@ function visibleRows() {
       item.instrument.asset_type,
       item.quote?.source?.provider,
       item.quote?.source?.feed,
+      item.error?.code,
+      item.error?.message,
+      availability(item).label,
     ].filter(Boolean).join(" ").toLowerCase();
     const itemStatus = marketStatus(item);
     return (!query || haystack.includes(query))
@@ -419,6 +449,7 @@ function buildDetails(item) {
   metadata.className = "metadata-grid";
   const instrument = item.instrument;
   const quote = item.quote;
+  const dataAvailability = availability(item);
   const fields = [
     ["Symbol", instrument.symbol],
     ["Name", instrument.name],
@@ -429,6 +460,9 @@ function buildDetails(item) {
     ["Price basis", quote?.price_basis || instrument.price_basis],
     ["Change basis", instrument.change_basis],
     ["Market status", marketStatus(item)],
+    ["Data status", dataAvailability.label],
+    ["Status reason", dataAvailability.reason],
+    ["Status code", dataAvailability.code],
     ["As of", dateTime(quote?.as_of)],
     ["Provider", quote?.source?.provider],
     ["Feed", quote?.source?.feed],
@@ -440,6 +474,28 @@ function buildDetails(item) {
     ["Snapshot age", quote ? duration(quote.quality?.staleness_ms) : "-"],
     ["Dividend method", instrument.dividend_method],
     ["Yield method", instrument.yield_method],
+    ["Yield provider", quote?.estimated_annual_yield?.provider],
+    ["Yield calculation", quote?.estimated_annual_yield?.method],
+    ["Yield rate type", quote?.estimated_annual_yield?.rate_type],
+    [
+      "Yield observation window",
+      quote?.estimated_annual_yield?.observation_window_days == null
+        ? "-"
+        : `${quote.estimated_annual_yield.observation_window_days} days`,
+    ],
+    [
+      "Yield is proxy",
+      quote?.estimated_annual_yield?.is_proxy === undefined
+        ? "-"
+        : String(quote.estimated_annual_yield.is_proxy),
+    ],
+    [
+      "Yield is estimate",
+      quote?.estimated_annual_yield?.is_estimate === undefined
+        ? "-"
+        : String(quote.estimated_annual_yield.is_estimate),
+    ],
+    ["Yield confidence", quote?.estimated_annual_yield?.quality?.confidence],
     ["Reward accrual", instrument.reward_accrual_mode],
     ["Underlying", instrument.underlying_asset],
   ];
@@ -466,20 +522,31 @@ function marketCell(item) {
   return cell;
 }
 
+function yieldLabel(value) {
+  const rateType = textValue(value?.rate_type)?.toUpperCase() || "YIELD";
+  if (value?.is_proxy) return `Proxy ${rateType}`;
+  if (value?.is_estimate) return `Estimated ${rateType}`;
+  return rateType;
+}
+
 function incomeCell(item) {
   const cell = document.createElement("td");
   const dividend = item.quote?.dividend;
   const annualYield = item.quote?.estimated_annual_yield;
   if (dividend) {
     cell.append(
-      textNode("strong", percent(dividend.yield_percent), "income-value"),
+      textNode("strong", incomePercent(dividend.yield_percent), "income-value"),
       textNode("small", `Dividend - ${dividend.frequency}`, "income-label"),
     );
   }
   if (annualYield) {
+    const label = textNode("small", yieldLabel(annualYield), "income-label");
+    if (annualYield.is_proxy) label.classList.add("is-proxy");
+    else if (annualYield.is_estimate) label.classList.add("is-estimate");
+    label.title = `${annualYield.provider || "Unknown provider"} - ${annualYield.method || "Unspecified method"}`;
     cell.append(
-      textNode("strong", percent(annualYield.percent), "income-value"),
-      textNode("small", annualYield.rate_type || annualYield.method, "income-label"),
+      textNode("strong", incomePercent(annualYield.percent), "income-value"),
+      label,
     );
   }
   if (!dividend && !annualYield) cell.append(textNode("span", "-", "value-empty"));
@@ -491,14 +558,24 @@ function renderMarket() {
   const fragment = document.createDocumentFragment();
   for (const item of items) {
     const expansion = instrumentExpansion(item.instrument.symbol);
+    const dataAvailability = availability(item);
     const row = document.createElement("tr");
-    row.className = "market-row";
+    row.className = `market-row availability-${dataAvailability.kind}`;
     const instrumentCell = document.createElement("td");
     instrumentCell.append(
       textNode("strong", item.instrument.symbol, "instrument-symbol"),
       textNode("span", item.instrument.name, "instrument-name"),
       textNode("span", `${item.instrument.asset_class} / ${item.instrument.asset_type}`, "source-feed"),
     );
+    if (dataAvailability.kind !== "available") {
+      instrumentCell.append(
+        textNode(
+          "span",
+          dataAvailability.label,
+          `availability-label is-${dataAvailability.kind}`,
+        ),
+      );
+    }
     const priceCell = document.createElement("td");
     priceCell.append(
       textNode("strong", price(item.quote?.price), "price-value"),
@@ -511,15 +588,28 @@ function renderMarket() {
     }
     row.append(incomeCell(item), marketCell(item));
     const sourceCell = document.createElement("td");
-    sourceCell.append(
-      textNode("strong", item.quote?.source?.provider || "-", "source-provider"),
-      textNode("span", item.quote?.source?.feed || item.error?.code || "No snapshot", "source-feed"),
-      textNode(
-        "span",
-        item.quote?.quality?.stale ? duration(item.quote.quality.staleness_ms) : "Current",
-        item.quote?.quality?.stale ? "change-negative" : "change-flat",
-      ),
-    );
+    if (item.quote) {
+      sourceCell.append(
+        textNode("strong", item.quote.source?.provider || "-", "source-provider"),
+        textNode("span", item.quote.source?.feed || "Feed unavailable", "source-feed"),
+        textNode(
+          "span",
+          item.quote.quality?.stale ? duration(item.quote.quality.staleness_ms) : "Current",
+          item.quote.quality?.stale ? "change-negative" : "change-flat",
+        ),
+      );
+    } else {
+      sourceCell.append(
+        textNode("strong", "Unavailable", "source-provider source-unavailable"),
+        textNode("span", dataAvailability.code, "source-feed"),
+        textNode("span", "No price snapshot", "change-negative"),
+      );
+    }
+    if (dataAvailability.reason) {
+      const reason = textNode("span", dataAvailability.reason, "availability-reason");
+      reason.title = dataAvailability.reason;
+      sourceCell.append(reason);
+    }
     row.append(sourceCell);
     const actionCell = document.createElement("td");
     const inspect = textNode("button", expansion.buttonText, "inspect-button");
@@ -573,7 +663,7 @@ async function refreshQuotes() {
     const symbols = state.instruments.map((item) => item.symbol);
     const envelopes = await Promise.all(
       chunks(symbols, 100).map((group) => apiJson(
-        `/v1/quotes?symbols=${encodeURIComponent(group.join(","))}`,
+        `/internal/dashboard/quotes?symbols=${encodeURIComponent(group.join(","))}`,
         { allowUnavailable: true },
       )),
     );
@@ -587,13 +677,26 @@ async function refreshQuotes() {
     }
     const generated = envelopes.map((item) => item.generated_at).filter(Boolean).sort().at(-1);
     ui.lastRefresh.textContent = dateTime(generated || new Date().toISOString());
-    const missing = state.instruments.length - state.quotes.size;
+    const incomplete = [...state.quoteErrors.keys()].filter(
+      (symbol) => state.quotes.has(symbol),
+    ).length;
+    const unavailable = state.instruments.length - state.quotes.size;
+    const issueSummary = [
+      incomplete ? `${incomplete} metadata incomplete` : null,
+      unavailable ? `${unavailable} unavailable` : null,
+    ].filter(Boolean).join("; ");
     setNotice(
       ui.marketNotice,
-      missing ? `${state.quotes.size} priced; ${missing} unavailable. Details remain visible.` : "All registered instruments are priced.",
-      missing ? "neutral" : "success",
+      issueSummary
+        ? `${state.quotes.size} priced; ${issueSummary}. Exact reasons are shown with each instrument.`
+        : "All registered instruments are priced and complete.",
+      issueSummary ? "neutral" : "success",
     );
-    setBadge(ui.connectionBadge, missing ? "Partial" : "Connected", missing ? "warn" : "good");
+    setBadge(
+      ui.connectionBadge,
+      issueSummary ? "Partial" : "Connected",
+      issueSummary ? "warn" : "good",
+    );
     updateFixtureWarning();
     updateSummary();
     renderMarket();

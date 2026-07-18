@@ -338,6 +338,77 @@ def create_app(
     async def metrics_endpoint(request: Request) -> dict[str, Any]:
         return _envelope(request, data=service.operational_metrics())
 
+    @app.get("/internal/dashboard/quotes", include_in_schema=False)
+    async def dashboard_quotes(
+        request: Request,
+        symbols: Annotated[
+            str | None,
+            Query(min_length=1, description="Comma-separated instrument symbols, maximum 100"),
+        ] = None,
+    ) -> JSONResponse:
+        """Return the best in-memory quote projection for the operations dashboard.
+
+        The public quote API intentionally rejects snapshots missing mandatory
+        dividend or yield metadata. The private dashboard still needs to expose
+        an existing market price while retaining that exact completeness error,
+        so operators can distinguish an absent price from incomplete metadata.
+        """
+
+        if symbols is None:
+            requested = list(registry.symbols)
+        else:
+            requested = []
+            for raw in symbols.split(","):
+                normalized = normalize_symbol(raw)
+                instrument = registry.resolve(normalized)
+                symbol = instrument.symbol if instrument is not None else normalized
+                if symbol and symbol not in requested:
+                    requested.append(symbol)
+            if not requested:
+                raise APIError(422, "invalid_request", "symbols cannot be empty")
+            if len(requested) > 100:
+                raise APIError(
+                    422,
+                    "invalid_request",
+                    "symbols cannot contain more than 100 items",
+                )
+
+        data: list[dict[str, Any]] = []
+        errors: list[ErrorModel] = []
+        now = utc_now()
+        for symbol in requested:
+            instrument = registry.resolve(symbol)
+            if instrument is None:
+                errors.append(
+                    ErrorModel(code="unknown_symbol", message="unsupported symbol", symbol=symbol)
+                )
+                continue
+            try:
+                quote = service.get_quote(instrument.symbol, now=now)
+            except DataUnavailableError as exc:
+                errors.append(
+                    ErrorModel(code=exc.code, message=exc.reason, symbol=instrument.symbol)
+                )
+                try:
+                    quote = service.get_quote(
+                        instrument.symbol,
+                        now=now,
+                        require_complete_metadata=False,
+                    )
+                except DataUnavailableError:
+                    continue
+            data.append(quote.model_dump(mode="json"))
+
+        return JSONResponse(
+            _envelope(
+                request,
+                data=data,
+                errors=errors,
+                partial=bool(errors),
+                generated_at=now,
+            )
+        )
+
     @app.get(_LOG_STREAM_PATH, include_in_schema=False)
     async def dashboard_log_stream(request: Request) -> StreamingResponse:
         raw_last_event_id = request.headers.get("Last-Event-ID")
