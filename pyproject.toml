@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "quickprice"
-version = "1.6.3"
+version = "1.7.0"
 description = "A private, cache-first market data service for Excel Power Query"
 readme = "README.md"
 requires-python = ">=3.14"
