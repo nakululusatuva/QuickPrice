@@ -1,0 +1,8 @@
+{
+  "meta": {"symbol": "USD/CNH", "interval": "1min"},
+  "values": [
+    {"datetime": "2026-07-20 14:29:00", "close": "7.21480"},
+    {"datetime": "2026-07-20 14:30:00", "close": "7.21530"}
+  ],
+  "status": "ok"
+}

@@ -1,0 +1,12 @@
+{
+  "symbol": "SGOV",
+  "data": [
+    {
+      "ex_dividend_date": "2026-07-01",
+      "declaration_date": "2026-06-27",
+      "record_date": "2026-07-01",
+      "payment_date": "2026-07-07",
+      "amount": "0.3765"
+    }
+  ]
+}
