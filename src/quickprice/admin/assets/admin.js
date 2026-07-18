@@ -1,6 +1,7 @@
 "use strict";
 
 const THEME_KEY = "quickprice-admin-theme";
+const CATALOG_JOB_KEY = "quickprice-admin-catalog-job";
 const STATISTICS_REFRESH_MS = 15_000;
 
 const state = {
@@ -12,7 +13,13 @@ const state = {
   providerRevision: null,
   instruments: [],
   instrumentRevision: null,
-  instrumentDirty: new Map(),
+  instrumentCatalog: null,
+  instrumentEditingId: null,
+  providerCatalog: [],
+  catalogJobId: null,
+  catalogJobLabel: null,
+  catalogJobRetryCount: 0,
+  catalogJobTimer: null,
   configuration: [],
   configurationRevision: null,
   configurationOriginal: new Map(),
@@ -66,7 +73,67 @@ const ui = {
   instrumentsBody: element("instruments-body"),
   instrumentsEmpty: element("instruments-empty"),
   refreshInstruments: element("refresh-instruments"),
-  saveInstruments: element("save-instruments"),
+  createInstrument: element("create-instrument"),
+  importInstrumentCatalog: element("import-instrument-catalog"),
+  exportInstrumentCatalog: element("export-instrument-catalog"),
+  validateInstrumentCatalog: element("validate-instrument-catalog"),
+  activateInstrumentCatalog: element("activate-instrument-catalog"),
+  rollbackInstrumentCatalog: element("rollback-instrument-catalog"),
+  catalogActiveRevision: element("catalog-active-revision"),
+  catalogStagedRevision: element("catalog-staged-revision"),
+  catalogLastGoodRevision: element("catalog-last-good-revision"),
+  catalogJobStatus: element("catalog-job-status"),
+  catalogDiagnostics: element("catalog-diagnostics"),
+  catalogDiagnosticsTitle: element("catalog-diagnostics-title"),
+  catalogDiagnosticsList: element("catalog-diagnostics-list"),
+  closeCatalogDiagnostics: element("close-catalog-diagnostics"),
+  instrumentDialog: element("instrument-dialog"),
+  instrumentForm: element("instrument-form"),
+  instrumentDialogTitle: element("instrument-dialog-title"),
+  instrumentId: element("instrument-id"),
+  instrumentSymbol: element("instrument-symbol"),
+  instrumentBase: element("instrument-base"),
+  instrumentQuote: element("instrument-quote"),
+  instrumentName: element("instrument-name"),
+  instrumentDescription: element("instrument-description"),
+  instrumentAssetClass: element("instrument-asset-class"),
+  instrumentAssetType: element("instrument-asset-type"),
+  instrumentPriceBasis: element("instrument-price-basis"),
+  instrumentChangeBasis: element("instrument-change-basis"),
+  instrumentAliases: element("instrument-aliases"),
+  instrumentCalendar: element("instrument-calendar"),
+  instrumentEnabled: element("instrument-enabled"),
+  instrumentPoll: element("instrument-poll"),
+  instrumentStale: element("instrument-stale"),
+  instrumentHistoryEnabled: element("instrument-history-enabled"),
+  instrumentHistoryPoll: element("instrument-history-poll"),
+  instrumentHistoryDays: element("instrument-history-days"),
+  routeQuote: element("route-quote"),
+  routeHistory: element("route-history"),
+  routeDividend: element("route-dividend"),
+  routeYield: element("route-yield"),
+  instrumentProviderSymbols: element("instrument-provider-symbols"),
+  recommendInstrumentRoutes: element("recommend-instrument-routes"),
+  instrumentCreditEstimate: element("instrument-credit-estimate"),
+  providerSymbolProvider: element("provider-symbol-provider"),
+  providerSymbolQuery: element("provider-symbol-query"),
+  searchProviderSymbol: element("search-provider-symbol"),
+  providerSymbolResults: element("provider-symbol-results"),
+  instrumentYieldStrategy: element("instrument-yield-strategy"),
+  instrumentDividendStrategy: element("instrument-dividend-strategy"),
+  instrumentAccrualMode: element("instrument-accrual-mode"),
+  instrumentUnderlying: element("instrument-underlying"),
+  instrumentFredSeries: element("instrument-fred-series"),
+  instrumentExpenseRatio: element("instrument-expense-ratio"),
+  instrumentFallbackDays: element("instrument-fallback-days"),
+  instrumentSyntheticOperation: element("instrument-synthetic-operation"),
+  instrumentSyntheticInputs: element("instrument-synthetic-inputs"),
+  instrumentSyntheticSkew: element("instrument-synthetic-skew"),
+  instrumentSyntheticAges: element("instrument-synthetic-ages"),
+  importInstrumentDialog: element("import-instrument-dialog"),
+  importInstrumentForm: element("import-instrument-form"),
+  importInstrumentMode: element("import-instrument-mode"),
+  importInstrumentJson: element("import-instrument-json"),
   configurationForm: element("configuration-form"),
   configurationEmpty: element("configuration-empty"),
   restartBanner: element("restart-banner"),
@@ -144,11 +211,13 @@ function updateSessionFromResponse(response, body) {
 async function adminRequest(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const headers = { Accept: "application/json" };
-  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+  const readOnlyMethod = ["GET", "HEAD", "OPTIONS"].includes(method);
+  const includeCsrf = options.csrf === true || (!readOnlyMethod && options.csrf !== false);
+  if (!readOnlyMethod) {
     headers["Content-Type"] = "application/json";
-    if (options.csrf !== false && !state.csrfToken) throw new Error("The administrator session cannot authorize changes. Sign in again.");
-    if (options.csrf !== false) headers["X-CSRF-Token"] = state.csrfToken;
   }
+  if (includeCsrf && !state.csrfToken) throw new Error("The administrator session cannot authorize changes. Sign in again.");
+  if (includeCsrf) headers["X-CSRF-Token"] = state.csrfToken;
   const response = await fetch(`/admin-api${path}`, {
     method,
     credentials: "same-origin",
@@ -210,12 +279,14 @@ function showConsole() {
   ui.totp.value = "";
   startSessionClock();
   selectPanel(state.activePanel, { force: true });
+  resumeCatalogJob();
 }
 
 function clearSensitiveInputs() {
   ui.adminKey.value = "";
   ui.totp.value = "";
   ui.importKeysJson.value = "";
+  ui.importInstrumentJson.value = "";
   ui.revealedApiKey.textContent = "";
   ui.copyKeyStatus.textContent = "";
   for (const input of document.querySelectorAll('#provider-keys-body input[type="password"]')) input.value = "";
@@ -227,11 +298,14 @@ function endSession(message = "Verify your administrator credentials to continue
   state.apiKeys = [];
   state.providerKeys = [];
   state.instruments = [];
+  state.instrumentCatalog = null;
+  state.providerCatalog = [];
+  state.instrumentEditingId = null;
   state.configuration = [];
-  state.instrumentDirty.clear();
   state.configurationOriginal.clear();
   window.clearInterval(state.statisticsTimer);
   window.clearInterval(state.sessionTimer);
+  window.clearTimeout(state.catalogJobTimer);
   ui.consoleView.hidden = true;
   ui.loginView.hidden = false;
   clearSensitiveInputs();
@@ -693,15 +767,34 @@ function normalizeInstruments(body) {
     .sort((left, right) => left.symbol.localeCompare(right.symbol));
 }
 
+function catalogGeneration(body, name) {
+  const payload = nestedPayload(body);
+  const generation = payload?.[name];
+  if (generation && Array.isArray(generation.instruments)) return generation;
+  if (name === "active" && Array.isArray(payload?.instruments)) {
+    return { revision: payload.active_revision || payload.revision, instruments: payload.instruments };
+  }
+  return null;
+}
+
+function shortRevision(value) {
+  return typeof value === "string" && value ? value.slice(0, 12) : "-";
+}
+
 async function loadInstruments() {
   ui.refreshInstruments.disabled = true;
   try {
-    const body = await adminRequest("/instruments");
-    state.instruments = normalizeInstruments(body);
+    const body = await adminRequest("/instrument-catalog");
+    const active = catalogGeneration(body, "active");
+    const staged = catalogGeneration(body, "staged");
+    const lastKnownGood = catalogGeneration(body, "last_known_good");
+    const visible = staged || active || body;
+    state.instruments = normalizeInstruments(visible);
     state.instrumentRevision = metadata(body, "revision");
-    state.instrumentDirty.clear();
+    state.instrumentCatalog = { active, staged, lastKnownGood };
+    renderCatalogStatus();
     renderInstruments();
-    updateInstrumentSaveState();
+    await loadProviderCatalog({ quiet: true });
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -709,13 +802,34 @@ async function loadInstruments() {
   }
 }
 
+function renderCatalogStatus() {
+  const { active, staged, lastKnownGood } = state.instrumentCatalog || {};
+  ui.catalogActiveRevision.textContent = shortRevision(active?.revision);
+  ui.catalogActiveRevision.title = active?.revision || "";
+  ui.catalogStagedRevision.textContent = staged ? shortRevision(staged.revision) : "No draft";
+  ui.catalogStagedRevision.title = staged?.revision || "";
+  ui.catalogLastGoodRevision.textContent = shortRevision(lastKnownGood?.revision);
+  ui.catalogLastGoodRevision.title = lastKnownGood?.revision || "";
+  ui.validateInstrumentCatalog.disabled = !staged;
+  ui.activateInstrumentCatalog.disabled = !staged || Boolean(state.catalogJobId);
+  ui.rollbackInstrumentCatalog.disabled = !lastKnownGood || lastKnownGood.revision === active?.revision || Boolean(state.catalogJobId);
+  if (!state.catalogJobId) ui.catalogJobStatus.textContent = staged ? "Draft ready" : "Idle";
+}
+
 function renderInstruments() {
   const query = ui.instrumentSearch.value.trim().toLowerCase();
   const filter = ui.instrumentFilter.value;
   const items = state.instruments.filter((item) => {
-    const enabled = state.instrumentDirty.has(item.symbol) ? state.instrumentDirty.get(item.symbol) : item.enabled !== false;
-    const matchesState = !filter || (filter === "enabled" ? enabled : !enabled);
-    const matchesQuery = [item.symbol, item.name, item.asset_class, item.asset_type, item.provider, item.route].some((value) => String(value || "").toLowerCase().includes(query));
+    const enabled = item.enabled !== false && item.archived !== true;
+    const ownership = item.ownership || "builtin";
+    const matchesState = !filter
+      || (filter === "enabled" && enabled)
+      || (filter === "disabled" && !enabled && !item.archived)
+      || (filter === "custom" && ownership === "custom")
+      || (filter === "builtin" && ownership === "builtin")
+      || (filter === "archived" && item.archived === true);
+    const routeText = (item.routes || []).flatMap((route) => [route.capability, ...(route.providers || [])]).join(" ");
+    const matchesQuery = [item.id, item.symbol, item.name, item.asset_class, item.asset_type, routeText].some((value) => String(value || "").toLowerCase().includes(query));
     return matchesState && matchesQuery;
   });
   const fragment = document.createDocumentFragment();
@@ -726,59 +840,918 @@ function renderInstruments() {
 
 function instrumentRow(item) {
   const row = document.createElement("tr");
+  if (item.archived) row.classList.add("is-archived");
   const instrument = document.createElement("td");
-  instrument.append(textNode("span", item.symbol, "cell-primary"), textNode("span", item.name || item.description || "Installed instrument", "cell-secondary"));
+  instrument.append(
+    textNode("span", item.symbol, "cell-primary"),
+    textNode("span", item.name || item.description || "Managed instrument", "cell-secondary"),
+    textNode("code", item.id || "-", "catalog-id"),
+  );
   const classification = document.createElement("td");
-  classification.append(textNode("span", [item.asset_class, item.asset_type].filter(Boolean).join(" / ") || "-", "cell-primary"), textNode("span", item.underlying_asset ? `Underlying ${item.underlying_asset}` : "", "cell-secondary"));
+  classification.append(
+    textNode("span", [item.asset_class, item.asset_type].filter(Boolean).join(" / ") || "-", "cell-primary"),
+    textNode("span", item.income?.underlying_asset ? `Underlying ${item.income.underlying_asset}` : item.market_calendar || "", "cell-secondary"),
+  );
   const route = document.createElement("td");
-  route.append(textNode("span", item.provider || item.route || item.plugin || "Built-in", "cell-primary"), textNode("span", item.price_basis || "", "cell-secondary"));
+  const routes = item.routes || [];
+  if (routes.length) {
+    for (const capabilityRoute of routes) {
+      route.append(textNode("span", `${capabilityRoute.capability}: ${(capabilityRoute.providers || []).join(" > ")}`, "route-line"));
+    }
+  } else if (item.synthetic) {
+    route.append(textNode("span", `${item.synthetic.operation}: ${item.synthetic.inputs.join(" / ")}`, "route-line"));
+  } else {
+    route.append(textNode("span", "Automatic recommended route", "cell-secondary"));
+  }
+  const policy = document.createElement("td");
+  policy.append(
+    textNode("span", `${item.quote_poll_seconds ?? "-"}s polling`, "cell-primary"),
+    textNode("span", `${item.stale_after_seconds ?? "-"}s stale - history ${item.history?.enabled === false ? "off" : "on"}`, "cell-secondary"),
+  );
   const stateCell = document.createElement("td");
   const label = document.createElement("label");
   label.className = "switch";
   const toggle = document.createElement("input");
   toggle.type = "checkbox";
-  toggle.checked = state.instrumentDirty.has(item.symbol) ? state.instrumentDirty.get(item.symbol) : item.enabled !== false;
+  toggle.checked = item.enabled !== false && item.archived !== true;
+  toggle.disabled = item.archived === true;
   toggle.setAttribute("aria-label", `${toggle.checked ? "Disable" : "Enable"} ${item.symbol}`);
   const track = document.createElement("span");
   track.className = "switch-track";
-  const switchLabel = textNode("span", toggle.checked ? "Enabled" : "Disabled", "cell-secondary");
-  toggle.addEventListener("change", () => {
-    const original = item.enabled !== false;
-    if (toggle.checked === original) state.instrumentDirty.delete(item.symbol);
-    else state.instrumentDirty.set(item.symbol, toggle.checked);
-    switchLabel.textContent = toggle.checked ? "Enabled" : "Disabled";
-    toggle.setAttribute("aria-label", `${toggle.checked ? "Disable" : "Enable"} ${item.symbol}`);
-    updateInstrumentSaveState();
+  const switchLabel = textNode("span", item.archived ? "Archived" : toggle.checked ? "Enabled" : "Disabled", "cell-secondary");
+  toggle.addEventListener("change", async () => {
+    toggle.disabled = true;
+    try {
+      await stageInstrumentUpdate(item.id, { enabled: toggle.checked });
+      showToast(`${item.symbol} ${toggle.checked ? "enabled" : "disabled"} in the staged catalog.`, "success");
+    } catch (error) {
+      toggle.checked = !toggle.checked;
+      toggle.disabled = false;
+      showToast(error.message, "error");
+    }
   });
   label.append(toggle, track, switchLabel);
-  stateCell.append(label);
-  row.append(instrument, classification, route, stateCell);
+  stateCell.append(label, statusPill(item.ownership || "builtin", item.ownership === "custom" ? "warning" : "neutral"));
+  const actions = document.createElement("td");
+  actions.className = "cell-actions";
+  const edit = textNode("button", "Edit", "button button-quiet button-small");
+  edit.type = "button";
+  edit.addEventListener("click", () => openInstrumentEditor(item));
+  actions.append(edit);
+  if ((item.ownership || "builtin") === "custom") {
+    const archive = textNode("button", item.archived ? "Restore" : "Archive", item.archived ? "button button-secondary button-small" : "button button-danger button-small");
+    archive.type = "button";
+    archive.addEventListener("click", () => item.archived ? restoreInstrument(item, archive) : archiveInstrument(item, archive));
+    actions.append(archive);
+  }
+  row.append(instrument, classification, route, policy, stateCell, actions);
   return row;
 }
 
-function updateInstrumentSaveState() {
-  ui.saveInstruments.disabled = state.instrumentDirty.size === 0;
+async function stageInstrumentUpdate(instrumentId, changes) {
+  const body = await adminRequest(`/instrument-catalog/instruments/${encodeURIComponent(instrumentId)}`, {
+    method: "PATCH",
+    body: { revision: state.instrumentRevision, changes },
+  });
+  applyCatalogResponse(body);
+  return body;
 }
 
-async function saveInstruments() {
-  const changes = [...state.instrumentDirty].map(([symbol, enabled]) => {
-    const item = state.instruments.find((candidate) => candidate.symbol === symbol);
-    return {
-      symbol,
-      enabled,
-      quote_poll_seconds: item?.quote_poll_seconds,
-      stale_after_seconds: item?.stale_after_seconds,
-    };
+function applyCatalogResponse(body) {
+  const active = catalogGeneration(body, "active");
+  const staged = catalogGeneration(body, "staged");
+  const lastKnownGood = catalogGeneration(body, "last_known_good");
+  state.instrumentRevision = metadata(body, "revision", state.instrumentRevision);
+  state.instrumentCatalog = {
+    active: active || state.instrumentCatalog?.active || null,
+    staged,
+    lastKnownGood: lastKnownGood || state.instrumentCatalog?.lastKnownGood || null,
+  };
+  const visible = staged || active;
+  if (visible) state.instruments = normalizeInstruments(visible);
+  renderCatalogStatus();
+  renderInstruments();
+}
+
+function splitList(value, { lower = false, upper = false, maximum = 32 } = {}) {
+  let items = value.split(",").map((item) => item.trim()).filter(Boolean);
+  if (lower) items = items.map((item) => item.toLowerCase());
+  if (upper) items = items.map((item) => item.toUpperCase());
+  if (items.length > maximum || new Set(items).size !== items.length) throw new Error("List contains duplicates or exceeds its limit.");
+  return items;
+}
+
+function nullableNumber(input, { integer = false } = {}) {
+  if (!input.value.trim()) return null;
+  const value = integer ? Number.parseInt(input.value, 10) : Number(input.value);
+  if (!Number.isFinite(value)) throw new Error(`Enter a valid number for ${input.labels?.[0]?.textContent || "the field"}.`);
+  return value;
+}
+
+function routesFromForm() {
+  const controls = {
+    quote: ui.routeQuote,
+    history: ui.routeHistory,
+    dividend: ui.routeDividend,
+    yield: ui.routeYield,
+  };
+  return Object.entries(controls).flatMap(([capability, control]) => {
+    const providers = splitList(control.value, { lower: true, maximum: 4 });
+    return providers.length ? [{ capability, providers }] : [];
   });
-  if (!changes.length) return;
-  ui.saveInstruments.disabled = true;
+}
+
+function providerSymbolsFromForm() {
+  const bindings = [];
+  const providers = new Set();
+  for (const rawLine of ui.instrumentProviderSymbols.value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const separator = line.indexOf("=");
+    if (separator <= 0 || separator === line.length - 1) throw new Error("Each vendor binding must use provider=symbol.");
+    const provider = line.slice(0, separator).trim().toLowerCase();
+    const symbol = line.slice(separator + 1).trim();
+    if (providers.has(provider)) throw new Error(`Provider ${provider} has more than one vendor symbol.`);
+    providers.add(provider);
+    bindings.push({ provider, symbol });
+  }
+  return bindings;
+}
+
+function treasurySeriesConstraint(strategy, currentSeries) {
+  const legacy = strategy === "treasury_3m_proxy_minus_expense";
+  return {
+    legacy,
+    series: legacy ? "DGS3MO" : currentSeries,
+  };
+}
+
+function syncTreasurySeriesConstraint() {
+  const constraint = treasurySeriesConstraint(
+    ui.instrumentYieldStrategy.value,
+    ui.instrumentFredSeries.value,
+  );
+  ui.instrumentFredSeries.value = constraint.series;
+  for (const option of ui.instrumentFredSeries.options) {
+    option.disabled = constraint.legacy && option.value !== "DGS3MO";
+  }
+  ui.instrumentFredSeries.title = constraint.legacy
+    ? "The legacy three-month Treasury strategy requires DGS3MO."
+    : "Select a controlled FRED Treasury maturity for the Treasury proxy strategy.";
+}
+
+function incomeFromForm() {
+  syncTreasurySeriesConstraint();
+  const income = {
+    yield_strategy: ui.instrumentYieldStrategy.value || null,
+    dividend_strategy: ui.instrumentDividendStrategy.value.trim().toLowerCase() || null,
+    reward_accrual_mode: ui.instrumentAccrualMode.value || null,
+    underlying_asset: ui.instrumentUnderlying.value.trim().toUpperCase() || null,
+    fred_series: ui.instrumentFredSeries.value || null,
+    expense_ratio_percent: nullableNumber(ui.instrumentExpenseRatio),
+    fallback_ratio_days: nullableNumber(ui.instrumentFallbackDays, { integer: true }),
+  };
+  return Object.values(income).some((value) => value != null) ? income : null;
+}
+
+function syntheticFromForm() {
+  const operation = ui.instrumentSyntheticOperation.value;
+  if (!operation) return null;
+  const ages = splitList(ui.instrumentSyntheticAges.value).map((value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) throw new Error("Synthetic input ages must be numbers.");
+    return parsed;
+  });
+  return {
+    operation,
+    inputs: splitList(ui.instrumentSyntheticInputs.value, { upper: true, maximum: 2 }),
+    max_skew_seconds: nullableNumber(ui.instrumentSyntheticSkew) ?? 2,
+    input_max_age_seconds: ages,
+  };
+}
+
+function instrumentFromForm() {
+  return {
+    id: ui.instrumentId.value.trim().toLowerCase(),
+    symbol: ui.instrumentSymbol.value.trim().toUpperCase().replace("/", ":"),
+    base: ui.instrumentBase.value.trim().toUpperCase(),
+    quote: ui.instrumentQuote.value.trim().toUpperCase(),
+    name: ui.instrumentName.value.trim(),
+    description: ui.instrumentDescription.value.trim(),
+    asset_class: ui.instrumentAssetClass.value,
+    asset_type: ui.instrumentAssetType.value.trim().toLowerCase(),
+    price_basis: ui.instrumentPriceBasis.value.trim().toLowerCase(),
+    change_basis: ui.instrumentChangeBasis.value.trim().toLowerCase(),
+    ownership: state.instrumentEditingId
+      ? state.instruments.find((item) => item.id === state.instrumentEditingId)?.ownership || "custom"
+      : "custom",
+    enabled: ui.instrumentEnabled.checked,
+    archived: state.instrumentEditingId
+      ? state.instruments.find((item) => item.id === state.instrumentEditingId)?.archived === true
+      : false,
+    aliases: splitList(ui.instrumentAliases.value, { upper: true }),
+    market_calendar: ui.instrumentCalendar.value,
+    quote_poll_seconds: nullableNumber(ui.instrumentPoll),
+    stale_after_seconds: nullableNumber(ui.instrumentStale),
+    history: {
+      enabled: ui.instrumentHistoryEnabled.checked,
+      poll_seconds: nullableNumber(ui.instrumentHistoryPoll),
+      backfill_days: nullableNumber(ui.instrumentHistoryDays, { integer: true }),
+    },
+    routes: routesFromForm(),
+    provider_symbols: providerSymbolsFromForm(),
+    income: incomeFromForm(),
+    synthetic: syntheticFromForm(),
+  };
+}
+
+function setInstrumentCoreReadOnly(readOnly) {
+  for (const control of [
+    ui.instrumentId, ui.instrumentSymbol, ui.instrumentBase, ui.instrumentQuote,
+    ui.instrumentName, ui.instrumentDescription, ui.instrumentAssetClass,
+    ui.instrumentAssetType, ui.instrumentPriceBasis, ui.instrumentChangeBasis,
+    ui.instrumentAliases, ui.instrumentCalendar, ui.instrumentProviderSymbols,
+    ui.instrumentYieldStrategy, ui.instrumentDividendStrategy, ui.instrumentAccrualMode,
+    ui.instrumentUnderlying, ui.instrumentFredSeries, ui.instrumentExpenseRatio,
+    ui.instrumentFallbackDays, ui.instrumentSyntheticOperation,
+    ui.instrumentSyntheticInputs, ui.instrumentSyntheticSkew, ui.instrumentSyntheticAges,
+  ]) control.disabled = readOnly;
+  ui.instrumentId.disabled = false;
+  ui.instrumentId.readOnly = true;
+}
+
+function openInstrumentEditor(item = null) {
+  state.instrumentEditingId = item?.id || null;
+  ui.instrumentForm.reset();
+  ui.instrumentDialogTitle.textContent = item ? `Edit ${item.symbol}` : "Add instrument";
+  const definition = item || {
+    id: "", symbol: "", base: "", quote: "", name: "", description: "",
+    asset_class: "crypto", asset_type: "spot_crypto", price_basis: "market_price",
+    change_basis: "unadjusted_market_price", aliases: [], market_calendar: "always_open",
+    enabled: true, quote_poll_seconds: 5, stale_after_seconds: 10,
+    history: { enabled: true, poll_seconds: null, backfill_days: null },
+    routes: [], provider_symbols: [], income: null, synthetic: null,
+  };
+  ui.instrumentId.value = definition.id || "";
+  ui.instrumentSymbol.value = definition.symbol || "";
+  ui.instrumentBase.value = definition.base || "";
+  ui.instrumentQuote.value = definition.quote || "";
+  ui.instrumentName.value = definition.name || "";
+  ui.instrumentDescription.value = definition.description || "";
+  ui.instrumentAssetClass.value = definition.asset_class || "crypto";
+  ui.instrumentAssetType.value = definition.asset_type || "spot_crypto";
+  ui.instrumentPriceBasis.value = definition.price_basis || "market_price";
+  ui.instrumentChangeBasis.value = definition.change_basis || "unadjusted_market_price";
+  ui.instrumentAliases.value = (definition.aliases || []).join(", ");
+  ui.instrumentCalendar.value = definition.market_calendar || "always_open";
+  ui.instrumentEnabled.checked = definition.enabled !== false;
+  ui.instrumentPoll.value = definition.quote_poll_seconds ?? 5;
+  ui.instrumentStale.value = definition.stale_after_seconds ?? 10;
+  ui.instrumentHistoryEnabled.checked = definition.history?.enabled !== false;
+  ui.instrumentHistoryPoll.value = definition.history?.poll_seconds ?? "";
+  ui.instrumentHistoryDays.value = definition.history?.backfill_days ?? "";
+  const routes = new Map((definition.routes || []).map((route) => [route.capability, route.providers || []]));
+  ui.routeQuote.value = (routes.get("quote") || []).join(", ");
+  ui.routeHistory.value = (routes.get("history") || []).join(", ");
+  ui.routeDividend.value = (routes.get("dividend") || []).join(", ");
+  ui.routeYield.value = (routes.get("yield") || []).join(", ");
+  ui.instrumentProviderSymbols.value = (definition.provider_symbols || []).map((binding) => `${binding.provider}=${binding.symbol}`).join("\n");
+  ui.instrumentYieldStrategy.value = definition.income?.yield_strategy || "";
+  ui.instrumentDividendStrategy.value = definition.income?.dividend_strategy || "";
+  ui.instrumentAccrualMode.value = definition.income?.reward_accrual_mode || "";
+  ui.instrumentUnderlying.value = definition.income?.underlying_asset || "";
+  ui.instrumentFredSeries.value = definition.income?.fred_series || "";
+  syncTreasurySeriesConstraint();
+  ui.instrumentExpenseRatio.value = definition.income?.expense_ratio_percent ?? "";
+  ui.instrumentFallbackDays.value = definition.income?.fallback_ratio_days ?? "";
+  ui.instrumentSyntheticOperation.value = definition.synthetic?.operation || "";
+  ui.instrumentSyntheticInputs.value = (definition.synthetic?.inputs || []).join(", ");
+  ui.instrumentSyntheticSkew.value = definition.synthetic?.max_skew_seconds ?? 2;
+  ui.instrumentSyntheticAges.value = (definition.synthetic?.input_max_age_seconds || []).map((age) => age ?? "").join(", ");
+  setInstrumentCoreReadOnly(definition.ownership === "builtin");
+  updateCreditEstimate();
+  ui.providerSymbolResults.replaceChildren();
+  ui.instrumentDialog.showModal();
+}
+
+function changedInstrumentFields(original, current) {
+  const editable = original.ownership === "builtin"
+    ? new Set(["enabled", "quote_poll_seconds", "stale_after_seconds", "history", "routes"])
+    : new Set(Object.keys(current).filter((name) => !["id", "ownership"].includes(name)));
+  return Object.fromEntries(
+    [...editable]
+      .filter((name) => JSON.stringify(original[name]) !== JSON.stringify(current[name]))
+      .map((name) => [name, current[name]]),
+  );
+}
+
+async function saveInstrument(event) {
+  event.preventDefault();
+  if (!ui.instrumentForm.reportValidity()) return;
+  const submit = ui.instrumentForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
   try {
-    await adminRequest("/instruments", { method: "PATCH", body: { revision: state.instrumentRevision, instruments: changes } });
-    showToast("Instrument state saved. A service restart may be required.", "success");
-    await loadInstruments();
+    const definition = instrumentFromForm();
+    let body;
+    if (state.instrumentEditingId) {
+      const original = state.instruments.find((item) => item.id === state.instrumentEditingId);
+      if (!original) throw new Error("The instrument changed while the editor was open. Refresh and try again.");
+      const changes = changedInstrumentFields(original, definition);
+      if (!Object.keys(changes).length) {
+        ui.instrumentDialog.close();
+        return;
+      }
+      body = await adminRequest(`/instrument-catalog/instruments/${encodeURIComponent(original.id)}`, {
+        method: "PATCH", body: { revision: state.instrumentRevision, changes },
+      });
+    } else {
+      delete definition.id;
+      delete definition.ownership;
+      body = await adminRequest("/instrument-catalog/instruments", {
+        method: "POST", body: { revision: state.instrumentRevision, instrument: definition },
+      });
+    }
+    ui.instrumentDialog.close();
+    applyCatalogResponse(body);
+    showToast("Instrument definition staged. Validate the complete catalog before activation.", "success");
   } catch (error) {
     showToast(error.message, "error");
-    updateInstrumentSaveState();
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function archiveInstrument(item, button) {
+  const accepted = await confirmAction("Archive instrument", `Archive ${item.symbol}? It will disappear from the public API after activation, while stored history remains subject to normal retention.`, "Archive instrument");
+  if (!accepted) return;
+  button.disabled = true;
+  try {
+    const body = await adminRequest(`/instrument-catalog/instruments/${encodeURIComponent(item.id)}`, {
+      method: "DELETE", body: { revision: state.instrumentRevision },
+    });
+    applyCatalogResponse(body);
+    showToast(`${item.symbol} archived in the staged catalog.`, "success");
+  } catch (error) {
+    button.disabled = false;
+    showToast(error.message, "error");
+  }
+}
+
+async function restoreInstrument(item, button) {
+  button.disabled = true;
+  try {
+    await stageInstrumentUpdate(item.id, { archived: false, enabled: false });
+    showToast(`${item.symbol} restored as disabled in the staged catalog.`, "success");
+  } catch (error) {
+    button.disabled = false;
+    showToast(error.message, "error");
+  }
+}
+
+function normalizeProviderCatalog(body) {
+  return collection(body, ["providers", "items"])
+    .filter((provider) => provider && typeof (provider.name || provider.provider) === "string")
+    .map((provider) => ({ ...provider, name: provider.name || provider.provider }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function loadProviderCatalog({ quiet = false } = {}) {
+  try {
+    state.providerCatalog = normalizeProviderCatalog(await adminRequest("/provider-catalog"));
+    const selected = ui.providerSymbolProvider.value;
+    ui.providerSymbolProvider.replaceChildren(...state.providerCatalog.map((provider) => new Option(provider.display_name || provider.name, provider.name)));
+    if (state.providerCatalog.some((provider) => provider.name === selected)) ui.providerSymbolProvider.value = selected;
+    updateCreditEstimate();
+  } catch (error) {
+    if (!quiet) showToast(error.message, "error");
+  }
+}
+
+function providerSupports(provider, capability, assetClass) {
+  const capabilities = provider.capabilities || [];
+  const assetClasses = provider.asset_classes || [];
+  return capabilities.includes(capability) && (!assetClasses.length || assetClasses.includes(assetClass));
+}
+
+function providerBindingNames(value) {
+  return new Set(value.split(/\r?\n/).flatMap((line) => {
+    const separator = line.indexOf("=");
+    const provider = separator > 0 ? line.slice(0, separator).trim().toLowerCase() : "";
+    return provider ? [provider] : [];
+  }));
+}
+
+function stakingYieldCandidates(symbol, accrualMode) {
+  const base = symbol.split(":", 1)[0];
+  if (base === "WBETH") {
+    return [
+      "binance_wbeth_rate",
+      "ethereum_exchange_rate",
+      ...(accrualMode === "value_accruing" ? ["staking_market_ratio_proxy"] : []),
+    ];
+  }
+  if (base === "BETH" && accrualMode === "distributed_units") return ["okx_beth_yield"];
+  if (base === "STETH") return ["lido"];
+  if (base === "WSTETH") {
+    return [
+      "lido",
+      ...(accrualMode === "value_accruing" ? ["staking_market_ratio_proxy"] : []),
+    ];
+  }
+  return accrualMode === "value_accruing" ? ["staking_market_ratio_proxy"] : [];
+}
+
+function recommendedRoutesForDraft(draft, providerCatalog) {
+  const providers = new Map(providerCatalog.map((provider) => [provider.name, provider]));
+  const bound = providerBindingNames(draft.providerSymbols || "");
+  const assetClass = draft.assetClass;
+  const [base = "", quote = ""] = draft.symbol.toUpperCase().replace("/", ":").split(":", 2);
+  const autoBound = new Set();
+  if (assetClass === "fx") autoBound.add("twelve_data").add("alpha_vantage");
+  if (draft.fredSeries) autoBound.add("fred");
+  const available = (name, capability) => {
+    const provider = providers.get(name);
+    if (!provider || provider.credentials_configured === false) return false;
+    if (!providerSupports(provider, capability, assetClass)) return false;
+    const needsBinding = provider.kind === "market_data" || name === "fred";
+    return !needsBinding || bound.has(name) || autoBound.has(name);
+  };
+  const select = (capability, candidates) => candidates
+    .filter((name) => available(name, capability))
+    .slice(0, 4);
+
+  let quoteCandidates;
+  let historyCandidates;
+  if (draft.synthetic) {
+    quoteCandidates = ["synthetic"];
+    historyCandidates = ["synthetic"];
+  } else if (assetClass === "crypto") {
+    quoteCandidates = ["binance", "okx", "kraken", "coingecko"];
+    historyCandidates = quoteCandidates;
+  } else if (assetClass === "fx") {
+    const usdSpoke = base === "USD" || quote === "USD";
+    quoteCandidates = usdSpoke ? ["twelve_data", "alpha_vantage"] : ["synthetic_fx"];
+    historyCandidates = quoteCandidates;
+  } else {
+    quoteCandidates = ["alpaca", "finnhub", "twelve_data", "alpha_vantage"];
+    historyCandidates = ["alpaca", "twelve_data", "alpha_vantage"];
+  }
+
+  const needsDividend = Boolean(draft.dividendStrategy)
+    || draft.yieldStrategy === "latest_distribution_annualized";
+  let yieldCandidates = [];
+  if (assetClass === "crypto" && draft.assetType.toLowerCase().includes("staking")) {
+    yieldCandidates = stakingYieldCandidates(`${base}:${quote}`, draft.accrualMode);
+  } else if (
+    assetClass === "bond"
+    && ["treasury_proxy_minus_expense", "treasury_3m_proxy_minus_expense"]
+      .includes(draft.yieldStrategy)
+  ) {
+    yieldCandidates = ["fred"];
+  }
+  return {
+    quote: select("quote", quoteCandidates),
+    history: draft.historyEnabled ? select("history", historyCandidates) : [],
+    dividend: needsDividend ? select("dividend", ["alpaca"]) : [],
+    yield: draft.yieldStrategy ? select("yield", yieldCandidates) : [],
+  };
+}
+
+function recommendRoutes() {
+  const routes = recommendedRoutesForDraft({
+    symbol: ui.instrumentSymbol.value,
+    assetClass: ui.instrumentAssetClass.value,
+    assetType: ui.instrumentAssetType.value,
+    historyEnabled: ui.instrumentHistoryEnabled.checked,
+    providerSymbols: ui.instrumentProviderSymbols.value,
+    yieldStrategy: ui.instrumentYieldStrategy.value,
+    dividendStrategy: ui.instrumentDividendStrategy.value,
+    accrualMode: ui.instrumentAccrualMode.value,
+    fredSeries: ui.instrumentFredSeries.value,
+    synthetic: Boolean(ui.instrumentSyntheticOperation.value),
+  }, state.providerCatalog);
+  ui.routeQuote.value = routes.quote.join(", ");
+  ui.routeHistory.value = routes.history.join(", ");
+  ui.routeDividend.value = routes.dividend.join(", ");
+  ui.routeYield.value = routes.yield.join(", ");
+  updateCreditEstimate();
+  showToast(
+    "Recommended only configured providers supported by the draft's current bindings and income policy.",
+    "success",
+  );
+}
+
+function providerCredit(provider, capability) {
+  const value = provider.credit_costs ?? provider.per_call_credits ?? provider.credits_per_call ?? provider.credit_cost;
+  if (value && typeof value === "object") return finiteNumber(value[capability]);
+  return finiteNumber(value);
+}
+
+function updateCreditEstimate() {
+  let total = 0;
+  let tracked = false;
+  const dailyCalls = {
+    quote: 86_400 / Math.max(.25, finiteNumber(ui.instrumentPoll.value) ?? 5),
+    history: 86_400 / Math.max(1, finiteNumber(ui.instrumentHistoryPoll.value) ?? 300),
+    dividend: 1,
+    yield: 24,
+  };
+  const routes = [
+    ["quote", ui.routeQuote], ["history", ui.routeHistory],
+    ["dividend", ui.routeDividend], ["yield", ui.routeYield],
+  ];
+  for (const [capability, control] of routes) {
+    for (const name of control.value.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean).slice(0, 4)) {
+      const provider = state.providerCatalog.find((item) => item.name === name);
+      const credit = provider ? providerCredit(provider, capability) : null;
+      if (credit != null) { tracked = true; total += credit * dailyCalls[capability]; }
+    }
+  }
+  ui.instrumentCreditEstimate.textContent = tracked
+    ? `Pre-validation estimate: approximately ${compactNumber(total)} fallback credits per day. Validate for cache-aware provider budgets.`
+    : "Pre-validation estimate unavailable. Validate the staged catalog for compiler-aware provider budgets.";
+}
+
+function providerSearchCompatibility(item, assetClass, selectedCapabilities) {
+  const capabilities = Array.isArray(item?.capabilities)
+    ? [...new Set(item.capabilities.map((value) => String(value).trim().toLowerCase()).filter(Boolean))]
+    : [];
+  const resultAssetClass = String(item?.asset_class || "").trim().toLowerCase();
+  const resultAssetClasses = Array.isArray(item?.asset_classes)
+    ? [...new Set(item.asset_classes.map((value) => String(value).trim().toLowerCase()).filter(Boolean))]
+    : resultAssetClass ? [resultAssetClass] : [];
+  const assetCompatible = !resultAssetClasses.length || resultAssetClasses.includes(assetClass);
+  const missing = selectedCapabilities.filter((capability) => !capabilities.includes(capability));
+  let reason = "";
+  if (!assetCompatible) reason = `Result is compatible with ${resultAssetClasses.join(", ")}, not ${assetClass}.`;
+  else if (!capabilities.length) reason = "The provider did not confirm any compatible capability.";
+  else if (missing.length) reason = `Missing selected capabilities: ${missing.join(", ")}.`;
+  return {
+    capabilities,
+    assetClasses: resultAssetClasses,
+    compatible: assetCompatible && capabilities.length > 0 && missing.length === 0,
+    reason,
+  };
+}
+
+function selectedCapabilitiesForProvider(provider) {
+  return [
+    ["quote", ui.routeQuote],
+    ["history", ui.routeHistory],
+    ["dividend", ui.routeDividend],
+    ["yield", ui.routeYield],
+  ].flatMap(([capability, control]) => (
+    control.value.split(",").map((value) => value.trim().toLowerCase()).includes(provider)
+      ? [capability]
+      : []
+  ));
+}
+
+async function searchProviderSymbols() {
+  const provider = ui.providerSymbolProvider.value;
+  const query = ui.providerSymbolQuery.value.trim();
+  if (!provider || !query) {
+    showToast("Select a provider and enter a vendor symbol or ticker.", "error");
+    return;
+  }
+  ui.searchProviderSymbol.disabled = true;
+  try {
+    const path = `/provider-catalog/${encodeURIComponent(provider)}/search?q=${encodeURIComponent(query)}&asset_class=${encodeURIComponent(ui.instrumentAssetClass.value)}&limit=20`;
+    const items = collection(await adminRequest(path, { csrf: true }), ["items", "results", "symbols"]);
+    const fragment = document.createDocumentFragment();
+    let resultCount = 0;
+    const selectedCapabilities = selectedCapabilitiesForProvider(provider);
+    for (const item of items) {
+      const vendorSymbol = item.vendor_symbol || item.symbol;
+      if (!vendorSymbol) continue;
+      const compatibility = providerSearchCompatibility(
+        item,
+        ui.instrumentAssetClass.value,
+        selectedCapabilities,
+      );
+      const row = document.createElement("li");
+      const details = document.createElement("div");
+      details.append(textNode("strong", vendorSymbol), textNode("span", item.display_name || item.name || "Validated vendor identifier", "cell-secondary"));
+      const capabilityList = document.createElement("span");
+      capabilityList.className = "capability-list";
+      for (const capability of compatibility.capabilities) {
+        capabilityList.append(textNode("span", capability, "capability-chip"));
+      }
+      details.append(capabilityList);
+      if (!compatibility.compatible) {
+        details.append(textNode("span", compatibility.reason, "search-result-warning"));
+        row.classList.add("is-incompatible");
+      }
+      const use = textNode("button", "Use", "button button-secondary button-small");
+      use.type = "button";
+      use.disabled = !compatibility.compatible;
+      if (!compatibility.compatible) use.title = compatibility.reason;
+      use.addEventListener("click", () => addProviderBinding(provider, vendorSymbol));
+      row.append(details, use);
+      fragment.append(row);
+      resultCount += 1;
+    }
+    ui.providerSymbolResults.replaceChildren(fragment);
+    if (!resultCount) ui.providerSymbolResults.append(textNode("li", "No compatible symbols found.", "cell-secondary"));
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.searchProviderSymbol.disabled = false;
+  }
+}
+
+function addProviderBinding(provider, symbol) {
+  const lines = ui.instrumentProviderSymbols.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const replacement = `${provider}=${symbol}`;
+  const index = lines.findIndex((line) => line.toLowerCase().startsWith(`${provider.toLowerCase()}=`));
+  if (index >= 0) lines[index] = replacement;
+  else lines.push(replacement);
+  ui.instrumentProviderSymbols.value = lines.join("\n");
+  showToast(`${provider} binding added to the draft.`, "success");
+}
+
+async function importInstrumentCatalog(event) {
+  event.preventDefault();
+  const submit = ui.importInstrumentForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    const catalog = JSON.parse(ui.importInstrumentJson.value);
+    if (!catalog || (typeof catalog !== "object" && !Array.isArray(catalog))) throw new Error("Catalog JSON must be an object or an array of definitions.");
+    const body = await adminRequest("/instrument-catalog/import", {
+      method: "POST",
+      body: { revision: state.instrumentRevision, mode: ui.importInstrumentMode.value, catalog },
+    });
+    ui.importInstrumentDialog.close();
+    ui.importInstrumentJson.value = "";
+    applyCatalogResponse(body);
+    showToast("Catalog import staged. Validate it before activation.", "success");
+  } catch (error) {
+    showToast(error instanceof SyntaxError ? "Catalog import must be valid JSON." : error.message, "error");
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function exportInstrumentCatalog() {
+  ui.exportInstrumentCatalog.disabled = true;
+  try {
+    const exportState = state.instrumentCatalog?.staged ? "staged" : "active";
+    const body = await adminRequest(`/instrument-catalog/export?state=${exportState}`);
+    const blob = new Blob([`${JSON.stringify(body, null, 2)}\n`], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `quickprice-instruments-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    ui.exportInstrumentCatalog.disabled = false;
+  }
+}
+
+function summarizedSymbols(label, values) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const visible = values.slice(0, 20).map(String);
+  const remainder = values.length - visible.length;
+  return `${label} (${values.length}): ${visible.join(", ")}${remainder ? `, plus ${remainder} more` : ""}.`;
+}
+
+function catalogDiffDiagnostics(diff) {
+  if (!diff || typeof diff !== "object") return ["No staged diff is available."];
+  if (diff.available !== true && diff.counts && typeof diff.counts === "object") {
+    const messages = [
+      `Staged diff: ${diff.counts.total || 0} active definition changes.`,
+    ];
+    for (const [field, label] of [
+      ["added", "Added or enabled"],
+      ["changed", "Definition updated"],
+      ["archived_or_disabled", "Archived or disabled"],
+    ]) {
+      const summary = summarizedSymbols(label, diff[field]);
+      if (summary) messages.push(summary);
+    }
+    return messages;
+  }
+  if (diff.available !== true) return ["No staged diff is available."];
+  const messages = [
+    `Staged diff: ${diff.changed_count || 0} changed and ${diff.unchanged_count || 0} unchanged definitions.`,
+  ];
+  for (const [field, label] of [
+    ["added", "Added"], ["removed", "Removed"], ["archived", "Archived"],
+    ["restored", "Restored"], ["enabled", "Enabled"], ["disabled", "Disabled"],
+    ["modified", "Definition updated"],
+  ]) {
+    const summary = summarizedSymbols(label, diff[field]);
+    if (summary) messages.push(summary);
+  }
+  return messages;
+}
+
+function creditPlanDiagnostics(providerRoutes) {
+  const plan = providerRoutes?.credit_plan;
+  if (!plan || typeof plan !== "object") return [];
+  const worstCase = plan.worst_case_daily_credits || {};
+  const hardCaps = plan.hard_capped_daily_credits || {};
+  const budgets = plan.budgets || {};
+  const providers = Object.keys(worstCase).sort();
+  const messages = providers.map((provider) => {
+    const parts = [
+      `Provider credits - ${provider}: ${compactNumber(worstCase[provider])} worst-case per day`,
+    ];
+    if (Number.isFinite(hardCaps[provider])) {
+      parts.push(`${compactNumber(hardCaps[provider])} daily hard cap`);
+    }
+    const budget = budgets[provider];
+    if (budget && Number.isFinite(budget.reserved_for_fx) && budget.reserved_for_fx > 0) {
+      parts.push(`${compactNumber(budget.reserved_for_fx)} reserved for FX`);
+    }
+    return `${parts.join("; ")}.`;
+  });
+  for (const assumption of Array.isArray(plan.assumptions) ? plan.assumptions.slice(0, 8) : []) {
+    messages.push(`Credit assumption: ${String(assumption)}`);
+  }
+  return messages;
+}
+
+function diagnosticsFrom(body) {
+  const payload = nestedPayload(body) || {};
+  const messages = [];
+  for (const field of ["diagnostics", "errors", "warnings"]) {
+    if (!Array.isArray(payload[field])) continue;
+    for (const item of payload[field]) {
+      messages.push(typeof item === "string"
+        ? item
+        : item?.message || item?.detail || item?.code || "Catalog diagnostic");
+    }
+  }
+  if (payload.error) {
+    const item = payload.error;
+    messages.push(typeof item === "string"
+      ? item
+      : item.message || item.detail || item.code || "Catalog diagnostic");
+  }
+  if (payload.valid === true) {
+    messages.unshift("The complete staged catalog passed structural, routing, dependency, and budget validation.");
+  } else if (payload.valid === false && messages.length === 0) {
+    messages.push("The staged catalog is not valid.");
+  }
+  if (payload.diff) messages.push(...catalogDiffDiagnostics(payload.diff));
+  messages.push(...creditPlanDiagnostics(payload.provider_routes));
+  return messages.length ? messages : ["Catalog operation completed without additional diagnostics."];
+}
+
+function showCatalogDiagnostics(title, body) {
+  ui.catalogDiagnosticsTitle.textContent = title;
+  ui.catalogDiagnosticsList.replaceChildren(...diagnosticsFrom(body).map((message) => textNode("li", message)));
+  ui.catalogDiagnostics.hidden = false;
+}
+
+async function validateInstrumentCatalog() {
+  ui.validateInstrumentCatalog.disabled = true;
+  try {
+    const body = await adminRequest("/instrument-catalog/validate", {
+      method: "POST", body: { revision: state.instrumentRevision },
+    });
+    showCatalogDiagnostics("Catalog validation passed", body);
+    showToast("The staged catalog is valid and ready for warm-up.", "success");
+  } catch (error) {
+    showCatalogDiagnostics("Catalog validation failed", { errors: [error.message] });
+    showToast(error.message, "error");
+  } finally {
+    renderCatalogStatus();
+  }
+}
+
+async function activateInstrumentCatalog() {
+  const accepted = await confirmAction("Activate staged catalog", "QuickPrice will validate and warm every changed instrument while the current generation continues serving traffic. The switch occurs only after required quote and income data are ready.", "Start warm-up");
+  if (!accepted) return;
+  ui.activateInstrumentCatalog.disabled = true;
+  try {
+    const body = await adminRequest("/instrument-catalog/activate", {
+      method: "POST", body: { revision: state.instrumentRevision },
+    });
+    startCatalogJob(body, "Activation");
+  } catch (error) {
+    showCatalogDiagnostics("Activation could not start", { errors: [error.message] });
+    showToast(error.message, "error");
+    renderCatalogStatus();
+  }
+}
+
+async function rollbackInstrumentCatalog() {
+  const accepted = await confirmAction("Roll back catalog", "Warm and atomically restore the last-known-good catalog generation?", "Start rollback");
+  if (!accepted) return;
+  ui.rollbackInstrumentCatalog.disabled = true;
+  try {
+    const body = await adminRequest("/instrument-catalog/rollback", {
+      method: "POST", body: { revision: state.instrumentRevision },
+    });
+    startCatalogJob(body, "Rollback");
+  } catch (error) {
+    showCatalogDiagnostics("Rollback could not start", { errors: [error.message] });
+    showToast(error.message, "error");
+    renderCatalogStatus();
+  }
+}
+
+function startCatalogJob(body, label) {
+  const jobId = metadata(body, "job_id");
+  const status = String(metadata(body, "status", metadata(body, "state", jobId ? "queued" : "succeeded")));
+  state.catalogJobId = jobId || null;
+  state.catalogJobLabel = label;
+  state.catalogJobRetryCount = 0;
+  ui.catalogJobStatus.textContent = `${label}: ${status.replaceAll("_", " ")}`;
+  renderCatalogStatus();
+  if (!jobId) {
+    clearPersistedCatalogJob();
+    loadInstruments();
+    return;
+  }
+  persistCatalogJob();
+  window.clearTimeout(state.catalogJobTimer);
+  state.catalogJobTimer = window.setTimeout(() => pollCatalogJob(label), 800);
+}
+
+function persistCatalogJob() {
+  if (!state.catalogJobId || !state.catalogJobLabel) return;
+  localStorage.setItem(CATALOG_JOB_KEY, JSON.stringify({
+    job_id: state.catalogJobId,
+    label: state.catalogJobLabel,
+  }));
+}
+
+function clearPersistedCatalogJob() {
+  localStorage.removeItem(CATALOG_JOB_KEY);
+}
+
+function clearCatalogJob() {
+  window.clearTimeout(state.catalogJobTimer);
+  state.catalogJobTimer = null;
+  state.catalogJobId = null;
+  state.catalogJobLabel = null;
+  state.catalogJobRetryCount = 0;
+  clearPersistedCatalogJob();
+}
+
+function resumeCatalogJob() {
+  if (!state.catalogJobId) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CATALOG_JOB_KEY) || "null");
+      const jobId = typeof saved?.job_id === "string" ? saved.job_id : "";
+      const label = saved?.label === "Rollback" ? "Rollback" : saved?.label === "Activation" ? "Activation" : null;
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(jobId) || !label) {
+        clearPersistedCatalogJob();
+        return;
+      }
+      state.catalogJobId = jobId;
+      state.catalogJobLabel = label;
+      state.catalogJobRetryCount = 0;
+    } catch (_error) {
+      clearPersistedCatalogJob();
+      return;
+    }
+  }
+  ui.catalogJobStatus.textContent = `${state.catalogJobLabel}: reconnecting`;
+  renderCatalogStatus();
+  window.clearTimeout(state.catalogJobTimer);
+  state.catalogJobTimer = window.setTimeout(
+    () => pollCatalogJob(state.catalogJobLabel || "Activation"),
+    250,
+  );
+}
+
+async function pollCatalogJob(label) {
+  if (!state.catalogJobId) return;
+  try {
+    const body = await adminRequest(`/instrument-catalog/jobs/${encodeURIComponent(state.catalogJobId)}`);
+    const status = String(metadata(body, "status", metadata(body, "state", "unknown")));
+    const progress = finiteNumber(metadata(body, "progress_percent"));
+    state.catalogJobRetryCount = 0;
+    ui.catalogJobStatus.textContent = `${label}: ${status.replaceAll("_", " ")}${progress == null ? "" : ` ${Math.round(progress)}%`}`;
+    if (["succeeded", "failed", "cancelled"].includes(status)) {
+      clearCatalogJob();
+      showCatalogDiagnostics(`${label} ${status}`, body);
+      showToast(`${label} ${status}.`, status === "succeeded" ? "success" : "error");
+      await loadInstruments();
+      return;
+    }
+    state.catalogJobTimer = window.setTimeout(() => pollCatalogJob(label), 1000);
+  } catch (error) {
+    if (error.status === 401) return;
+    if (error.status === 404) {
+      clearCatalogJob();
+      showToast("The activation job is no longer available.", "error");
+      renderCatalogStatus();
+      return;
+    }
+    state.catalogJobRetryCount += 1;
+    const delay = Math.min(15_000, 1000 * (2 ** Math.min(state.catalogJobRetryCount, 4)));
+    ui.catalogJobStatus.textContent = `${label}: connection interrupted, retrying`;
+    state.catalogJobTimer = window.setTimeout(() => pollCatalogJob(label), delay);
   }
 }
 
@@ -1187,7 +2160,36 @@ function bindEvents() {
   ui.instrumentSearch.addEventListener("input", renderInstruments);
   ui.instrumentFilter.addEventListener("change", renderInstruments);
   ui.refreshInstruments.addEventListener("click", loadInstruments);
-  ui.saveInstruments.addEventListener("click", saveInstruments);
+  ui.createInstrument.addEventListener("click", () => openInstrumentEditor());
+  ui.instrumentForm.addEventListener("submit", saveInstrument);
+  ui.instrumentDialog.addEventListener("close", () => {
+    state.instrumentEditingId = null;
+    setInstrumentCoreReadOnly(false);
+    ui.instrumentForm.reset();
+    ui.providerSymbolResults.replaceChildren();
+  });
+  ui.importInstrumentCatalog.addEventListener("click", () => ui.importInstrumentDialog.showModal());
+  ui.importInstrumentForm.addEventListener("submit", importInstrumentCatalog);
+  ui.importInstrumentDialog.addEventListener("close", () => { ui.importInstrumentJson.value = ""; });
+  ui.exportInstrumentCatalog.addEventListener("click", exportInstrumentCatalog);
+  ui.validateInstrumentCatalog.addEventListener("click", validateInstrumentCatalog);
+  ui.activateInstrumentCatalog.addEventListener("click", activateInstrumentCatalog);
+  ui.rollbackInstrumentCatalog.addEventListener("click", rollbackInstrumentCatalog);
+  ui.closeCatalogDiagnostics.addEventListener("click", () => { ui.catalogDiagnostics.hidden = true; });
+  ui.recommendInstrumentRoutes.addEventListener("click", recommendRoutes);
+  ui.searchProviderSymbol.addEventListener("click", searchProviderSymbols);
+  ui.instrumentYieldStrategy.addEventListener("change", syncTreasurySeriesConstraint);
+  for (const control of [ui.routeQuote, ui.routeHistory, ui.routeDividend, ui.routeYield, ui.instrumentPoll, ui.instrumentHistoryPoll]) {
+    control.addEventListener("input", updateCreditEstimate);
+  }
+  ui.instrumentSymbol.addEventListener("change", () => {
+    const [base, quote] = ui.instrumentSymbol.value.trim().toUpperCase().replace("/", ":").split(":");
+    if (base && quote) {
+      ui.instrumentSymbol.value = `${base}:${quote}`;
+      if (!ui.instrumentBase.value) ui.instrumentBase.value = base;
+      if (!ui.instrumentQuote.value) ui.instrumentQuote.value = quote;
+    }
+  });
   ui.resetConfiguration.addEventListener("click", resetConfiguration);
   ui.saveConfiguration.addEventListener("click", saveConfiguration);
   ui.refreshStatistics.addEventListener("click", () => loadStatistics());

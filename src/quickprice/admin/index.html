@@ -154,27 +154,44 @@
         <section id="instruments-panel" class="admin-panel" role="tabpanel" aria-labelledby="instruments-tab" hidden>
           <div class="page-heading">
             <div>
-              <p class="eyebrow">Market coverage</p>
+              <p class="eyebrow">Managed market catalog</p>
               <h1>Instruments</h1>
-              <p>Enable or disable instruments installed by trusted provider plugins.</p>
+              <p>Stage data-driven instruments, validate provider routes, and activate a complete generation without restarting QuickPrice.</p>
             </div>
             <div class="heading-actions">
+              <button id="import-instrument-catalog" class="button button-secondary" type="button">Import JSON</button>
+              <button id="export-instrument-catalog" class="button button-secondary" type="button">Export</button>
+              <button id="create-instrument" class="button button-primary" type="button">Add instrument</button>
               <button id="refresh-instruments" class="button button-quiet" type="button">Refresh</button>
-              <button id="save-instruments" class="button button-primary" type="button" disabled>Save changes</button>
             </div>
           </div>
           <aside class="info-banner">
             <strong>Trusted definitions only</strong>
-            <p>This console cannot install arbitrary code or create unreviewed provider routes. Add new instrument definitions through a signed or locally reviewed plugin, then enable them here.</p>
+            <p>Only built-in providers and their fixed upstream hosts are available. Catalogs cannot contain URLs, request headers, credentials, module paths, Python, or executable formulas.</p>
           </aside>
+          <div class="catalog-status" aria-label="Catalog revisions">
+            <article><span>Active revision</span><code id="catalog-active-revision">-</code></article>
+            <article><span>Staged revision</span><code id="catalog-staged-revision">No draft</code></article>
+            <article><span>Last known good</span><code id="catalog-last-good-revision">-</code></article>
+            <article><span>Activation</span><strong id="catalog-job-status" role="status" aria-live="polite" aria-atomic="true">Idle</strong></article>
+          </div>
+          <div class="catalog-actions" aria-label="Catalog activation actions">
+            <button id="validate-instrument-catalog" class="button button-secondary" type="button" disabled>Validate staged catalog</button>
+            <button id="activate-instrument-catalog" class="button button-primary" type="button" disabled>Warm and activate</button>
+            <button id="rollback-instrument-catalog" class="button button-danger" type="button" disabled>Roll back</button>
+          </div>
+          <section id="catalog-diagnostics" class="catalog-diagnostics" aria-live="polite" hidden>
+            <div class="dialog-heading"><div><p class="eyebrow">Validation result</p><h2 id="catalog-diagnostics-title">Catalog diagnostics</h2></div><button id="close-catalog-diagnostics" class="dialog-close" type="button" aria-label="Close diagnostics">&times;</button></div>
+            <ol id="catalog-diagnostics-list"></ol>
+          </section>
           <section class="data-card" aria-label="Installed instruments">
             <div class="card-toolbar">
               <label class="search-field"><span>Search</span><input id="instrument-search" type="search" placeholder="Symbol, name, class, or provider"></label>
-              <label><span>State</span><select id="instrument-filter"><option value="">All instruments</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
+              <label><span>State</span><select id="instrument-filter"><option value="">All instruments</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="custom">Custom only</option><option value="builtin">Built-in only</option><option value="archived">Archived</option></select></label>
             </div>
             <div class="table-scroll">
               <table>
-                <thead><tr><th scope="col">Instrument</th><th scope="col">Classification</th><th scope="col">Provider route</th><th scope="col">State</th></tr></thead>
+                <thead><tr><th scope="col">Instrument</th><th scope="col">Classification</th><th scope="col">Provider routes</th><th scope="col">Collection policy</th><th scope="col">State</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
                 <tbody id="instruments-body"></tbody>
               </table>
             </div>
@@ -266,6 +283,102 @@
       <p id="copy-key-status" class="field-help" role="status" aria-live="polite"></p>
       <div class="dialog-actions"><button id="close-reveal-key" class="button button-primary" type="button">I have saved the key</button></div>
     </div>
+  </dialog>
+
+  <dialog id="instrument-dialog" class="catalog-dialog" aria-labelledby="instrument-dialog-title">
+    <form id="instrument-form" class="dialog-card catalog-form" method="post" action="/admin" autocomplete="off">
+      <div class="dialog-heading">
+        <div><p class="eyebrow">Staged definition</p><h2 id="instrument-dialog-title">Add instrument</h2></div>
+        <button class="dialog-close" type="button" data-close-dialog="instrument-dialog" aria-label="Close">&times;</button>
+      </div>
+      <p class="field-help">Definitions are data only. Validation rejects uninstalled providers, unsafe vendor identifiers, incompatible capabilities, and incomplete income policies.</p>
+
+      <fieldset class="form-section">
+        <legend>Identity and classification</legend>
+        <div class="setting-fields">
+          <label class="setting-field"><span>Stable ID</span><input id="instrument-id" type="text" placeholder="Assigned by QuickPrice" readonly></label>
+          <label class="setting-field"><span>Symbol</span><input id="instrument-symbol" type="text" pattern="[A-Z0-9._-]+:[A-Z0-9._-]+" maxlength="129" placeholder="SOL:USD" required></label>
+          <label class="setting-field"><span>Base asset</span><input id="instrument-base" type="text" pattern="[A-Z0-9._-]+" maxlength="64" placeholder="SOL" required></label>
+          <label class="setting-field"><span>Quote asset</span><input id="instrument-quote" type="text" pattern="[A-Z0-9._-]+" maxlength="64" placeholder="USD" required></label>
+          <label class="setting-field is-wide"><span>Name</span><input id="instrument-name" type="text" maxlength="160" placeholder="Solana / United States Dollar" required></label>
+          <label class="setting-field is-wide"><span>Description</span><textarea id="instrument-description" rows="2" maxlength="1000" required></textarea></label>
+          <label class="setting-field"><span>Asset class</span><select id="instrument-asset-class"><option value="crypto">Crypto</option><option value="equity">Equity</option><option value="bond">Bond</option><option value="fx">Foreign exchange</option></select></label>
+          <label class="setting-field"><span>Asset type</span><input id="instrument-asset-type" type="text" pattern="[a-z0-9][a-z0-9._-]*" placeholder="spot_crypto" required></label>
+          <label class="setting-field"><span>Price basis</span><input id="instrument-price-basis" type="text" pattern="[a-z0-9][a-z0-9._-]*" value="market_price" required></label>
+          <label class="setting-field"><span>Change basis</span><input id="instrument-change-basis" type="text" pattern="[a-z0-9][a-z0-9._-]*" value="unadjusted_market_price" required></label>
+          <label class="setting-field is-wide"><span>Aliases <small>comma separated</small></span><input id="instrument-aliases" type="text" placeholder="SOL:USDC"></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend>Collection policy</legend>
+        <div class="setting-fields">
+          <label class="setting-field"><span>Market calendar</span><select id="instrument-calendar"><option value="always_open">Always open</option><option value="us_equity">US equity</option><option value="fx_24x5">FX 24x5</option></select></label>
+          <label class="setting-field checkbox-field"><input id="instrument-enabled" type="checkbox" checked><span>Enabled after activation</span></label>
+          <label class="setting-field"><span>Quote polling <small>seconds</small></span><input id="instrument-poll" type="number" min="0.25" max="604800" step="0.25" value="5" required></label>
+          <label class="setting-field"><span>Stale threshold <small>seconds</small></span><input id="instrument-stale" type="number" min="1" max="604800" step="1" value="10" required></label>
+          <label class="setting-field checkbox-field"><input id="instrument-history-enabled" type="checkbox" checked><span>Collect history</span></label>
+          <label class="setting-field"><span>History polling <small>seconds, optional</small></span><input id="instrument-history-poll" type="number" min="1" max="86400" step="1"></label>
+          <label class="setting-field"><span>History backfill <small>days, optional</small></span><input id="instrument-history-days" type="number" min="1" max="3650" step="1"></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend>Provider routing</legend>
+        <div class="provider-route-grid">
+          <label><span>Quote chain</span><input id="route-quote" type="text" placeholder="binance, okx, kraken"></label>
+          <label><span>History chain</span><input id="route-history" type="text" placeholder="binance, kraken"></label>
+          <label><span>Dividend chain</span><input id="route-dividend" type="text" placeholder="alpaca"></label>
+          <label><span>Yield chain</span><input id="route-yield" type="text" placeholder="fred"></label>
+        </div>
+        <label><span>Vendor symbol bindings <small>one provider=symbol per line</small></span><textarea id="instrument-provider-symbols" rows="4" spellcheck="false" placeholder="binance=SOLUSDC&#10;kraken=SOLUSDC"></textarea></label>
+        <div class="route-tools">
+          <button id="recommend-instrument-routes" class="button button-secondary" type="button">Recommend routes</button>
+          <span id="instrument-credit-estimate" class="field-help">Estimated provider credits appear after route selection.</span>
+        </div>
+        <div class="provider-search">
+          <label><span>Provider</span><select id="provider-symbol-provider"></select></label>
+          <label class="search-field"><span>Vendor symbol search</span><input id="provider-symbol-query" type="search" maxlength="128" placeholder="Ticker or vendor symbol"></label>
+          <button id="search-provider-symbol" class="button button-quiet" type="button">Search</button>
+        </div>
+        <ul id="provider-symbol-results" class="search-results" aria-live="polite" aria-atomic="false"></ul>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend>Income policy</legend>
+        <div class="setting-fields">
+          <label class="setting-field"><span>Yield strategy</span><select id="instrument-yield-strategy"><option value="">None</option><option value="latest_distribution_annualized">Latest distribution annualized</option><option value="treasury_proxy_minus_expense">Treasury proxy minus expense (select maturity)</option><option value="treasury_3m_proxy_minus_expense">Legacy 3-month Treasury proxy minus expense (DGS3MO only)</option><option value="staking_provider_metric">Staking provider metric</option></select></label>
+          <label class="setting-field"><span>Dividend strategy</span><select id="instrument-dividend-strategy"><option value="">None</option><option value="latest_regular_cash_annualized_x4">Latest regular cash dividend annualized quarterly</option></select></label>
+          <label class="setting-field"><span>Reward accrual</span><select id="instrument-accrual-mode"><option value="">None</option><option value="value_accruing">Value accruing</option><option value="rebasing_balance">Rebasing balance</option><option value="distributed_units">Distributed units</option><option value="claimable_rewards">Claimable rewards</option></select></label>
+          <label class="setting-field"><span>Underlying asset</span><input id="instrument-underlying" type="text" pattern="[A-Z0-9._-]+" maxlength="64"></label>
+          <label class="setting-field"><span>FRED Treasury series</span><select id="instrument-fred-series" aria-describedby="instrument-fred-series-help"><option value="">None</option><option value="DGS1MO">DGS1MO - 1 month</option><option value="DGS3MO">DGS3MO - 3 months</option><option value="DGS6MO">DGS6MO - 6 months</option><option value="DGS1">DGS1 - 1 year</option></select><small id="instrument-fred-series-help" class="field-help">The legacy three-month strategy is fixed to DGS3MO.</small></label>
+          <label class="setting-field"><span>Expense ratio <small>percent</small></span><input id="instrument-expense-ratio" type="number" min="0" max="25" step="0.0001"></label>
+          <label class="setting-field"><span>Ratio fallback <small>days</small></span><input id="instrument-fallback-days" type="number" min="7" max="365" step="1"></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend>Restricted synthetic recipe</legend>
+        <div class="setting-fields">
+          <label class="setting-field"><span>Operation</span><select id="instrument-synthetic-operation"><option value="">None</option><option value="inverse">Inverse</option><option value="multiply">Multiply</option><option value="divide">Divide</option></select></label>
+          <label class="setting-field"><span>Input symbols <small>comma separated</small></span><input id="instrument-synthetic-inputs" type="text" placeholder="USD:CNH, USD:HKD"></label>
+          <label class="setting-field"><span>Maximum skew <small>seconds</small></span><input id="instrument-synthetic-skew" type="number" min="0" max="1000000" step="0.25" value="2"></label>
+          <label class="setting-field"><span>Input maximum ages <small>comma separated</small></span><input id="instrument-synthetic-ages" type="text" placeholder="120, 1200"></label>
+        </div>
+      </fieldset>
+
+      <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="instrument-dialog">Cancel</button><button id="save-instrument" class="button button-primary" type="submit">Stage instrument</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="import-instrument-dialog" aria-labelledby="import-instrument-title">
+    <form id="import-instrument-form" class="dialog-card dialog-wide" method="post" action="/admin" autocomplete="off">
+      <div class="dialog-heading"><div><p class="eyebrow">Strict catalog import</p><h2 id="import-instrument-title">Import instrument JSON</h2></div><button class="dialog-close" type="button" data-close-dialog="import-instrument-dialog" aria-label="Close">&times;</button></div>
+      <label><span>Mode</span><select id="import-instrument-mode"><option value="merge">Merge with custom instruments</option><option value="replace_custom">Replace custom instruments</option></select></label>
+      <label><span>Catalog JSON</span><textarea id="import-instrument-json" rows="14" autocomplete="off" spellcheck="false" required></textarea></label>
+      <p class="field-help">Import never changes built-in identity or classification and never accepts provider keys, URLs, headers, or executable content.</p>
+      <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="import-instrument-dialog">Cancel</button><button class="button button-primary" type="submit">Stage import</button></div>
+    </form>
   </dialog>
 
   <dialog id="confirm-dialog" aria-labelledby="confirm-title">

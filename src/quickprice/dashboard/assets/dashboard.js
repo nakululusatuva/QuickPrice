@@ -3,6 +3,9 @@
 const SESSION_KEY = "quickprice-dashboard-api-key";
 const THEME_KEY = "quickprice-dashboard-theme";
 const REFRESH_INTERVAL_MS = 10_000;
+const CATALOG_REFRESH_INTERVAL_MS = 30_000;
+const GENERATION_REFRESH_ATTEMPTS = 3;
+const CATALOG_REVISION_HEADER = "X-QuickPrice-Catalog-Revision";
 const LOG_LIMIT = 500;
 const LEVEL_WEIGHT = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 const FIXTURE_SOURCE_PATTERN = /(^|[^a-z0-9])fixture([^a-z0-9]|$)/i;
@@ -24,6 +27,10 @@ const state = {
   ascending: true,
   refreshing: false,
   refreshTimer: null,
+  catalogEtag: null,
+  catalogRevision: null,
+  catalogRefreshing: false,
+  catalogRefreshTimer: null,
   logs: [],
   logCursor: null,
   logController: null,
@@ -128,15 +135,89 @@ async function apiJson(path, { allowUnavailable = false } = {}) {
     const detail = body.errors?.map((item) => item.message).join("; ");
     throw new Error(detail || `Request failed with status ${response.status}`);
   }
-  return body;
+  return {
+    envelope: body,
+    catalogRevision: response.headers.get(CATALOG_REVISION_HEADER),
+  };
 }
 
-function chunks(values, size) {
-  const result = [];
-  for (let index = 0; index < values.length; index += size) {
-    result.push(values.slice(index, index + size));
+function revisionFromEtag(etag) {
+  if (typeof etag !== "string") return null;
+  let value = etag.trim();
+  if (value.startsWith("W/")) value = value.slice(2);
+  if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+  return value || null;
+}
+
+async function fetchInstrumentCatalog(etag = state.catalogEtag) {
+  const headers = {
+    Accept: "application/json",
+    "X-API-Key": state.apiKey,
+  };
+  if (etag) headers["If-None-Match"] = etag;
+  const response = await fetch("/v1/instruments", {
+    cache: "no-store",
+    headers,
+  });
+  if (response.status === 304) {
+    return {
+      notModified: true,
+      etag,
+      revision: revisionFromEtag(etag),
+      data: null,
+    };
   }
-  return result;
+  let body;
+  try {
+    body = await response.json();
+  } catch (_error) {
+    throw new Error(`Server returned an invalid response (${response.status})`);
+  }
+  if (response.status === 401) {
+    const error = new Error("The API key was rejected.");
+    error.unauthorized = true;
+    throw error;
+  }
+  if (!response.ok) {
+    const detail = body.errors?.map((item) => item.message).join("; ");
+    throw new Error(detail || `Request failed with status ${response.status}`);
+  }
+  const responseEtag = response.headers.get("ETag");
+  return {
+    notModified: false,
+    etag: responseEtag,
+    revision: response.headers.get(CATALOG_REVISION_HEADER) || revisionFromEtag(responseEtag),
+    data: Array.isArray(body.data) ? body.data : [],
+  };
+}
+
+function instrumentCatalogFingerprint(instruments) {
+  return JSON.stringify(instruments);
+}
+
+function reconcileInstrumentCatalog(nextInstruments, { render = true } = {}) {
+  if (
+    instrumentCatalogFingerprint(state.instruments)
+    === instrumentCatalogFingerprint(nextInstruments)
+  ) return false;
+  const activeSymbols = new Set(nextInstruments.map((item) => item.symbol));
+  state.instruments = nextInstruments;
+  for (const symbol of [...state.quotes.keys()]) {
+    if (!activeSymbols.has(symbol)) state.quotes.delete(symbol);
+  }
+  for (const symbol of [...state.quoteErrors.keys()]) {
+    if (!activeSymbols.has(symbol)) state.quoteErrors.delete(symbol);
+  }
+  for (const symbol of [...state.expandedSymbols]) {
+    if (!activeSymbols.has(symbol)) state.expandedSymbols.delete(symbol);
+  }
+  if (render) {
+    populateAssetFilter();
+    updateFixtureWarning();
+    updateSummary();
+    renderMarket();
+  }
+  return true;
 }
 
 function dateTime(value) {
@@ -718,56 +799,106 @@ function updateFixtureWarning() {
     : `${fixtureCount} displayed ${fixtureCount === 1 ? "quote comes" : "quotes come"} from a test fixture and ${fixtureCount === 1 ? "is" : "are"} not live market data. Do not use fixture prices for trading, valuation, or financial decisions.`;
 }
 
-async function refreshQuotes() {
-  if (!state.apiKey || state.refreshing || state.instruments.length === 0) return;
+function currentCatalogSnapshot() {
+  return {
+    notModified: false,
+    etag: state.catalogEtag,
+    revision: state.catalogRevision,
+    data: state.instruments,
+  };
+}
+
+function commitMarketGeneration(catalog, envelope) {
+  const catalogChanged = reconcileInstrumentCatalog(catalog.data, { render: false });
+  state.catalogEtag = catalog.etag;
+  state.catalogRevision = catalog.revision;
+  state.quotes.clear();
+  state.quoteErrors.clear();
+  const activeSymbols = new Set(catalog.data.map((item) => item.symbol));
+  for (const quote of envelope.data || []) {
+    if (activeSymbols.has(quote.symbol)) state.quotes.set(quote.symbol, quote);
+  }
+  for (const error of envelope.errors || []) {
+    if (error.symbol && activeSymbols.has(error.symbol)) {
+      state.quoteErrors.set(error.symbol, error);
+    }
+  }
+  ui.lastRefresh.textContent = dateTime(envelope.generated_at || new Date().toISOString());
+  const incomplete = [...state.quoteErrors.keys()].filter(
+    (symbol) => state.quotes.has(symbol),
+  ).length;
+  const unavailable = state.instruments.length - state.quotes.size;
+  const issueSummary = [
+    incomplete ? `${incomplete} metadata incomplete` : null,
+    unavailable ? `${unavailable} unavailable` : null,
+  ].filter(Boolean).join("; ");
+  setNotice(
+    ui.marketNotice,
+    state.instruments.length === 0
+      ? "No instruments are active in the current catalog."
+      : issueSummary
+      ? `${state.quotes.size} priced; ${issueSummary}. Exact reasons are shown with each instrument.`
+      : "All registered instruments are priced and complete.",
+    issueSummary ? "neutral" : "success",
+  );
+  setBadge(
+    ui.connectionBadge,
+    issueSummary ? "Partial" : "Connected",
+    issueSummary ? "warn" : "good",
+  );
+  if (catalogChanged) populateAssetFilter();
+  updateFixtureWarning();
+  updateSummary();
+  renderMarket();
+  return catalogChanged;
+}
+
+async function refreshQuotes(candidateCatalog = null) {
+  const firstCatalog = candidateCatalog?.data ? candidateCatalog : currentCatalogSnapshot();
+  if (!state.apiKey || state.refreshing) return false;
   state.refreshing = true;
   ui.refreshMarket.disabled = true;
   try {
-    const symbols = state.instruments.map((item) => item.symbol);
-    const envelopes = await Promise.all(
-      chunks(symbols, 100).map((group) => apiJson(
-        `/internal/dashboard/quotes?symbols=${encodeURIComponent(group.join(","))}`,
-        { allowUnavailable: true },
-      )),
-    );
-    state.quotes.clear();
-    state.quoteErrors.clear();
-    for (const envelope of envelopes) {
-      for (const quote of envelope.data || []) state.quotes.set(quote.symbol, quote);
-      for (const error of envelope.errors || []) {
-        if (error.symbol) state.quoteErrors.set(error.symbol, error);
+    let catalog = firstCatalog;
+    for (let attempt = 0; attempt < GENERATION_REFRESH_ATTEMPTS; attempt += 1) {
+      if (!catalog.revision) {
+        throw new Error("The instrument catalog response omitted its generation revision.");
       }
+      const result = await apiJson("/v1/quotes", { allowUnavailable: true });
+      if (!result.catalogRevision) {
+        throw new Error("The quote response omitted its catalog generation revision.");
+      }
+      if (result.catalogRevision === catalog.revision) {
+        return commitMarketGeneration(catalog, result.envelope);
+      }
+      const latest = await fetchInstrumentCatalog(catalog.etag);
+      if (!latest.notModified) catalog = latest;
     }
-    const generated = envelopes.map((item) => item.generated_at).filter(Boolean).sort().at(-1);
-    ui.lastRefresh.textContent = dateTime(generated || new Date().toISOString());
-    const incomplete = [...state.quoteErrors.keys()].filter(
-      (symbol) => state.quotes.has(symbol),
-    ).length;
-    const unavailable = state.instruments.length - state.quotes.size;
-    const issueSummary = [
-      incomplete ? `${incomplete} metadata incomplete` : null,
-      unavailable ? `${unavailable} unavailable` : null,
-    ].filter(Boolean).join("; ");
-    setNotice(
-      ui.marketNotice,
-      issueSummary
-        ? `${state.quotes.size} priced; ${issueSummary}. Exact reasons are shown with each instrument.`
-        : "All registered instruments are priced and complete.",
-      issueSummary ? "neutral" : "success",
-    );
-    setBadge(
-      ui.connectionBadge,
-      issueSummary ? "Partial" : "Connected",
-      issueSummary ? "warn" : "good",
-    );
-    updateFixtureWarning();
-    updateSummary();
-    renderMarket();
+    throw new Error("The instrument catalog changed repeatedly while prices were loading. Retry the refresh.");
   } catch (error) {
     handleConnectionError(error);
+    return false;
   } finally {
     state.refreshing = false;
     ui.refreshMarket.disabled = false;
+  }
+}
+
+async function refreshInstrumentCatalog() {
+  if (!state.apiKey || state.catalogRefreshing || state.refreshing) return false;
+  state.catalogRefreshing = true;
+  try {
+    const result = await fetchInstrumentCatalog();
+    if (result.notModified) return false;
+    const changed = result.revision !== state.catalogRevision;
+    setNotice(ui.marketNotice, "The instrument catalog changed. Refreshing market data...");
+    await refreshQuotes(result);
+    return changed;
+  } catch (error) {
+    handleConnectionError(error);
+    return false;
+  } finally {
+    state.catalogRefreshing = false;
   }
 }
 
@@ -776,12 +907,11 @@ async function connect() {
   setBadge(ui.connectionBadge, "Connecting", "neutral");
   setNotice(ui.marketNotice, "Loading the installed instrument catalog...");
   try {
-    const envelope = await apiJson("/v1/instruments");
-    state.instruments = envelope.data || [];
+    const catalog = await fetchInstrumentCatalog();
+    const candidate = catalog.notModified ? currentCatalogSnapshot() : catalog;
     sessionStorage.setItem(SESSION_KEY, state.apiKey);
-    populateAssetFilter();
-    await refreshQuotes();
-    startRefreshTimer();
+    await refreshQuotes(candidate);
+    startRefreshTimers();
     connectLogStream();
   } catch (error) {
     handleConnectionError(error);
@@ -795,14 +925,27 @@ function handleConnectionError(error) {
     sessionStorage.removeItem(SESSION_KEY);
     state.apiKey = "";
     ui.apiKey.value = "";
+    stopRefreshTimers();
     stopLogStream();
     clearDashboardData();
   }
 }
 
-function startRefreshTimer() {
+function startRefreshTimers() {
   window.clearInterval(state.refreshTimer);
+  window.clearInterval(state.catalogRefreshTimer);
   state.refreshTimer = window.setInterval(refreshQuotes, REFRESH_INTERVAL_MS);
+  state.catalogRefreshTimer = window.setInterval(
+    refreshInstrumentCatalog,
+    CATALOG_REFRESH_INTERVAL_MS,
+  );
+}
+
+function stopRefreshTimers() {
+  window.clearInterval(state.refreshTimer);
+  window.clearInterval(state.catalogRefreshTimer);
+  state.refreshTimer = null;
+  state.catalogRefreshTimer = null;
 }
 
 function stopLogStream() {
@@ -815,6 +958,8 @@ function stopLogStream() {
 
 function clearDashboardData() {
   state.instruments = [];
+  state.catalogEtag = null;
+  state.catalogRevision = null;
   state.quotes.clear();
   state.quoteErrors.clear();
   state.expandedSymbols.clear();
@@ -973,7 +1118,7 @@ ui.forgetKey.addEventListener("click", () => {
   sessionStorage.removeItem(SESSION_KEY);
   state.apiKey = "";
   ui.apiKey.value = "";
-  window.clearInterval(state.refreshTimer);
+  stopRefreshTimers();
   stopLogStream();
   clearDashboardData();
   setBadge(ui.connectionBadge, "Not connected", "neutral");
@@ -1013,7 +1158,7 @@ for (const header of ui.sortHeaders) {
     selectSortField(header.dataset.sortField, { toggleIfActive: true });
   });
 }
-ui.refreshMarket.addEventListener("click", refreshQuotes);
+ui.refreshMarket.addEventListener("click", () => refreshQuotes());
 ui.logLevel.addEventListener("change", renderLogs);
 ui.logSearch.addEventListener("input", renderLogs);
 ui.pauseLogs.addEventListener("click", () => {
@@ -1033,7 +1178,10 @@ ui.clearLogs.addEventListener("click", () => {
   renderLogs();
 });
 ui.reconnectLogs.addEventListener("click", connectLogStream);
-window.addEventListener("beforeunload", stopLogStream);
+window.addEventListener("beforeunload", () => {
+  stopRefreshTimers();
+  stopLogStream();
+});
 
 initializeTheme();
 updateSortControls();

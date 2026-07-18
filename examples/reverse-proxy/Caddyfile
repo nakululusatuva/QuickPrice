@@ -10,7 +10,17 @@ price.example.com {
 		}
 	}
 
+	handle /admin-api/instrument-catalog/import {
+		request_body {
+			max_size 8MB
+		}
+		reverse_proxy 127.0.0.1:8080
+	}
+
 	handle {
+		request_body {
+			max_size 64KB
+		}
 		encode zstd gzip
 		reverse_proxy 127.0.0.1:8080
 	}

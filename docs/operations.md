@@ -124,8 +124,9 @@ origin:
 - missing or wrong CSRF tokens, sibling origins, `Origin: null`, non-JSON
   mutation bodies, and `Sec-Fetch-Site: same-site` are rejected;
 - the reverse proxy overwrites forwarding headers, restores a visitor address
-  only from trusted peers, caps bodies at 64 KiB, and never caches the admin
-  shell or responses;
+  only from trusted peers, caps ordinary admin bodies at 64 KiB, permits at
+  most 8 MiB only on `/admin-api/instrument-catalog/import`, and never caches
+  the admin shell or responses;
 - `QUICKPRICE_ADMIN_TRUSTED_PROXY_IPS` lists only the exact Nginx peer address;
   QuickPrice is started through `quickprice serve`, which disables Uvicorn's
   implicit proxy-header trust;
@@ -144,10 +145,44 @@ Provider files may also contain host-managed network destinations such as
 Ethereum RPC URLs. Those entries are preserved but never exposed or modified
 by web administration.
 
-Instrument administration is declarative. The UI can activate installed
-catalog entries and adjust bounded collection intervals, but cannot load entry
-points, upload wheels, specify import paths, create arbitrary URLs, or execute
-code. New provider routes still require a reviewed plugin deployment.
+Instrument administration is declarative. The UI can stage custom instruments
+supported by installed providers, adjust compatible routes and bounded
+collection intervals, validate the full catalog, perform a shadow warm-up, and
+atomically activate or roll back a runtime generation. It cannot load entry
+points, upload wheels, specify import paths, create arbitrary URLs or headers,
+or execute code. A completely new provider still requires a reviewed plugin
+deployment.
+
+The catalog file maintains active, staged, and last-known-good generations.
+Before an application upgrade, back up `instruments.json` together with SQLite.
+Version 1 policy files migrate only after the complete application startup has
+succeeded while retaining disabled symbols and interval overrides. QuickPrice
+also writes `instruments.json.v1-backup`; keep it until the previous release is
+outside the rollback window. After migration, confirm that the active revision
+contains all built-ins before activating any new draft.
+
+A policy that intentionally disabled every version 1 symbol remains empty after
+migration. This is a ready state when the other readiness gates pass; the
+detailed readiness response reports zero active instruments. The default quote
+and instrument batches are HTTP 200 empty arrays, while explicit disabled-symbol
+requests still fail as unknown symbols.
+
+During activation, monitor the job in `/admin`, provider quota state, and the
+service journal. Only changed instruments are warmed. Every changed instrument
+must produce a valid price, and bond or staking instruments must also produce
+their mandatory income metric. A failed job intentionally leaves the staged
+revision available for correction and does not degrade the active generation
+or `/health/ready`.
+
+Large listed-security imports are constrained by the Alpaca stream prefix and
+shared REST rate gate. Adjust `QUICKPRICE_ALPACA_STREAM_SYMBOL_LIMIT`,
+`QUICKPRICE_ALPACA_REST_CALLS_PER_MINUTE`, and
+`QUICKPRICE_CATALOG_WARM_TIMEOUT_SECONDS` only to values supported by the
+attached account. The old generation remains active until the candidate
+collector acknowledges startup. The configured warm timeout is a floor.
+Validation exposes a scale-aware effective deadline derived from the changed
+capabilities, bounded warm concurrency, compiled fallback routing timeouts, and
+known provider rate gates; inspect that plan before activating a large catalog.
 
 Provider statistics are process-lifetime operational observations. Credit
 values are local request reservations unless a provider explicitly reports a
@@ -158,7 +193,10 @@ the operation count. Stream state and reconnects are shown separately. Success
 rate and latency have no value before the first observed attempt. Quota
 snapshots refresh every 60 seconds and carry their own observation timestamp;
 the bounded 2,048-sample percentile window and process-lifetime counters reset
-on restart.
+on restart. Admission uses committed primary demand. Validation reports
+uncapped fallback demand separately, while provider quota gates enforce the
+reported hard-capped amount at runtime; do not read worst-case fallback demand
+as simultaneously reserved credit.
 
 ## Routine checks
 
@@ -303,10 +341,9 @@ Synthetic prices reject over-age or over-skew components. A last cached value
 must remain explicitly stale. WBETH yield may fall back from signed Binance APR
 to the contract exchange-rate estimate and finally the declared 30-day
 WBETH/ETH market-ratio proxy; the method and proxy flags must reveal the
-fallback. For staking assets
-whose rewards increase units rather than unit value, the same declared
-price-ratio fallback can omit those units and must remain a low-confidence
-market proxy rather than a protocol-reported rate.
+fallback. Assets whose rewards increase units rather than unit value must use a
+compatible provider-reported metric; QuickPrice rejects a market-ratio proxy
+that cannot observe those units.
 
 ### Provider quota exhausted
 
@@ -322,6 +359,8 @@ market proxy rather than a protocol-reported rate.
   after a listed-security route falls through. Twelve Data and Alpha Vantage
   fallback values or expected errors are cached per symbol until the next
   scheduled US session open; closed sessions use a 15-minute route-wide floor.
+- Alpaca streams at most 30 symbols by default. Remaining symbols use the
+  catalog-scaled REST cadence behind the shared 180-call-per-minute gate.
 - FX scheduling continues to probe Twelve Data every 240 seconds for USD/CNH
   and every 900 seconds for the other USD hubs. Alpha FX fallback values and
   expected Alpha errors are cached per hub for six hours, so those primary

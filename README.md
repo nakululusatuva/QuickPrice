@@ -17,8 +17,10 @@ environment.
   SQLite writer thread.
 - API-key authentication, hostile-IP and per-key rate limits, provider quotas,
   single-flight requests, circuit breakers, and explicit stale-data metadata.
-- Trusted Python entry-point plugins for instruments, provider routes,
-  synthetic formulas, and income policies.
+- A revisioned, data-driven instrument catalog with fixed provider descriptors,
+  bounded synthetic recipes, shadow warm-up, and atomic hot activation.
+- Trusted Python entry-point plugins only when a completely new provider or
+  executable integration is required.
 - Native Windows, WSL2, Linux, and macOS development workflows; Docker is not supported.
 
 After importing the complete dependency graph, production readiness requires:
@@ -37,10 +39,11 @@ but it does not satisfy the production readiness gate.
 flowchart LR
     Excel["Excel Power Query"] -->|"HTTPS and X-API-Key"| Proxy["Operator-selected reverse proxy"]
     Proxy -->|"HTTP/1.1 on loopback"| API["FastAPI and h11"]
-    API --> Snapshots["Immutable memory snapshots"]
-    Plugins["Trusted instrument plugins"] --> Collectors["Background collectors"]
-    Providers["Quote, history, income, and index providers"] --> Collectors
-    Collectors --> Snapshots
+    API --> Generation["Immutable runtime generation"]
+    Catalog["Active managed catalog"] --> Compiler["Safe route compiler"]
+    Compiler --> Collectors["Background collectors"]
+    Providers["Fixed-host built-in providers"] --> Collectors
+    Collectors --> Generation
     Collectors --> Writer["Single SQLite writer"]
     Writer --> SQLite["SQLite WAL on local storage"]
 ```
@@ -51,8 +54,11 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in plugin contains 54 canonical instruments. Additional trusted
-plugins can extend the catalog without modifying the application core.
+The built-in seed contains 54 canonical instruments. The administrator console
+can add further instruments supported by installed providers without a code
+change or process restart. Built-in identity, classification, and income
+semantics remain immutable; their enabled state, bounded collection cadence,
+and compatible provider order are operator-managed.
 
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
@@ -102,9 +108,11 @@ not mix in dividends, rebases, distributed units, or total return. Missing
 history produces JSON `null`, not a fabricated zero.
 
 SQLite retention defaults are 48 hours for 1-minute points, 45 days for
-5-minute points, and 400 days for daily points. A closed market returns the
-last valid price with `market_status=closed`. A provider outage may return the
-last snapshot only when `quality.stale=true` discloses its age.
+5-minute points, and 400 days for daily points. Maintenance applies the same
+windows to memory rings even after a symbol is archived and no longer receives
+observations. A closed market returns the last valid price with
+`market_status=closed`. A provider outage may return the last snapshot only when
+`quality.stale=true` discloses its age.
 
 Income calculations are explicit:
 
@@ -173,7 +181,7 @@ without required price or income data returns 503.
 
 ### `GET /v1/instruments`
 
-Returns the complete installed catalog and its names, descriptions,
+Returns the complete active catalog and its names, descriptions,
 classifications, price bases, change windows, reward mechanics, and income
 policies.
 
@@ -223,7 +231,7 @@ request IDs appear in both the envelope and `X-Request-ID`.
 QuickPrice serves a compact operator dashboard at `/dashboard`. It is a
 read-only client of the same HTTP API used by Excel: the static HTML, CSS, and
 JavaScript shell contains no instrument data, cached prices, API keys, provider
-credentials, or other runtime secrets. It retrieves the installed catalog and
+credentials, or other runtime secrets. It retrieves the active catalog and
 quotes only after the operator authenticates.
 
 The dashboard deliberately presents one table covering every installed
@@ -282,8 +290,10 @@ The default route families are:
   `BETH/USDT / USDC/USDT`; CoinGecko is the final price/history fallback. Yield
   uses only OKX's provider-reported ETH staking rate, while SQLite can retain
   the last successful metric with explicit stale metadata during an outage.
-- stETH and wstETH: CoinGecko price normalization, Lido protocol yield, then
-  the declared 30-day market-ratio yield fallback.
+- stETH and wstETH: CoinGecko price normalization and Lido protocol yield.
+  Value-accruing wstETH may finally use the declared 30-day market-ratio
+  proxy; rebasing stETH does not use a price-ratio proxy because rewards accrue
+  as units rather than unit-price appreciation.
 - Common-stock and ETF quotes: Alpaca IEX, Finnhub, Twelve Data, then Alpha
   Vantage end-of-day data. History remains Alpaca, Twelve Data, then Alpha
   Vantage because [Finnhub's free plan](https://finnhub.io/pricing) does not
@@ -311,6 +321,14 @@ US real-time quote is SIP, single-venue, or aggregated, so responses use
 [Finnhub API documentation](https://finnhub.io/docs/api) and
 [rate-limit policy](https://finnhub.io/docs/api/rate-limit).
 
+Alpaca streaming uses a deterministic prefix of at most 30 symbols by default.
+Additional listed instruments remain active through a shared REST scheduler
+paced at 180 calls per minute; both limits are explicit managed settings so an
+operator can match an authorized Alpaca plan without changing code. The same
+gate covers quote, history, dividend, and market-clock requests, including
+catalog warm-up, rather than allowing a large import to create a cold-start
+burst.
+
 With the default 9,000-credit monthly CoinGecko budget and healthy primary spot
 providers, stETH and wstETH drive one all-symbol quote batch on a 660-second
 cadence. Ordinary spot fallback demand reuses that cache; its refresh floor and
@@ -319,6 +337,10 @@ ordinary spot routes are aggregated, USD-to-USDC-normalized quote fallbacks
 only and are never used as ordinary spot history. Source timestamps and
 staleness remain explicit, and a paid or plugin-provided feed can replace this
 route when a tighter service level is required.
+
+Data-driven CoinGecko bindings support direct `*:USD` quotes and USD-to-USDC
+normalization for `*:USDC`. Other quote currencies require a controlled
+synthetic definition or a provider that natively lists the pair.
 
 ## Configuration and credentials
 
@@ -404,9 +426,10 @@ in-memory synchronizer token. Administrator mutations require the token,
 context. Sessions have 15-minute idle and one-hour absolute defaults, are
 bounded in memory, and disappear on restart. Login and mutation budgets are
 rate-limited independently. A pre-parse guard also rate-limits every admin API
-request, rejects chunked mutation bodies, and enforces the 64 KiB body limit
-without trusting `Content-Length`. TOTP codes cannot be replayed within the
-running process.
+request, rejects chunked mutation bodies, and enforces a 64 KiB body limit
+without trusting `Content-Length`. Only the exact instrument-catalog import
+endpoint receives a separate 8 MiB limit. TOTP codes cannot be replayed within
+the running process.
 
 `quickprice serve` disables Uvicorn's implicit forwarding-header trust.
 QuickPrice accepts `X-Real-IP` and `X-Forwarded-Proto` only from exact addresses
@@ -418,7 +441,8 @@ The control plane deliberately exposes only bounded operations:
 
 - client API-key creation, import, expiry changes, and immediate revocation;
 - write-only provider credential replacement and clearing;
-- enable/disable and safe cadence settings for already installed instruments;
+- declarative instrument creation, editing, archiving, import, export,
+  validation, hot activation, and rollback;
 - an allowlist of non-secret runtime and provider-routing settings;
 - redacted audit events and in-memory provider availability, latency,
   fallback, circuit, stream, and locally accounted credit statistics.
@@ -433,13 +457,44 @@ provider billing statements.
 
 It cannot install plugins, import Python objects, edit arbitrary files, choose
 arbitrary provider/RPC destinations, execute commands, modify Nginx/systemd,
-or restart itself. Configuration and catalog changes are revisioned and show a
-restart-required state; use the host's normal service manager to apply them.
+or restart itself. Configuration and provider-key changes remain revisioned
+and restart-bound. Instrument catalog activation is an in-process atomic
+generation switch after validation and shadow warm-up.
 For a public deployment, place an identity-aware proxy, mTLS, VPN, or strict IP
 policy in front of `/admin` as a second boundary. TOTP is strong protection
 against a stolen administrator key but is not phishing-resistant.
 
-## Extending the catalog
+## Managed instrument catalog
+
+`/admin` provides a staged catalog workflow for instruments supported by the
+built-in providers. It includes provider capability discovery, fixed-host
+symbol search, recommended routes, local credit estimates, strict JSON import
+and export, validation, shadow warm-up, activation jobs, and rollback to the
+last-known-good generation.
+
+Public requests capture one immutable generation. They therefore observe the
+complete old catalog or the complete new catalog, never a partially activated
+mix. A draft is private until activation; an archived instrument disappears
+from public APIs after activation while its retained SQLite history is left to
+the normal retention policy. Failed validation or warm-up leaves the active
+generation and readiness unchanged.
+
+The validation result and activation job expose a scale-aware warm-up plan.
+`QUICKPRICE_CATALOG_WARM_TIMEOUT_SECONDS` is a minimum deadline: QuickPrice
+raises it for large changed sets according to bounded concurrency, compiled
+provider attempts and known rate gates, and paces primary minute-limited routes.
+An intentionally all-disabled migrated catalog remains a valid empty active
+generation; default batch endpoints return HTTP 200 with empty arrays.
+
+The managed boundary accepts only installed provider identifiers, validated
+vendor symbols, controlled income strategies, and `inverse`, `multiply`, or
+`divide` recipes with at most two inputs. It rejects URLs, headers, credentials,
+module paths, executable expressions, unknown fields, dependency cycles, and
+catalogs above the configured structural and credit limits. See
+[docs/instrument-catalog.md](docs/instrument-catalog.md) for the manifest,
+workflow, endpoints, and recovery model.
+
+## Extending providers
 
 Only entry points listed in `QUICKPRICE_ENABLED_PLUGINS` execute. Plugin wheels
 are trusted code running inside the QuickPrice process and must be reviewed
@@ -509,7 +564,7 @@ The supplied Linux service layout is:
 /etc/quickprice/admin-auth.env          root-controlled administrator factors
 /var/lib/quickprice/config/quickprice.env       web-managed allowlisted settings
 /var/lib/quickprice/config/provider-keys.env    web-managed provider credentials
-/var/lib/quickprice/config/instruments.json     declarative instrument policy
+/var/lib/quickprice/config/instruments.json     revisioned managed catalog
 /var/lib/quickprice                     SQLite database, configuration, backups
 /etc/systemd/system/quickprice.service  application service unit
 ```
@@ -533,8 +588,9 @@ The selected HTTP server must:
   block direct origin bypass;
 - preserve the method, path, query, and `X-API-Key` request header;
 - avoid shared caching of authenticated responses;
-- cap administrator request bodies at 64 KiB and never cache `/admin` or
-  `/admin-api/*`;
+- cap ordinary administrator request bodies at 64 KiB, allow at most 8 MiB on
+  the exact `/admin-api/instrument-catalog/import` path, and never cache
+  `/admin` or `/admin-api/*`;
 - redact `X-API-Key` and credential-like query parameters from access logs;
 - apply appropriate request-header, body, upstream, and idle timeouts;
 - stream `/internal/logs/stream` without response buffering, transformation,
@@ -565,9 +621,10 @@ HTTP request per cell.
 
 ## Verification and operations
 
-CI exercises standard CPython 3.14.6 and free-threaded 3.14.6t across Windows,
-Ubuntu, and macOS. It verifies formatting, tests, the systemd unit, shell
-scripts, English-only repository text, and the native-only deployment policy.
+CI exercises standard CPython 3.14.6 on Windows, Ubuntu, and macOS, plus
+free-threaded 3.14.6t on Windows and Ubuntu. It verifies formatting, tests, the
+systemd unit, shell scripts, English-only repository text, and the native-only
+deployment policy.
 
 The acceptance target on a 2-vCPU Linux host is 500 concurrent connections,
 300 requests per second, hot-cache p95 below 100 ms, and unexpected errors

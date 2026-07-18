@@ -88,8 +88,14 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert 'fetch("/internal/logs/stream"' in javascript.text
     assert '"X-API-Key"' in javascript.text
     assert 'headers["Last-Event-ID"]' in javascript.text
-    assert "chunks(symbols, 100)" in javascript.text
-    assert "/internal/dashboard/quotes?symbols=" in javascript.text
+    assert 'apiJson("/v1/quotes"' in javascript.text
+    assert "chunks(symbols, 100)" not in javascript.text
+    assert "/internal/dashboard/quotes?symbols=" not in javascript.text
+    assert 'CATALOG_REVISION_HEADER = "X-QuickPrice-Catalog-Revision"' in javascript.text
+    assert "result.catalogRevision === catalog.revision" in javascript.text
+    assert 'if (etag) headers["If-None-Match"] = etag' in javascript.text
+    assert "CATALOG_REFRESH_INTERVAL_MS = 30_000" in javascript.text
+    assert "window.setInterval(\n    refreshInstrumentCatalog" in javascript.text
     assert "expandedSymbols: new Set()" in javascript.text
     assert "state.expandedSymbols.clear()" in javascript.text
     assert 'inspect.setAttribute("aria-expanded", String(expansion.expanded))' in javascript.text
@@ -143,6 +149,9 @@ def test_dashboard_quote_projection_keeps_price_with_exact_metadata_error(
         "required latest regular dividend is unavailable"
     )
     assert dashboard.status_code == 200
+    assert dashboard.headers["X-QuickPrice-Catalog-Revision"] == (
+        local_client.app.state.service.capture_generation().revision
+    )
     body = dashboard.json()
     assert body["partial"] is True
     assert [(item["symbol"], item["price"]) for item in body["data"]] == [("AAPL:USD", 225.0)]
@@ -812,9 +821,10 @@ def test_dashboard_refresh_reapplies_active_sort_after_live_values_change() -> N
         source.index("function visibleRows") : source.index("\n\nfunction metadataItem")
     ]
     refresh_helper = source[
-        source.index("async function refreshQuotes") : source.index("\n\nasync function connect")
+        source.index("function currentCatalogSnapshot") : source.index("\n\nasync function connect")
     ]
     assertions = r"""
+const GENERATION_REFRESH_ATTEMPTS = 3;
 const instruments = [
   { symbol: "ALPHA", name: "Alpha", description: "Alpha", asset_class: "equity", asset_type: "stock" },
   { symbol: "BETA", name: "Beta", description: "Beta", asset_class: "equity", asset_type: "stock" },
@@ -825,6 +835,8 @@ const state = {
   instruments,
   quotes: new Map(),
   quoteErrors: new Map(),
+  catalogEtag: '"revision-1"',
+  catalogRevision: "revision-1",
   sortField: "price",
   ascending: true,
 };
@@ -853,8 +865,13 @@ const responses = [
 ];
 const renderedOrders = [];
 
-function chunks(values) { return [values]; }
-async function apiJson() { return responses.shift(); }
+async function apiJson(path) {
+  if (path !== "/v1/quotes") throw new Error(`unexpected quote path: ${path}`);
+  return { envelope: responses.shift(), catalogRevision: "revision-1" };
+}
+async function fetchInstrumentCatalog() { throw new Error("catalog retry was not expected"); }
+function reconcileInstrumentCatalog() { return false; }
+function populateAssetFilter() {}
 function dateTime(value) { return value; }
 function setNotice() {}
 function setBadge() {}
@@ -893,6 +910,205 @@ function assertOrder(index, expected, label) {
             "-e",
             rows_helper + sort_helpers + visible_rows_helper + refresh_helper + assertions,
         ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_large_catalog_uses_one_request_and_retries_activation_atomically() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    refresh_helper = source[
+        source.index("function currentCatalogSnapshot") : source.index("\n\nasync function connect")
+    ]
+    assertions = r"""
+const GENERATION_REFRESH_ATTEMPTS = 3;
+const oldRevision = "a".repeat(64);
+const newRevision = "b".repeat(64);
+const instrument = (index, generation) => ({
+  symbol: `${generation}${String(index).padStart(4, "0")}:USD`,
+  name: `${generation} ${index}`,
+  description: `${generation} generation instrument ${index}`,
+  asset_class: "equity",
+  asset_type: "stock",
+});
+const quote = (item, generation) => ({
+  symbol: item.symbol,
+  price: generation === "OLD" ? 1 : 2,
+  changes: {},
+  market_status: "open",
+  source: { provider: "fixture", feed: generation },
+  quality: { stale: false },
+});
+const oldInstruments = Array.from({ length: 2054 }, (_, index) => instrument(index, "OLD"));
+const newInstruments = Array.from({ length: 2055 }, (_, index) => instrument(index, "NEW"));
+const state = {
+  apiKey: "test-key",
+  refreshing: false,
+  instruments: oldInstruments,
+  quotes: new Map(),
+  quoteErrors: new Map(),
+  catalogEtag: `"${oldRevision}"`,
+  catalogRevision: oldRevision,
+};
+const ui = {
+  refreshMarket: { disabled: false },
+  lastRefresh: { textContent: "" },
+  marketNotice: {},
+  connectionBadge: {},
+};
+let activation = false;
+let activationQuoteAttempt = 0;
+let quoteRequests = [];
+let catalogRequests = 0;
+const renders = [];
+
+async function apiJson(path) {
+  quoteRequests.push(path);
+  if (path !== "/v1/quotes") throw new Error(`unexpected quote path: ${path}`);
+  if (!activation) {
+    return {
+      envelope: { data: oldInstruments.map((item) => quote(item, "OLD")), errors: [] },
+      catalogRevision: oldRevision,
+    };
+  }
+  activationQuoteAttempt += 1;
+  return {
+    envelope: { data: newInstruments.map((item) => quote(item, "NEW")), errors: [] },
+    catalogRevision: newRevision,
+  };
+}
+async function fetchInstrumentCatalog(etag) {
+  catalogRequests += 1;
+  if (etag !== `"${oldRevision}"`) throw new Error(`unexpected conditional ETag: ${etag}`);
+  return {
+    notModified: false,
+    etag: `"${newRevision}"`,
+    revision: newRevision,
+    data: newInstruments,
+  };
+}
+function reconcileInstrumentCatalog(next, options) {
+  if (options?.render !== false) throw new Error("catalog must be staged without rendering");
+  const changed = state.instruments !== next;
+  state.instruments = next;
+  return changed;
+}
+function dateTime(value) { return value; }
+function setNotice() {}
+function setBadge() {}
+function populateAssetFilter() {}
+function updateFixtureWarning() {}
+function updateSummary() {}
+function handleConnectionError(error) { throw error; }
+function renderMarket() {
+  const feeds = new Set([...state.quotes.values()].map((item) => item.source.feed));
+  renders.push({ instruments: state.instruments.length, quotes: state.quotes.size, feeds: [...feeds] });
+}
+function assertCondition(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+(async () => {
+  await refreshQuotes();
+  assertCondition(quoteRequests.length === 1, "2,054 instruments must use one quote request");
+  assertCondition(quoteRequests[0] === "/v1/quotes", "the quote request must have no symbols query");
+  assertCondition(renders.length === 1, "the stable generation should render once");
+  assertCondition(renders[0].instruments === 2054 && renders[0].quotes === 2054, "old generation mismatch");
+  assertCondition(renders[0].feeds.join() === "OLD", "old render mixed quote generations");
+
+  activation = true;
+  await refreshQuotes();
+  assertCondition(activationQuoteAttempt === 2, "activation mismatch must retry the complete quote request");
+  assertCondition(catalogRequests === 1, "activation mismatch must reload the catalog once");
+  assertCondition(renders.length === 2, "a mismatched generation must never render");
+  assertCondition(renders[1].instruments === 2055 && renders[1].quotes === 2055, "new generation mismatch");
+  assertCondition(renders[1].feeds.join() === "NEW", "new render mixed quote generations");
+  assertCondition(state.catalogRevision === newRevision, "new catalog revision was not committed");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", refresh_helper + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_commits_an_intentionally_empty_catalog_generation() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    refresh_helper = source[
+        source.index("function currentCatalogSnapshot") : source.index("\n\nasync function connect")
+    ]
+    assertions = r"""
+const GENERATION_REFRESH_ATTEMPTS = 3;
+const revision = "c".repeat(64);
+const state = {
+  apiKey: "test-key",
+  refreshing: false,
+  instruments: [],
+  quotes: new Map(),
+  quoteErrors: new Map(),
+  catalogEtag: `"${revision}"`,
+  catalogRevision: revision,
+};
+const ui = {
+  refreshMarket: { disabled: false },
+  lastRefresh: { textContent: "" },
+  marketNotice: {},
+  connectionBadge: {},
+};
+let quoteRequests = 0;
+let renders = 0;
+let notice = "";
+async function apiJson(path) {
+  if (path !== "/v1/quotes") throw new Error(`unexpected quote path: ${path}`);
+  quoteRequests += 1;
+  return {
+    envelope: { data: [], errors: [], generated_at: "2026-07-21T00:00:00Z" },
+    catalogRevision: revision,
+  };
+}
+async function fetchInstrumentCatalog() { throw new Error("catalog retry was not expected"); }
+function reconcileInstrumentCatalog() { return false; }
+function dateTime(value) { return value; }
+function setNotice(_target, value) { notice = value; }
+function setBadge() {}
+function populateAssetFilter() {}
+function updateFixtureWarning() {}
+function updateSummary() {}
+function renderMarket() { renders += 1; }
+function handleConnectionError(error) { throw error; }
+
+(async () => {
+  await refreshQuotes();
+  if (quoteRequests !== 1) throw new Error("the empty generation must still validate quotes");
+  if (renders !== 1) throw new Error("the empty generation must render once");
+  if (notice !== "No instruments are active in the current catalog.") {
+    throw new Error(`unexpected empty notice: ${notice}`);
+  }
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", refresh_helper + assertions],
         check=False,
         capture_output=True,
         text=True,
@@ -1022,6 +1238,95 @@ assertCondition(
   [...state.expandedSymbols].join() === "BTC:USDC,ETH:USDC",
   "sorting preserves expanded instruments",
 );
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helper + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_reconciles_added_archived_and_changed_instruments_without_reload() -> None:
+    script_path = (
+        Path(__file__).parents[1] / "src" / "quickprice" / "dashboard" / "assets" / "dashboard.js"
+    )
+    source = script_path.read_text(encoding="utf-8")
+    helper = source[
+        source.index("function instrumentCatalogFingerprint") : source.index(
+            "\n\nfunction dateTime"
+        )
+    ]
+    assertions = r"""
+function assertCondition(condition, label) {
+  if (!condition) throw new Error(label);
+}
+function instrument(symbol, name = symbol) {
+  return { symbol, name, asset_class: "crypto", asset_type: "spot_crypto" };
+}
+
+const state = {
+  instruments: [instrument("BTC:USDC"), instrument("ETH:USDC")],
+  quotes: new Map([
+    ["BTC:USDC", { price: 1 }],
+    ["ETH:USDC", { price: 2 }],
+  ]),
+  quoteErrors: new Map([["ETH:USDC", { code: "metadata" }]]),
+  expandedSymbols: new Set(["BTC:USDC", "ETH:USDC"]),
+  sortField: "price",
+  ascending: false,
+  filterToken: "crypto",
+};
+let renders = 0;
+let filterRefreshes = 0;
+function populateAssetFilter() { filterRefreshes += 1; }
+function updateFixtureWarning() {}
+function updateSummary() {}
+function renderMarket() { renders += 1; }
+
+assertCondition(
+  !reconcileInstrumentCatalog(JSON.parse(JSON.stringify(state.instruments))),
+  "an identical catalog is ignored",
+);
+assertCondition(renders === 0, "an unchanged catalog does not rerender");
+
+const added = reconcileInstrumentCatalog([
+  instrument("BTC:USDC"),
+  instrument("ETH:USDC"),
+  instrument("SOL:USDC"),
+]);
+assertCondition(added, "a newly activated instrument changes the catalog");
+assertCondition(
+  state.instruments.map((item) => item.symbol).join() === "BTC:USDC,ETH:USDC,SOL:USDC",
+  "the new instrument appears without reload",
+);
+assertCondition(state.expandedSymbols.has("ETH:USDC"), "retained inspect state survives addition");
+
+state.quotes.set("SOL:USDC", { price: 3 });
+state.quoteErrors.set("SOL:USDC", { code: "temporary" });
+state.expandedSymbols.add("SOL:USDC");
+const archived = reconcileInstrumentCatalog([
+  instrument("BTC:USDC"),
+  instrument("SOL:USDC", "Solana (updated)"),
+]);
+assertCondition(archived, "an archive or metadata edit changes the catalog");
+assertCondition(
+  state.instruments.map((item) => item.symbol).join() === "BTC:USDC,SOL:USDC",
+  "the archived instrument disappears without reload",
+);
+assertCondition(!state.quotes.has("ETH:USDC"), "archived quote state is removed");
+assertCondition(!state.quoteErrors.has("ETH:USDC"), "archived error state is removed");
+assertCondition(!state.expandedSymbols.has("ETH:USDC"), "archived inspect state is removed");
+assertCondition(state.expandedSymbols.has("SOL:USDC"), "retained inspect state survives metadata edits");
+assertCondition(state.instruments[1].name === "Solana (updated)", "metadata changes appear");
+assertCondition(
+  state.sortField === "price" && !state.ascending && state.filterToken === "crypto",
+  "sort and filter state are preserved",
+);
+assertCondition(renders === 2 && filterRefreshes === 2, "only changed catalogs rerender");
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-e", helper + assertions],
