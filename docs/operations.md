@@ -59,6 +59,43 @@ Suggested alerts:
 Closed equity markets do not produce trades. Evaluate quote age together with
 `market_status`. Yield quality is independent of price quality; alert on both.
 
+## Dashboard and live logs
+
+`/dashboard` is a static operator shell. Loading the shell is not an
+authentication event and returns no market data or secrets. Its catalog,
+quotes, and Live log tab use the same QuickPrice API-key boundary as other
+clients. Treat a dashboard session as an authenticated administrative session:
+use a trusted browser profile, close the tab when finished, and never place the
+key in a bookmark, URL, reverse-proxy rule, or shared browser storage.
+
+The Live log tab reads `/internal/logs/stream` as an authenticated Server-Sent
+Events connection. Operational properties are intentionally bounded:
+
+- the in-process backlog retains at most 500 events and each connected client
+  has a 100-event queue;
+- `QUICKPRICE_DASHBOARD_MAX_LOG_STREAMS` limits concurrent streams per process
+  and defaults to 8; excess authenticated connections receive HTTP 429;
+- when a client falls behind, older queued events are discarded rather than
+  allowing memory growth or blocking application logging;
+- the backlog is cleared on process restart and is not an audit log, durable
+  journal, or replacement for host log collection;
+- configured credential values, credential-like assignments, and URL query
+  strings are redacted before delivery. Redaction is defense in depth: code
+  must still avoid logging secrets in the first place;
+- the server sends a heartbeat every 15 seconds. After an interruption, the
+  dashboard retries after two seconds and supplies the last received event
+  identifier when possible. Events older than the bounded backlog are not
+  replayable.
+
+Configure the selected reverse proxy specifically for the SSE path while
+remaining otherwise proxy-agnostic. It must preserve `X-API-Key` and
+`Last-Event-ID`, forward a streaming-capable connection, disable response
+buffering and shared caching, avoid compression or transformations that delay
+flushes, and disable or extend upstream read/idle timeouts so a healthy stream
+is not terminated. Do not encode the key in a proxy-generated query parameter.
+Validate reconnect and redaction behavior through the public HTTPS origin after
+every proxy or application upgrade.
+
 ## Routine checks
 
 Daily:

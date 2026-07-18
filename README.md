@@ -52,12 +52,12 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in plugin contains 50 canonical instruments. Additional trusted
+The built-in plugin contains 53 canonical instruments. Additional trusted
 plugins can extend the catalog without modifying the application core.
 
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
-| Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC` | `crypto / spot_crypto` | None |
+| Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC`, `POL:USDC`, `BNB:USDC`, `TRX:USDC` | `crypto / spot_crypto` | None |
 | Liquid staking | `WBETH:USDC`, `STETH:USDC`, `WSTETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
 | Common stock | `AAPL:USD`, `MSFT:USD`, `GOOGL:USD`, `META:USD`, `NVDA:USD` | `equity / common_stock` | Latest regular quarterly cash dividend |
 | Common stock | `AMZN:USD`, `TSLA:USD`, `SPCX:USD`, `MSTR:USD`, `CRCL:USD` | `equity / common_stock` | No current regular dividend; returns `null` |
@@ -208,6 +208,47 @@ request IDs appear in both the envelope and `X-Request-ID`.
 | 429 | Rate limited; honor `Retry-After` |
 | 503 | Required price or income data has never been available |
 
+## Dashboard
+
+QuickPrice serves a compact operator dashboard at `/dashboard`. It is a
+read-only client of the same HTTP API used by Excel: the static HTML, CSS, and
+JavaScript shell contains no instrument data, cached prices, API keys, provider
+credentials, or other runtime secrets. It retrieves the installed catalog and
+quotes only after the operator authenticates.
+
+The dashboard deliberately presents one table covering every installed
+instrument. It does not render charts or introduce a separate analytics API.
+Filtering, sorting, freshness, market status, source, fallback, dividend, and
+estimated-yield fields remain grounded in the existing JSON responses.
+
+Authentication and browser state follow these boundaries:
+
+- The operator enters a raw QuickPrice key in the dashboard. The key is held in
+  `sessionStorage`, sent as `X-API-Key`, and scoped to the current browser tab
+  session. It is not embedded in static assets, persisted in `localStorage`, or
+  placed in a URL, query string, fragment, cookie, or server-rendered document.
+- Closing the tab clears the session key according to normal browser
+  `sessionStorage` behavior. Shared or untrusted browser profiles remain
+  inappropriate places to enter credentials.
+- The light/dark theme preference is non-sensitive and persists independently
+  across visits. Theme persistence never includes the API key.
+- The Live log tab opens an authenticated Server-Sent Events stream from
+  `/internal/logs/stream`. It uses the same key header and reconnects from the
+  last event identifier when possible; credentials never become URL state.
+
+For a local UI preview with deterministic data, run the test fixture on
+loopback:
+
+```bash
+uv run --frozen uvicorn tests.load_fixture_app:app \
+  --host 127.0.0.1 --port 8080
+```
+
+Open `http://127.0.0.1:8080/dashboard` and use
+`test-key-with-enough-entropy`. This is a development fixture with seeded data
+and disabled rate limiting, not a production configuration; do not bind it to
+a public or shared interface.
+
 ## Provider model
 
 Adapters implement uniform quote, history, dividend, yield, and accrual-index
@@ -218,10 +259,9 @@ reconnect backoff.
 
 The default route families are:
 
-- BTC and ETH: Binance, Kraken, then CoinGecko for quotes; Binance then Kraken
-  for history.
-- SOL: Binance, Kraken, then CoinGecko for quotes; Binance then Kraken for
-  history.
+- BTC, ETH, SOL, and BNB: Binance, Kraken, then CoinGecko for quotes; Binance
+  then Kraken for history.
+- POL and TRX: Binance then CoinGecko for quotes; Binance only for history.
 - XMR: Kraken then CoinGecko for quotes; Kraken for history.
 - WBETH: Binance synthetic routes, then CoinGecko normalization for quotes;
   Binance synthetic routes for history.
@@ -239,9 +279,13 @@ Synthetic responses expose every component timestamp. Components that exceed
 their configured age or skew limits are rejected. Free IEX is a single venue,
 so responses preserve `feed=iex` and `coverage=single_venue`.
 
-With the default 9,000-credit monthly CoinGecko budget, stETH and wstETH share
-one batched upstream refresh on a 660-second cadence. Their source timestamps
-and staleness remain explicit; a paid or plugin-provided feed can replace this
+With the default 9,000-credit monthly CoinGecko budget and healthy primary spot
+providers, stETH and wstETH drive one all-symbol quote batch on a 660-second
+cadence. Ordinary spot fallback demand reuses that cache; its refresh floor and
+the durable monthly budget prevent an unbounded request fan-out. CoinGecko
+ordinary spot routes are aggregated, USD-to-USDC-normalized quote fallbacks
+only and are never used as ordinary spot history. Source timestamps and
+staleness remain explicit, and a paid or plugin-provided feed can replace this
 route when a tighter service level is required.
 
 ## Configuration and credentials
@@ -364,6 +408,9 @@ The selected HTTP server must:
 - avoid shared caching of authenticated responses;
 - redact `X-API-Key` and credential-like query parameters from access logs;
 - apply appropriate request-header, body, upstream, and idle timeouts;
+- stream `/internal/logs/stream` without response buffering, transformation,
+  shared caching, or an upstream read/idle timeout that terminates the SSE
+  connection, and preserve `Last-Event-ID` on reconnect;
 - expose `/health/live` and `/health/ready` while leaving `/internal/*`
   protected by QuickPrice authentication.
 
