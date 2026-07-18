@@ -278,10 +278,10 @@ def test_instruments_documents_classification_and_methods(client, auth_headers):
     assert items["QQQM:USD"]["change_windows"]["1y"] == "rolling_365_days"
 
 
-def test_batch_quotes_requires_symbols_and_limits_unique_items(client, auth_headers):
-    missing = client.get("/v1/quotes", headers=auth_headers)
-    assert missing.status_code == 422
-    assert missing.json()["errors"][0]["code"] == "invalid_request"
+def test_batch_quotes_defaults_to_all_and_limits_explicit_unique_items(client, auth_headers):
+    all_quotes = client.get("/v1/quotes", headers=auth_headers)
+    assert all_quotes.status_code == 200
+    assert len(all_quotes.json()["data"]) == len(client.app.state.registry.symbols)
 
     empty = client.get("/v1/quotes?symbols=", headers=auth_headers)
     assert empty.status_code == 422

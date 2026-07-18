@@ -385,21 +385,24 @@ def create_app(
     async def quotes(
         request: Request,
         symbols: Annotated[
-            str,
+            str | None,
             Query(min_length=1, description="Comma-separated instrument symbols, maximum 100"),
-        ],
+        ] = None,
     ) -> JSONResponse:
-        requested: list[str] = []
-        for raw in symbols.split(","):
-            normalized = normalize_symbol(raw)
-            instrument = registry.resolve(normalized)
-            symbol = instrument.symbol if instrument is not None else normalized
-            if symbol and symbol not in requested:
-                requested.append(symbol)
-        if not requested:
-            raise APIError(422, "invalid_request", "symbols cannot be empty")
-        if len(requested) > 100:
-            raise APIError(422, "invalid_request", "symbols cannot contain more than 100 items")
+        if symbols is None:
+            requested = list(registry.symbols)
+        else:
+            requested = []
+            for raw in symbols.split(","):
+                normalized = normalize_symbol(raw)
+                instrument = registry.resolve(normalized)
+                symbol = instrument.symbol if instrument is not None else normalized
+                if symbol and symbol not in requested:
+                    requested.append(symbol)
+            if not requested:
+                raise APIError(422, "invalid_request", "symbols cannot be empty")
+            if len(requested) > 100:
+                raise APIError(422, "invalid_request", "symbols cannot contain more than 100 items")
         data: list[dict[str, Any]] = []
         errors: list[ErrorModel] = []
         valid_requested = 0
