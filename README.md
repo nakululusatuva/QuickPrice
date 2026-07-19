@@ -15,7 +15,7 @@ provenance.
 
 [![QuickPrice dashboard displaying instruments, prices, rolling changes, income, market status, and provider sources](docs/assets/quickprice-dashboard.png)](docs/assets/quickprice-dashboard.png)
 
-<p align="center"><em>QuickPrice operator dashboard — sortable live quotes with explicit income, freshness, and source metadata.</em></p>
+<p align="center"><em>QuickPrice operator dashboard - sortable live quotes with explicit income, freshness, and source metadata.</em></p>
 
 ## Runtime profile
 
