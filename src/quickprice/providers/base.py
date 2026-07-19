@@ -47,6 +47,10 @@ class ProviderUnavailable(ProviderError):
     """Network, timeout, or server-side failure."""
 
 
+class NetworkUnavailable(ProviderUnavailable):
+    """A connection, DNS, TLS, proxy, or timeout failure safe for fast retry."""
+
+
 class ProviderRateLimited(ProviderError):
     """The upstream or QuickPrice's local quota gate rejected the request."""
 
@@ -251,13 +255,13 @@ class HttpProvider:
             raise
         except TimeoutError as exc:
             self._observe_http("timeout", started)
-            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+            raise NetworkUnavailable(self.name, type(exc).__name__) from None
         except aiohttp.ClientError as exc:
             # aiohttp exceptions may embed the request URL, including vendor
             # keys passed as query parameters. Suppress that cause so even an
             # accidental traceback log cannot disclose credentials.
             self._observe_http("unavailable", started)
-            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+            raise NetworkUnavailable(self.name, type(exc).__name__) from None
         self._observe_http("success", started)
         return payload
 

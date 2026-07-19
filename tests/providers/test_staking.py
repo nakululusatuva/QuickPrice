@@ -13,6 +13,7 @@ import pytest
 from quickprice.domain import (
     AccrualIndexPoint,
     PricePoint,
+    ProviderQuote,
     RewardAccrualMode,
     YieldMetric,
     YieldRateType,
@@ -21,6 +22,7 @@ from quickprice.provider_factory import (
     create_builtin_binance_yield_provider,
     create_builtin_ethereum_yield_provider,
     create_builtin_lido_provider,
+    create_builtin_staking_backing_quote_provider,
 )
 from quickprice.providers.base import (
     Capability,
@@ -39,6 +41,88 @@ from quickprice.staking import ONCHAIN_EXCHANGE_RATE_FRESHNESS_SECONDS
 def _uint256(value: Decimal) -> str:
     integer = int(value * Decimal(10**18))
     return f"0x{integer:064x}"
+
+
+def _underlying_quote(now: datetime, price: str = "2000") -> ProviderQuote:
+    return ProviderQuote(
+        symbol="ETH:USDC",
+        price=Decimal(price),
+        as_of=now,
+        provider="binance",
+        feed="binance_spot",
+    )
+
+
+@pytest.mark.asyncio
+async def test_constant_staking_backing_quote_is_explicitly_derived() -> None:
+    now = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
+    resolver = AsyncMock(return_value=_underlying_quote(now))
+    provider = create_builtin_staking_backing_quote_provider(
+        resolver,
+        clock=lambda: now,
+    )
+
+    result = await provider.get_quote("STETH:USDC")
+
+    assert result.price == Decimal("2000")
+    assert result.provider == "staking_backing_proxy"
+    assert result.price_basis == "protocol_backing_proxy"
+    assert result.coverage == "protocol_backing_proxy"
+    assert result.is_derived is True
+    assert [item.role for item in result.components] == [
+        "underlying_market_price",
+        "protocol_backing_ratio",
+    ]
+    assert result.components[-1].price == 1
+    resolver.assert_awaited_once_with("ETH:USDC")
+
+
+@pytest.mark.asyncio
+async def test_wrapped_steth_backing_quote_uses_current_onchain_ratio() -> None:
+    now = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
+    resolver = AsyncMock(return_value=_underlying_quote(now, "1900"))
+    provider = create_builtin_staking_backing_quote_provider(
+        resolver,
+        rpc_urls=("https://ethereum.invalid",),
+        clock=lambda: now,
+    )
+    ratio = Decimal("1.239877631060800508")
+
+    async def rpc(_endpoint, method, params):
+        if method == "eth_chainId":
+            return "0x1"
+        if method == "eth_blockNumber":
+            return "0x64"
+        if method == "eth_call":
+            assert params[0]["to"] == "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
+            assert params[0]["data"] == "0x035faf82"
+            assert params[1] == "0x64"
+            return _uint256(ratio)
+        if method == "eth_getBlockByNumber":
+            return {"number": params[0], "timestamp": hex(int(now.timestamp()))}
+        raise AssertionError(method)
+
+    provider._rpc = AsyncMock(side_effect=rpc)
+
+    result = await provider.get_quote("WSTETH:USDC")
+
+    assert result.price == Decimal("1900") * ratio
+    assert result.as_of == now
+    assert result.components[-1].symbol == "WSTETH:STETH"
+    assert result.components[-1].price == ratio
+    assert result.components[-1].feed == "ethereum_contract_call"
+
+
+@pytest.mark.asyncio
+async def test_wrapped_steth_backing_requires_configured_ethereum_rpc() -> None:
+    now = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
+    provider = create_builtin_staking_backing_quote_provider(
+        AsyncMock(return_value=_underlying_quote(now)),
+        clock=lambda: now,
+    )
+
+    with pytest.raises(ProviderUnavailable, match="JSON-RPC is not configured"):
+        await provider.get_quote("WSTETH:USDC")
 
 
 @pytest.mark.asyncio

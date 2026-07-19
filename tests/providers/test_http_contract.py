@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import aiohttp
 import pytest
 
 from quickprice.providers.base import (
     HttpProvider,
     MalformedResponse,
+    NetworkUnavailable,
     ProviderError,
     ProviderRateLimited,
     ProviderUnavailable,
@@ -67,9 +69,13 @@ async def test_malformed_json_is_normalized():
 
 
 @pytest.mark.asyncio
-async def test_disconnect_and_timeout_are_retryable():
-    provider = HttpProvider(session=FakeSession(error=TimeoutError()))
-    with pytest.raises(ProviderUnavailable) as caught:
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), aiohttp.ClientConnectionError("proxy TLS failure")],
+)
+async def test_disconnect_and_timeout_are_classified_for_fast_retry(error):
+    provider = HttpProvider(session=FakeSession(error=error))
+    with pytest.raises(NetworkUnavailable) as caught:
         await provider._request_json("GET", "https://example.invalid")
     assert caught.value.retryable is True
     assert caught.value.__cause__ is None

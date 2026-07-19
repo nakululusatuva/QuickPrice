@@ -26,6 +26,7 @@ from quickprice.providers.staking import (
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
     LidoAprProvider,
+    StakingBackingQuoteProvider,
     StakingMarketRatioYieldProvider,
 )
 from quickprice.providers.twelve_data import TwelveDataProvider
@@ -123,11 +124,13 @@ async def test_beth_uses_same_venue_okx_synthetics_and_only_official_yield() -> 
         history_chain = graph.router.providers_for("BETH:USDC", Capability.HISTORY)
         yield_chain = graph.router.providers_for("BETH:USDC", Capability.YIELD)
 
-        assert len(quote_chain) == len(history_chain) == 2
+        assert len(quote_chain) == 3
+        assert len(history_chain) == 2
         assert quote_chain[0]._recipes["BETH:USDC"].left_symbol == "OKX_BETH:ETH"
         assert quote_chain[0]._recipes["BETH:USDC"].right_symbol == "OKX_ETH:USDC"
         assert quote_chain[1]._recipes["BETH:USDC"].left_symbol == "OKX_BETH:USDT"
         assert quote_chain[1]._recipes["BETH:USDC"].right_symbol == "OKX_USDC:USDT"
+        assert isinstance(quote_chain[-1], StakingBackingQuoteProvider)
         assert tuple(type(provider) for provider in yield_chain) == (OkxBethYieldProvider,)
         assert "staking_market_ratio_proxy" not in tuple(provider.name for provider in yield_chain)
 
@@ -157,9 +160,11 @@ async def test_beth_adds_coingecko_only_after_both_okx_price_routes() -> None:
         quote_chain = graph.router.providers_for("BETH:USDC", Capability.QUOTE)
         history_chain = graph.router.providers_for("BETH:USDC", Capability.HISTORY)
 
-        assert len(quote_chain) == len(history_chain) == 3
-        assert isinstance(quote_chain[-1], CoinGeckoProvider)
-        assert history_chain[-1] is quote_chain[-1]
+        assert len(quote_chain) == 4
+        assert len(history_chain) == 3
+        assert isinstance(quote_chain[-2], CoinGeckoProvider)
+        assert isinstance(quote_chain[-1], StakingBackingQuoteProvider)
+        assert history_chain[-1] is quote_chain[-2]
     finally:
         await graph.close()
 
@@ -240,8 +245,10 @@ async def test_lido_tokens_use_coingecko_prices_and_official_apr_before_ratio_fa
             history_chain = graph.router.providers_for(symbol, Capability.HISTORY)
             yield_chain = graph.router.providers_for(symbol, Capability.YIELD)
 
-            assert len(quote_chain) == len(history_chain) == 1
+            assert len(quote_chain) == 2
+            assert len(history_chain) == 1
             assert isinstance(quote_chain[0], CoinGeckoProvider)
+            assert isinstance(quote_chain[1], StakingBackingQuoteProvider)
             assert history_chain[0] is quote_chain[0]
             expected = (
                 (LidoAprProvider,)

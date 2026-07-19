@@ -565,6 +565,41 @@ _BUILTIN_MUTABLE_FIELDS: Final[frozenset[str]] = frozenset(
     }
 )
 
+_BUILTIN_ROUTE_DEFAULT_MIGRATIONS: Final[dict[tuple[str, str], frozenset[tuple[str, ...]]]] = {
+    ("BETH:USDC", "quote"): frozenset(
+        {
+            (
+                "synthetic_beth_primary",
+                "synthetic_beth_alternate",
+                "coingecko",
+            )
+        }
+    ),
+    ("STETH:USDC", "quote"): frozenset({("coingecko",)}),
+    ("WSTETH:USDC", "quote"): frozenset({("coingecko",)}),
+}
+
+
+def _reconciled_builtin_routes(
+    symbol: str,
+    persisted_routes: list[dict[str, Any]],
+    baseline_routes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Adopt shipped route extensions only from an exact prior default."""
+
+    baseline_by_capability = {str(route["capability"]): route for route in baseline_routes}
+    result: list[dict[str, Any]] = []
+    for route in persisted_routes:
+        capability = str(route["capability"])
+        providers = tuple(str(provider) for provider in route["providers"])
+        previous_defaults = _BUILTIN_ROUTE_DEFAULT_MIGRATIONS.get((symbol, capability), frozenset())
+        result.append(
+            baseline_by_capability[capability]
+            if providers in previous_defaults and capability in baseline_by_capability
+            else route
+        )
+    return result
+
 
 def _serialize_catalog_document(document: ManagedCatalogDocument) -> bytes:
     content = (
@@ -771,7 +806,11 @@ def _reconcile_generation(
         # An empty v2 route list predates the declarative built-in route compiler.
         # A valid advanced override always retains at least one required route.
         if persisted_payload["routes"]:
-            baseline_payload["routes"] = persisted_payload["routes"]
+            baseline_payload["routes"] = _reconciled_builtin_routes(
+                item.symbol,
+                persisted_payload["routes"],
+                baseline_payload["routes"],
+            )
         baseline_payload["archived"] = False
         reconciled.append(definition_from_payload(baseline_payload))
     reconciled.extend(item for item in baseline.instruments if item.id not in seen_builtin_ids)

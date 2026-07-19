@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from quickprice.domain import (
     AccrualIndexPoint,
     PricePoint,
+    ProviderQuote,
     RewardAccrualMode,
     SourceComponent,
     YieldMetric,
@@ -96,6 +97,252 @@ def _hex_integer(value: Any, provider: str, context: str) -> int:
     if result < 0:
         raise MalformedResponse(provider, f"{context} cannot be negative")
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class StakingBackingQuoteSpec:
+    """Controlled protocol-backing rule used only as a final quote fallback."""
+
+    symbol: str
+    ratio_symbol: str
+    underlying_pair: str
+    underlying_asset: str
+    ratio_kind: str
+    constant_ratio: Decimal = Decimal(1)
+    contract_address: str | None = None
+    chain_id: int | None = None
+    call_data: str | None = None
+    scale: Decimal = Decimal(10**18)
+
+    def __post_init__(self) -> None:
+        if self.ratio_kind not in {"constant", "ethereum_call"}:
+            raise ValueError("staking backing ratio kind is invalid")
+        if ":" not in self.symbol or ":" not in self.ratio_symbol:
+            raise ValueError("staking backing symbols must use BASE:QUOTE form")
+        if self.underlying_pair.split(":", 1)[0] != self.underlying_asset:
+            raise ValueError("staking backing underlying pair is inconsistent")
+        object.__setattr__(self, "constant_ratio", decimal_value(self.constant_ratio))
+        object.__setattr__(self, "scale", decimal_value(self.scale))
+        if self.constant_ratio <= 0 or self.scale <= 0:
+            raise ValueError("staking backing ratios must be positive")
+        if self.ratio_kind == "ethereum_call":
+            if self.chain_id is None or self.chain_id <= 0:
+                raise ValueError("Ethereum staking backing requires a chain id")
+            if not _is_hex(self.contract_address, bytes_length=20):
+                raise ValueError("Ethereum staking backing requires a contract address")
+            if not _is_hex(self.call_data, bytes_length=4):
+                raise ValueError("Ethereum staking backing requires call data")
+
+
+class StakingBackingQuoteProvider(HttpProvider):
+    """Price a staking receipt from its protocol backing when markets are unavailable."""
+
+    name = "staking_backing_proxy"
+
+    def __init__(
+        self,
+        underlying_resolver: Callable[[str], Awaitable[ProviderQuote]],
+        *,
+        specs: Sequence[StakingBackingQuoteSpec] = (),
+        rpc_urls: str | Sequence[str] = (),
+        maximum_underlying_age: timedelta = timedelta(seconds=30),
+        maximum_ratio_age: timedelta = timedelta(minutes=2),
+        maximum_component_skew: timedelta = timedelta(minutes=2),
+        endpoint_race_width: int = 2,
+        routing_timeout_seconds: float | None = None,
+        clock: Callable[[], datetime] = utc_now,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.underlying_resolver = underlying_resolver
+        self.specs = {spec.symbol.strip().upper(): spec for spec in specs}
+        if len(self.specs) != len(specs):
+            raise ValueError("duplicate staking backing quote symbol")
+        urls = (rpc_urls,) if isinstance(rpc_urls, str) else tuple(rpc_urls)
+        self.rpc_urls = tuple(url.strip() for url in urls if url.strip())
+        if maximum_underlying_age <= timedelta(0) or maximum_ratio_age <= timedelta(0):
+            raise ValueError("staking backing component ages must be positive")
+        if maximum_component_skew < timedelta(0):
+            raise ValueError("staking backing component skew cannot be negative")
+        if endpoint_race_width <= 0:
+            raise ValueError("Ethereum endpoint race width must be positive")
+        self.maximum_underlying_age = maximum_underlying_age
+        self.maximum_ratio_age = maximum_ratio_age
+        self.maximum_component_skew = maximum_component_skew
+        self.endpoint_race_width = min(endpoint_race_width, len(self.rpc_urls))
+        self.routing_timeout_seconds = float(
+            routing_timeout_seconds
+            if routing_timeout_seconds is not None
+            else max(15.0, self.request_timeout * 3)
+        )
+        if not math.isfinite(self.routing_timeout_seconds) or self.routing_timeout_seconds <= 0:
+            raise ValueError("staking backing routing timeout must be finite and positive")
+        self._clock = clock
+        self._verified_endpoints: set[tuple[str, int]] = set()
+        self._endpoint_offset = 0
+
+    async def get_quote(self, symbol: str) -> ProviderQuote:
+        normalized = symbol.strip().upper()
+        try:
+            spec = self.specs[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(
+                self.name, f"unsupported quote symbol {normalized}"
+            ) from exc
+
+        underlying_task = asyncio.create_task(self.underlying_resolver(spec.underlying_pair))
+        ratio_task = (
+            None
+            if spec.ratio_kind == "constant"
+            else asyncio.create_task(self._ethereum_ratio(spec))
+        )
+        try:
+            underlying = await underlying_task
+            if ratio_task is None:
+                ratio = spec.constant_ratio
+                ratio_as_of = underlying.as_of
+                ratio_feed = "protocol_unit_backing"
+            else:
+                ratio, ratio_as_of = await ratio_task
+                ratio_feed = "ethereum_contract_call"
+        finally:
+            if ratio_task is not None and not ratio_task.done():
+                ratio_task.cancel()
+                await asyncio.gather(ratio_task, return_exceptions=True)
+
+        now = ensure_utc(self._clock())
+        underlying_as_of = ensure_utc(underlying.as_of)
+        ratio_as_of = ensure_utc(ratio_as_of)
+        if underlying_as_of > now + timedelta(seconds=5) or ratio_as_of > now + timedelta(
+            seconds=5
+        ):
+            raise ProviderUnavailable(self.name, "staking backing component is in the future")
+        if now - underlying_as_of > self.maximum_underlying_age:
+            raise ProviderUnavailable(self.name, "underlying market quote is stale")
+        if now - ratio_as_of > self.maximum_ratio_age:
+            raise ProviderUnavailable(self.name, "protocol backing ratio is stale")
+        if abs(underlying_as_of - ratio_as_of) > self.maximum_component_skew:
+            raise ProviderUnavailable(self.name, "staking backing component timestamps diverge")
+
+        components = [
+            SourceComponent(
+                symbol=underlying.symbol,
+                provider=underlying.provider,
+                price=underlying.price,
+                as_of=underlying.as_of,
+                feed=underlying.feed,
+                role="underlying_market_price",
+            ),
+            *(
+                SourceComponent(
+                    symbol=item.symbol,
+                    provider=item.provider,
+                    price=item.price,
+                    as_of=item.as_of,
+                    feed=item.feed,
+                    role=f"underlying_{item.role or 'component'}",
+                )
+                for item in underlying.components
+            ),
+            SourceComponent(
+                symbol=spec.ratio_symbol,
+                provider=self.name,
+                price=ratio,
+                as_of=ratio_as_of,
+                feed=ratio_feed,
+                role="protocol_backing_ratio",
+            ),
+        ]
+        return ProviderQuote(
+            symbol=normalized,
+            price=underlying.price * ratio,
+            as_of=min(underlying_as_of, ratio_as_of),
+            provider=self.name,
+            feed=f"{underlying.feed}+{ratio_feed}",
+            price_basis="protocol_backing_proxy",
+            market_status=underlying.market_status,
+            is_derived=True,
+            components=tuple(components),
+            fallback_level=underlying.fallback_level,
+            license_scope=underlying.license_scope,
+            coverage="protocol_backing_proxy",
+        )
+
+    async def _ethereum_ratio(self, spec: StakingBackingQuoteSpec) -> tuple[Decimal, datetime]:
+        if not self.rpc_urls or spec.chain_id is None:
+            raise ProviderUnavailable(self.name, "Ethereum JSON-RPC is not configured")
+        start = self._endpoint_offset
+        width = min(self.endpoint_race_width, len(self.rpc_urls))
+        endpoints = tuple(
+            self.rpc_urls[(start + offset) % len(self.rpc_urls)] for offset in range(width)
+        )
+        self._endpoint_offset = (start + width) % len(self.rpc_urls)
+        tasks = tuple(
+            asyncio.create_task(self._ethereum_ratio_on_endpoint(endpoint, spec))
+            for endpoint in endpoints
+        )
+        try:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    return await task
+                except ProviderError:
+                    continue
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise ProviderUnavailable(self.name, "all configured Ethereum JSON-RPC endpoints failed")
+
+    async def _ethereum_ratio_on_endpoint(
+        self,
+        endpoint: str,
+        spec: StakingBackingQuoteSpec,
+    ) -> tuple[Decimal, datetime]:
+        assert spec.chain_id is not None
+        assert spec.contract_address is not None
+        assert spec.call_data is not None
+        key = (endpoint, spec.chain_id)
+        if key not in self._verified_endpoints:
+            actual_chain = _hex_integer(
+                await self._rpc(endpoint, "eth_chainId", ()),
+                self.name,
+                "chain id",
+            )
+            if actual_chain != spec.chain_id:
+                raise ProviderUnavailable(self.name, "JSON-RPC endpoint returned the wrong chain")
+            self._verified_endpoints.add(key)
+        block_number = await self._rpc(endpoint, "eth_blockNumber", ())
+        block_number_value = _hex_integer(block_number, self.name, "latest block number")
+        raw_rate, raw_block = await asyncio.gather(
+            self._rpc(
+                endpoint,
+                "eth_call",
+                (
+                    {"to": spec.contract_address, "data": spec.call_data},
+                    hex(block_number_value),
+                ),
+            ),
+            self._rpc(endpoint, "eth_getBlockByNumber", (hex(block_number_value), False)),
+        )
+        ratio = Decimal(_hex_integer(raw_rate, self.name, "protocol backing ratio")) / spec.scale
+        if ratio <= 0:
+            raise MalformedResponse(self.name, "protocol backing ratio must be positive")
+        block = require_mapping(raw_block, self.name, "latest block")
+        return ratio, _block_timestamp(block, self.name)
+
+    async def _rpc(self, endpoint: str, method: str, params: Sequence[Any]) -> Any:
+        payload = await self._request_json(
+            "POST",
+            endpoint,
+            json_body={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
+        )
+        document = require_mapping(payload, self.name, "JSON-RPC response")
+        if document.get("error") is not None:
+            raise ProviderUnavailable(self.name, "JSON-RPC returned an error")
+        if "result" not in document or document["result"] is None:
+            raise MalformedResponse(self.name, "JSON-RPC response has no result")
+        return document["result"]
 
 
 class EthereumExchangeRateYieldProvider(HttpProvider):

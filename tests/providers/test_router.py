@@ -7,7 +7,12 @@ from decimal import Decimal
 import pytest
 
 from quickprice.domain import DividendEvent, PricePoint, ProviderQuote, YieldMetric
-from quickprice.providers.base import AllProvidersFailed, Capability, ProviderUnavailable
+from quickprice.providers.base import (
+    AllProvidersFailed,
+    Capability,
+    NetworkUnavailable,
+    ProviderUnavailable,
+)
 from quickprice.providers.router import ProviderRouter
 
 
@@ -437,6 +442,28 @@ async def test_failed_half_open_probe_doubles_backoff():
     with pytest.raises(AllProvidersFailed):
         await router.get_quote("BTC:USDC")
     assert router.circuit_snapshots()[0].retry_in_seconds == 120
+
+
+@pytest.mark.asyncio
+async def test_network_half_open_probes_never_exponentially_back_off():
+    clock = [10.0]
+    failure = NetworkUnavailable("primary", "TLS tunnel failed")
+    primary = ScriptedProvider("primary", [failure])
+    router = ProviderRouter(
+        {("BTC:USDC", Capability.QUOTE): [primary]},
+        failure_threshold=1,
+        half_open_after_seconds=60,
+        network_retry_seconds=15,
+        clock=lambda: clock[0],
+    )
+
+    for expected_calls in range(1, 5):
+        with pytest.raises(AllProvidersFailed):
+            await router.get_quote("BTC:USDC")
+        snapshot = router.circuit_snapshots()[0]
+        assert snapshot.retry_in_seconds == 15
+        assert snapshot.open_count == expected_calls
+        clock[0] += 15
 
 
 @pytest.mark.asyncio

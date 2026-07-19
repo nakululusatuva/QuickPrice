@@ -67,6 +67,20 @@ class BuiltinStakingRatioPolicy:
     accrual_mode: RewardAccrualMode
 
 
+@dataclass(frozen=True, slots=True)
+class BuiltinStakingBackingQuotePolicy:
+    symbol: str
+    ratio_symbol: str
+    underlying_pair: str
+    underlying_asset: str
+    ratio_kind: str
+    constant_ratio: str = "1"
+    contract_address: str | None = None
+    chain_id: int | None = None
+    call_data: str | None = None
+    scale: str = str(10**18)
+
+
 BUILTIN_BINANCE_SYMBOLS = _deep_freeze(
     {
         "BTC:USDC": "BTCUSDC",
@@ -244,6 +258,32 @@ BUILTIN_ETHEREUM_EXCHANGE_RATE_POLICIES = (
         event_topic="0x0b4e9390054347e2a16d95fd8376311b0d2deedecba526e9742bcaa40b059f0b",
     ),
 )
+BUILTIN_STAKING_BACKING_QUOTE_POLICIES = (
+    BuiltinStakingBackingQuotePolicy(
+        symbol="BETH:USDC",
+        ratio_symbol="BETH:ETH",
+        underlying_pair="ETH:USDC",
+        underlying_asset="ETH",
+        ratio_kind="constant",
+    ),
+    BuiltinStakingBackingQuotePolicy(
+        symbol="STETH:USDC",
+        ratio_symbol="STETH:ETH",
+        underlying_pair="ETH:USDC",
+        underlying_asset="ETH",
+        ratio_kind="constant",
+    ),
+    BuiltinStakingBackingQuotePolicy(
+        symbol="WSTETH:USDC",
+        ratio_symbol="WSTETH:STETH",
+        underlying_pair="ETH:USDC",
+        underlying_asset="ETH",
+        ratio_kind="ethereum_call",
+        contract_address="0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+        chain_id=1,
+        call_data="0x035faf82",
+    ),
+)
 BUILTIN_BINANCE_STAKING_RATE_POLICIES = _deep_freeze(
     {
         "WBETH:USDC": {
@@ -348,6 +388,7 @@ BUILTIN_PROVIDER_ROUTES = _deep_freeze(
                 "synthetic_beth_primary",
                 "synthetic_beth_alternate",
                 "coingecko",
+                "staking_backing_proxy",
             ),
             "history": (
                 "synthetic_beth_history_primary",
@@ -357,12 +398,12 @@ BUILTIN_PROVIDER_ROUTES = _deep_freeze(
             "yield": ("okx_beth_yield",),
         },
         "STETH:USDC": {
-            "quote": ("coingecko",),
+            "quote": ("coingecko", "staking_backing_proxy"),
             "history": ("coingecko",),
             "yield": ("lido",),
         },
         "WSTETH:USDC": {
-            "quote": ("coingecko",),
+            "quote": ("coingecko", "staking_backing_proxy"),
             "history": ("coingecko",),
             "yield": ("lido", "staking_market_ratio_proxy"),
         },
@@ -439,6 +480,7 @@ __all__ = [
     "BUILTIN_OKX_MARKETS",
     "BUILTIN_OKX_YIELD_SYMBOLS",
     "BUILTIN_PROVIDER_ROUTES",
+    "BUILTIN_STAKING_BACKING_QUOTE_POLICIES",
     "BUILTIN_STAKING_RATIO_POLICIES",
     "BUILTIN_SYNTHETIC_RECIPES",
     "BUILTIN_TWELVE_FX_CACHE_FLOOR_SECONDS",

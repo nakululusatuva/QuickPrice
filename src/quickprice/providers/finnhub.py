@@ -212,4 +212,6 @@ class FinnhubProvider(HttpProvider):
         except (TimeoutError, aiohttp.ClientError) as exc:
             # aiohttp errors may embed a WebSocket URL. Suppress their cause so
             # the authentication token cannot leak into an exception traceback.
-            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+            from .base import NetworkUnavailable
+
+            raise NetworkUnavailable(self.name, type(exc).__name__) from None

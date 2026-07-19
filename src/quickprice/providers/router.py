@@ -18,6 +18,7 @@ from ._models import replace_metadata
 from .base import (
     AllProvidersFailed,
     Capability,
+    NetworkUnavailable,
     ProviderBusy,
     ProviderError,
     ProviderRateLimited,
@@ -71,6 +72,7 @@ class ProviderRouter:
         failure_threshold: int = 3,
         half_open_after_seconds: float = 60.0,
         max_backoff_seconds: float = 900.0,
+        network_retry_seconds: float = 30.0,
         clock: Any = time.monotonic,
         latency_clock: Any = time.perf_counter,
         metrics: Metrics | None = None,
@@ -79,10 +81,13 @@ class ProviderRouter:
             raise ValueError("timeout_seconds must be positive")
         if failure_threshold <= 0:
             raise ValueError("failure_threshold must be positive")
+        if network_retry_seconds <= 0:
+            raise ValueError("network retry interval must be positive")
         self.timeout_seconds = timeout_seconds
         self.failure_threshold = failure_threshold
         self.half_open_after_seconds = half_open_after_seconds
         self.max_backoff_seconds = max_backoff_seconds
+        self.network_retry_seconds = network_retry_seconds
         self._clock = clock
         self._latency_clock = latency_clock
         self._metrics = metrics
@@ -289,13 +294,14 @@ class ProviderRouter:
                 )
             except TimeoutError:
                 self._observe_operation(name, capability, "timeout", started)
-                error: ProviderError = ProviderUnavailable(name, "timeout")
+                error: ProviderError = NetworkUnavailable(name, "timeout")
                 self._record_failure(
                     circuit,
                     provider=name,
                     symbol=symbol,
                     capability=capability,
                     error_type="TimeoutError",
+                    network_failure=True,
                 )
                 attempts.append((name, error.message))
                 continue
@@ -325,6 +331,7 @@ class ProviderRouter:
                     symbol=symbol,
                     capability=capability,
                     error_type=type(error).__name__,
+                    network_failure=isinstance(error, NetworkUnavailable),
                 )
                 attempts.append((name, error.message))
                 continue
@@ -336,6 +343,7 @@ class ProviderRouter:
                     symbol=symbol,
                     capability=capability,
                     error_type=type(error).__name__,
+                    network_failure=False,
                 )
                 attempts.append((name, type(error).__name__))
                 continue
@@ -494,6 +502,7 @@ class ProviderRouter:
         symbol: str,
         capability: Capability,
         error_type: str,
+        network_failure: bool,
     ) -> None:
         circuit.probing = False
         circuit.consecutive_failures += 1
@@ -501,11 +510,17 @@ class ProviderRouter:
             return
         was_previously_opened = circuit.open_count > 0
         circuit.open_count += 1
-        exponent = max(0, circuit.open_count - 1)
-        delay = min(
-            self.max_backoff_seconds,
-            self.half_open_after_seconds * (2**exponent),
-        )
+        if network_failure:
+            # Transport failures are probed indefinitely at a short fixed
+            # cadence. Explicit upstream and quota errors retain exponential
+            # backoff because rapid retries can make those conditions worse.
+            delay = self.network_retry_seconds
+        else:
+            exponent = max(0, circuit.open_count - 1)
+            delay = min(
+                self.max_backoff_seconds,
+                self.half_open_after_seconds * (2**exponent),
+            )
         circuit.open_until = self._clock() + delay
         state = "reopened" if was_previously_opened else "opened"
         _LOGGER.warning(

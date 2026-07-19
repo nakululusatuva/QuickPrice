@@ -27,6 +27,7 @@ from quickprice.providers.base import (
     Capability,
     HttpProvider,
     MalformedResponse,
+    NetworkUnavailable,
     ProviderRateLimited,
     ProviderUnavailable,
     UnsupportedInstrument,
@@ -508,8 +509,8 @@ async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_fai
     )
     provider._request_json = AsyncMock(
         side_effect=[
-            ProviderUnavailable("coingecko", "first failure"),
-            ProviderUnavailable("coingecko", "second failure"),
+            ProviderUnavailable("coingecko", "first failure", status=503),
+            ProviderUnavailable("coingecko", "second failure", status=503),
             {
                 "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
                 "usd-coin": {"usd": 1, "last_updated_at": timestamp},
@@ -541,22 +542,22 @@ async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_fai
 
 
 @pytest.mark.asyncio
-async def test_coingecko_default_negative_cache_never_delays_quote_retry_past_reserve_cadence():
+async def test_coingecko_network_failures_retry_indefinitely_at_short_fixed_cadence():
     monotonic = [0.0]
     provider = create_builtin_coingecko_provider(
         "key",
         clock=lambda: monotonic[0],
     )
     provider._request_json = AsyncMock(
-        side_effect=ProviderUnavailable("coingecko", "proxy tunnel failure")
+        side_effect=NetworkUnavailable("coingecko", "proxy tunnel failure")
     )
 
     for attempt in range(4):
         with pytest.raises(ProviderUnavailable, match="proxy tunnel failure"):
             await provider.get_quote("WSTETH:USDC")
-        assert provider.quote_failure_retry_after_seconds() == 600
+        assert provider.quote_failure_retry_after_seconds() == 300
         assert provider._request_json.await_count == attempt + 1
-        monotonic[0] += 600
+        monotonic[0] += 300
 
 
 @pytest.mark.asyncio

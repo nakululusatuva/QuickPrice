@@ -37,6 +37,7 @@ from .instrument_policy import (
     BUILTIN_OKX_INTERNAL_ALIASES,
     BUILTIN_OKX_MARKETS,
     BUILTIN_OKX_YIELD_SYMBOLS,
+    BUILTIN_STAKING_BACKING_QUOTE_POLICIES,
     BUILTIN_STAKING_RATIO_POLICIES,
     BUILTIN_SYNTHETIC_RECIPES,
     BUILTIN_TWELVE_FX_CACHE_FLOOR_SECONDS,
@@ -222,6 +223,40 @@ def create_builtin_ethereum_yield_provider(rpc_urls: Any, **kwargs: Any) -> Any:
     return EthereumExchangeRateYieldProvider(rpc_urls, **kwargs)
 
 
+def create_builtin_staking_backing_quote_provider(
+    underlying_resolver: Any,
+    *,
+    rpc_urls: Any = (),
+    **kwargs: Any,
+) -> Any:
+    from .providers.staking import StakingBackingQuoteProvider, StakingBackingQuoteSpec
+
+    _default(
+        kwargs,
+        "specs",
+        tuple(
+            StakingBackingQuoteSpec(
+                symbol=policy.symbol,
+                ratio_symbol=policy.ratio_symbol,
+                underlying_pair=policy.underlying_pair,
+                underlying_asset=policy.underlying_asset,
+                ratio_kind=policy.ratio_kind,
+                constant_ratio=Decimal(policy.constant_ratio),
+                contract_address=policy.contract_address,
+                chain_id=policy.chain_id,
+                call_data=policy.call_data,
+                scale=Decimal(policy.scale),
+            )
+            for policy in BUILTIN_STAKING_BACKING_QUOTE_POLICIES
+        ),
+    )
+    return StakingBackingQuoteProvider(
+        underlying_resolver,
+        rpc_urls=rpc_urls,
+        **kwargs,
+    )
+
+
 def create_builtin_lido_provider(**kwargs: Any) -> Any:
     from .providers.staking import LidoAprProvider
 
@@ -294,6 +329,7 @@ __all__ = [
     "create_builtin_lido_provider",
     "create_builtin_okx_market_provider",
     "create_builtin_okx_yield_provider",
+    "create_builtin_staking_backing_quote_provider",
     "create_builtin_staking_ratio_provider",
     "create_builtin_synthetic_recipe",
     "create_builtin_twelve_data_provider",

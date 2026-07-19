@@ -184,6 +184,86 @@ def test_legacy_v2_rebasing_ratio_fallback_is_normalized_before_validation(tmp_p
         )
 
 
+def test_prior_builtin_quote_defaults_adopt_staking_backing_fallback(tmp_path) -> None:
+    path = tmp_path / "instruments.json"
+    InstrumentPolicyStore(path, build_registry())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["staged"] = copy.deepcopy(payload["active"])
+    payload["last_known_good"] = copy.deepcopy(payload["active"])
+    legacy_routes = {
+        "BETH:USDC": [
+            "synthetic_beth_primary",
+            "synthetic_beth_alternate",
+            "coingecko",
+        ],
+        "STETH:USDC": ["coingecko"],
+        "WSTETH:USDC": ["coingecko"],
+    }
+    for generation_name in ("active", "staged", "last_known_good"):
+        generation = payload[generation_name]
+        for instrument in generation["instruments"]:
+            providers = legacy_routes.get(instrument["symbol"])
+            if providers is None:
+                continue
+            quote_route = next(
+                route for route in instrument["routes"] if route["capability"] == "quote"
+            )
+            quote_route["providers"] = providers
+        generation["revision"] = hashlib.sha256(
+            json.dumps(
+                {"instruments": generation["instruments"]},
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = InstrumentPolicyStore(path, build_registry(), defer_migration=True)
+
+    for generation in (
+        store.active_generation(),
+        store.staged_generation(),
+        store.last_known_good_generation(),
+    ):
+        assert generation is not None
+        by_symbol = generation.by_symbol()
+        for symbol in legacy_routes:
+            quote_route = next(
+                route for route in by_symbol[symbol].routes if route.capability == "quote"
+            )
+            assert quote_route.providers[-1] == "staking_backing_proxy"
+
+
+def test_customized_builtin_quote_route_is_not_overwritten_by_migration(tmp_path) -> None:
+    path = tmp_path / "instruments.json"
+    InstrumentPolicyStore(path, build_registry())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    steth = next(
+        item for item in payload["active"]["instruments"] if item["symbol"] == "STETH:USDC"
+    )
+    quote_route = next(route for route in steth["routes"] if route["capability"] == "quote")
+    quote_route["providers"] = ["staking_backing_proxy", "coingecko"]
+    payload["active"]["revision"] = hashlib.sha256(
+        json.dumps(
+            {"instruments": payload["active"]["instruments"]},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = InstrumentPolicyStore(path, build_registry(), defer_migration=True)
+    retained = next(
+        route
+        for route in store.active_generation().by_symbol()["STETH:USDC"].routes
+        if route.capability == "quote"
+    )
+
+    assert retained.providers == ("staking_backing_proxy", "coingecko")
+
+
 def test_builtin_history_defaults_migrate_only_null_catalog_values(tmp_path) -> None:
     path = tmp_path / "instruments.json"
     InstrumentPolicyStore(path, build_registry())

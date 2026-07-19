@@ -16,6 +16,7 @@ from ._ttl import AsyncTtlCache
 from .base import (
     HttpProvider,
     MalformedResponse,
+    NetworkUnavailable,
     ProviderError,
     ProviderUnavailable,
     UnsupportedInstrument,
@@ -26,6 +27,7 @@ from .quota import QuotaBudget, rolling_month_safe_daily_budget
 
 COINGECKO_SHARED_QUOTE_CACHE_SECONDS = 600.0
 COINGECKO_MAXIMUM_QUOTE_ERROR_CACHE_SECONDS = COINGECKO_SHARED_QUOTE_CACHE_SECONDS
+COINGECKO_NETWORK_ERROR_RETRY_SECONDS = 300.0
 COINGECKO_DAILY_QUOTE_RESERVE_CREDITS = math.ceil(86_400 / COINGECKO_SHARED_QUOTE_CACHE_SECONDS) + 1
 
 
@@ -151,6 +153,7 @@ class CoinGeckoProvider(HttpProvider):
         self._price_cache: Mapping[str, object] | None = None
         self._cache_expires_at = 0.0
         self._refresh_error: str | None = None
+        self._refresh_error_is_network = False
         self._consecutive_refresh_failures = 0
         self._daily_snapshot_cache = AsyncTtlCache[tuple[str, str], Decimal](clock=clock)
 
@@ -260,7 +263,10 @@ class CoinGeckoProvider(HttpProvider):
             if self._price_cache is not None:
                 return self._price_cache
             if self._refresh_error is not None:
-                raise ProviderUnavailable(self.name, self._refresh_error)
+                error_type = (
+                    NetworkUnavailable if self._refresh_error_is_network else ProviderUnavailable
+                )
+                raise error_type(self.name, self._refresh_error)
             # A refresh is in flight. Wait for its lock instead of treating
             # every concurrent symbol in the shared batch as a failed poll.
 
@@ -269,7 +275,10 @@ class CoinGeckoProvider(HttpProvider):
             if now < self._cache_expires_at:
                 if self._price_cache is not None:
                     return self._price_cache
-                raise ProviderUnavailable(
+                error_type = (
+                    NetworkUnavailable if self._refresh_error_is_network else ProviderUnavailable
+                )
+                raise error_type(
                     self.name,
                     self._refresh_error or "simple-price refresh is in backoff",
                 )
@@ -279,6 +288,7 @@ class CoinGeckoProvider(HttpProvider):
             self._cache_expires_at = now + self._cache_ttl_seconds
             self._price_cache = None
             self._refresh_error = None
+            self._refresh_error_is_network = False
             ids = list(self.coin_ids.values())
             if self.normalization_coin_id is not None:
                 ids.append(self.normalization_coin_id)
@@ -300,17 +310,26 @@ class CoinGeckoProvider(HttpProvider):
                     document = require_mapping(payload, self.name)
                     merged.update(document)
             except Exception as exc:
-                self._consecutive_refresh_failures += 1
-                exponent = min(self._consecutive_refresh_failures - 1, 10)
-                error_ttl = min(
-                    self._maximum_error_cache_ttl_seconds,
-                    self._cache_ttl_seconds * (2**exponent),
-                )
+                network_failure = isinstance(exc, NetworkUnavailable)
+                if network_failure:
+                    # Connection, TLS, DNS, proxy, and timeout failures are retried
+                    # forever at a bounded cadence. They must not inherit a long
+                    # exponential delay intended for valid upstream responses.
+                    error_ttl = COINGECKO_NETWORK_ERROR_RETRY_SECONDS
+                else:
+                    self._consecutive_refresh_failures += 1
+                    exponent = min(self._consecutive_refresh_failures - 1, 10)
+                    error_ttl = min(
+                        self._maximum_error_cache_ttl_seconds,
+                        self._cache_ttl_seconds * (2**exponent),
+                    )
                 self._cache_expires_at = self._clock() + error_ttl
                 self._refresh_error = str(exc) or type(exc).__name__
+                self._refresh_error_is_network = network_failure
                 raise
             self._price_cache = merged
             self._refresh_error = None
+            self._refresh_error_is_network = False
             self._consecutive_refresh_failures = 0
             return merged
 

@@ -307,9 +307,9 @@ class BinanceProvider(HttpProvider):
                     }:
                         break
         except (TimeoutError, aiohttp.ClientError) as exc:  # type: ignore[name-defined]
-            from .base import ProviderUnavailable
+            from .base import NetworkUnavailable
 
-            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+            raise NetworkUnavailable(self.name, type(exc).__name__) from None
 
     async def stream_quotes(self, symbols: Sequence[str]) -> AsyncIterator[Any]:
         """Merge a bounded number of combined-stream connections."""

@@ -383,6 +383,16 @@ PROVIDER_CATALOG: Mapping[str, ProviderDescriptor] = {
             notes="Annualizes the configured token-to-underlying ratio lookback.",
         ),
         _descriptor(
+            "staking_backing_proxy",
+            "Staking Protocol Backing Proxy",
+            kind=ProviderKind.DERIVED,
+            capabilities=frozenset({Capability.QUOTE}),
+            asset_classes=_CRYPTO,
+            symbol_kind=VendorSymbolKind.NONE,
+            binding_verification=BindingVerificationMode.NOT_APPLICABLE,
+            notes="Final quote fallback derived from underlying market price and controlled protocol backing rules.",
+        ),
+        _descriptor(
             "synthetic",
             "Restricted Synthetic",
             kind=ProviderKind.DERIVED,

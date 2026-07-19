@@ -34,6 +34,7 @@ from quickprice.provider_factory import (
 )
 from quickprice.providers.base import (
     Capability,
+    NetworkUnavailable,
     ProviderBusy,
     ProviderUnavailable,
 )
@@ -1562,7 +1563,7 @@ async def test_coingecko_negative_cache_retries_slow_staking_quote_at_expiry() -
     provider = coordinator.graph.providers["coingecko"]
     provider._clock = lambda: monotonic[0]
     provider._request_json = AsyncMock(
-        side_effect=ProviderUnavailable("coingecko", "temporary outage")
+        side_effect=NetworkUnavailable("coingecko", "temporary outage")
     )
     try:
         next_interval = await coordinator._poll_quote_once("WSTETH:USDC")
@@ -1570,7 +1571,8 @@ async def test_coingecko_negative_cache_retries_slow_staking_quote_at_expiry() -
         await coordinator.graph.close()
 
     assert coordinator.registry["WSTETH:USDC"].quote_poll_seconds == 660
-    assert next_interval == provider._cache_ttl_seconds == 600
+    assert provider._cache_ttl_seconds == 600
+    assert next_interval == 300
     assert provider._request_json.await_count == 1
     assert "simple-price refresh" not in coordinator._last_errors["quote:WSTETH:USDC"]["reason"]
 

@@ -33,6 +33,7 @@ from quickprice.provider_factory import (
     create_builtin_lido_provider,
     create_builtin_okx_market_provider,
     create_builtin_okx_yield_provider,
+    create_builtin_staking_backing_quote_provider,
     create_builtin_staking_ratio_provider,
     create_builtin_synthetic_recipe,
     create_builtin_twelve_data_provider,
@@ -86,6 +87,12 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     providers["staking_market_ratio_proxy"] = create_builtin_staking_ratio_provider(
         router,
         lookback_days=settings.staking_yield_market_fallback_days,
+    )
+    providers["staking_backing_proxy"] = create_builtin_staking_backing_quote_provider(
+        router.get_quote,
+        rpc_urls=settings.ethereum_rpc_urls,
+        request_timeout=settings.provider_timeout_seconds,
+        **_proxy_options(settings, "staking_backing_proxy"),
     )
 
     if settings.binance_api_key and settings.binance_api_secret:
@@ -227,6 +234,7 @@ def build_provider_graph(
         timeout_seconds=settings.provider_timeout_seconds,
         failure_threshold=settings.circuit_failure_threshold,
         half_open_after_seconds=settings.circuit_open_seconds,
+        network_retry_seconds=min(30.0, settings.circuit_open_seconds),
         metrics=metrics,
     )
     context = ProviderInstallContext(

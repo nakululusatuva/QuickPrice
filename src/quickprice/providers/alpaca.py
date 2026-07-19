@@ -415,4 +415,6 @@ class AlpacaProvider(HttpProvider):
                         except KeyError, ValueError:
                             continue
         except (TimeoutError, aiohttp.ClientError) as exc:
-            raise ProviderUnavailable(self.name, type(exc).__name__) from None
+            from .base import NetworkUnavailable
+
+            raise NetworkUnavailable(self.name, type(exc).__name__) from None
