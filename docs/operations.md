@@ -49,6 +49,7 @@ A healthy service has:
 - `py_gil_disabled=true` and `gil_enabled=false`;
 - a writer queue that returns toward zero;
 - bounded database and WAL files;
+- process memory that settles after bounded, streaming history restoration;
 - no sustained event-loop lag;
 - expected provider quotas, circuits, and fallback levels;
 - snapshot age consistent with market status and provider cadence.

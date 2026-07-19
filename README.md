@@ -15,6 +15,9 @@ environment.
 - FastAPI, Pydantic, Uvicorn with h11, aiohttp, and standard-library SQLite.
 - One process, one asyncio event loop, background collectors, and one dedicated
   SQLite writer thread.
+- Essential history columns are restored from SQLite in bounded per-symbol
+  batches. Rolling-change cutoffs are cached per quote minute, so stream updates
+  do not copy or sort complete history rings.
 - API-key authentication, hostile-IP and per-key rate limits, provider quotas,
   single-flight requests, circuit breakers, and explicit stale-data metadata.
 - A revisioned, data-driven instrument catalog with fixed provider descriptors,
@@ -109,8 +112,9 @@ history produces JSON `null`, not a fabricated zero.
 
 SQLite retention defaults are 48 hours for 1-minute points, 45 days for
 5-minute points, and 400 days for daily points. Maintenance applies the same
-windows to memory rings even after a symbol is archived and no longer receives
-observations. A closed market returns the last valid price with
+windows to active memory rings. Archiving an instrument releases its in-memory
+state after activation while SQLite keeps the retained rows available for a
+future reactivation. A closed market returns the last valid price with
 `market_status=closed`. A provider outage may return the last snapshot only when
 `quality.stale=true` discloses its age.
 
@@ -326,8 +330,10 @@ The default route families are:
   Vantage end-of-day data. History remains Alpaca, Twelve Data, then Alpha
   Vantage because [Finnhub's free plan](https://finnhub.io/pricing) does not
   include OHLC history.
-- FX: quota-bounded USD hub quotes and histories, with reciprocal and cross
-  rates derived from common timestamped components.
+- FX: quota-bounded USD hub quotes and histories. Only the five USD-spoke
+  histories are retained in memory; reciprocal and cross-pair cutoff references
+  are derived virtually from common timestamped components with the same skew
+  rules.
 - Dividend-paying common stocks, QQQM, and SGOV income: classified corporate
   actions and the last valid SQLite event.
 - BOXX yield: FRED DGS3MO and the last valid SQLite metric.
