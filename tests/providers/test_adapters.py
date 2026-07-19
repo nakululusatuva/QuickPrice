@@ -1272,6 +1272,36 @@ async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
 
 
 @pytest.mark.asyncio
+async def test_alpha_vantage_serializes_emergency_requests(monkeypatch) -> None:
+    provider = create_builtin_alpha_vantage_provider("key")
+    inflight = 0
+    maximum_inflight = 0
+
+    async def request_json(_self, _method, _url, **_kwargs):
+        nonlocal inflight, maximum_inflight
+        inflight += 1
+        maximum_inflight = max(maximum_inflight, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return {
+            "Realtime Currency Exchange Rate": {
+                "5. Exchange Rate": "1.25",
+                "6. Last Refreshed": "2026-07-21 14:00:00",
+            }
+        }
+
+    monkeypatch.setattr(HttpProvider, "_request_json", request_json)
+
+    await asyncio.gather(
+        provider.get_quote("USD:EUR"),
+        provider.get_quote("USD:GBP"),
+    )
+
+    assert maximum_inflight == 1
+    assert provider.routing_timeout_seconds >= 60
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_factory", "payload"),
     [

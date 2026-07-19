@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time as monotonic_time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, time
@@ -84,6 +85,18 @@ class AlphaVantageProvider(HttpProvider):
         )
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
         self._wall_clock = wall_clock
+        self._request_lock = asyncio.Lock()
+        self.routing_timeout_seconds = max(
+            60.0,
+            (len(self.fx_symbols) + 1) * self.request_timeout,
+        )
+
+    async def _request_json(self, *args, **kwargs):
+        # Alpha's free endpoint is sensitive to concurrent bursts. Keep one
+        # in-flight request per key so the five emergency FX spokes do not
+        # rate-limit one another during startup.
+        async with self._request_lock:
+            return await super()._request_json(*args, **kwargs)
 
     def _document(self, payload: Any) -> Mapping[str, Any]:
         document = require_mapping(payload, self.name)
