@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 
+import quickprice.providers.binance as binance_module
 from quickprice.analytics import calculate_changes
 from quickprice.domain import PricePoint, ProviderQuote
 from quickprice.provider_factory import (
@@ -182,6 +183,176 @@ def test_binance_shards_two_thousand_dynamic_stream_bindings_safely() -> None:
             f"{provider._exchange_symbol(symbol).lower()}@trade" for symbol in batch
         )
         assert len(stream_path) <= BINANCE_STREAM_PATH_MAX_CHARACTERS
+
+
+@pytest.mark.asyncio
+async def test_binance_stream_constructs_only_the_newest_valid_quote_per_window(
+    monkeypatch,
+) -> None:
+    class FakeMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        def __init__(self, symbol: str, price: str, timestamp: int) -> None:
+            self.payload = {
+                "stream": f"{symbol.lower()}@trade",
+                "data": {
+                    "e": "trade",
+                    "s": symbol,
+                    "p": price,
+                    "T": timestamp,
+                },
+            }
+
+        def json(self):
+            return self.payload
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            self.messages = iter(
+                (
+                    FakeMessage("BTCUSDC", "100", 1_784_561_400_100),
+                    FakeMessage("BTCUSDC", "102", 1_784_561_400_300),
+                    FakeMessage("BTCUSDC", "101", 1_784_561_400_200),
+                    FakeMessage("BTCUSDC", "-1", 1_784_561_400_400),
+                    FakeMessage("ETHUSDC", "200", 1_784_561_400_250),
+                    FakeMessage("ETHUSDC", "201", 1_784_561_400_350),
+                )
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    class FakeSession:
+        @staticmethod
+        def ws_connect(*args, **kwargs):
+            del args, kwargs
+            return FakeWebsocket()
+
+    constructed: list[str] = []
+    original_quote = binance_module.quote
+
+    def counting_quote(**values):
+        constructed.append(values["symbol"])
+        return original_quote(**values)
+
+    monkeypatch.setattr(binance_module, "quote", counting_quote)
+    provider = BinanceProvider(
+        symbol_bindings={"BTC:USDC": "BTCUSDC", "ETH:USDC": "ETHUSDC"},
+        session=FakeSession(),
+        stream_emit_interval_seconds=0.001,
+    )
+
+    results = [item async for item in provider.stream_quotes(("BTC:USDC", "ETH:USDC"))]
+
+    assert [(item.symbol, item.price) for item in results] == [
+        ("BTC:USDC", Decimal("102")),
+        ("ETH:USDC", Decimal("201")),
+    ]
+    assert constructed == ["BTC:USDC", "ETH:USDC"]
+
+
+@pytest.mark.asyncio
+async def test_binance_stream_emits_a_new_quote_in_the_next_window() -> None:
+    class FakeMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        def __init__(self, price: str, timestamp: int) -> None:
+            self.price = price
+            self.timestamp = timestamp
+
+        def json(self):
+            return {
+                "data": {
+                    "e": "trade",
+                    "s": "BTCUSDC",
+                    "p": self.price,
+                    "T": self.timestamp,
+                }
+            }
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            self.index = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.index += 1
+            if self.index == 1:
+                return FakeMessage("100", 1_784_561_400_100)
+            if self.index == 2:
+                return FakeMessage("101", 1_784_561_400_200)
+            if self.index == 3:
+                await asyncio.sleep(0.025)
+                return FakeMessage("102", 1_784_561_400_300)
+            raise StopAsyncIteration
+
+    class FakeSession:
+        @staticmethod
+        def ws_connect(*args, **kwargs):
+            del args, kwargs
+            return FakeWebsocket()
+
+    provider = BinanceProvider(
+        symbol_bindings={"BTC:USDC": "BTCUSDC"},
+        session=FakeSession(),
+        stream_emit_interval_seconds=0.01,
+    )
+
+    results = [item async for item in provider.stream_quotes(("BTC:USDC",))]
+
+    assert [item.price for item in results] == [Decimal("101"), Decimal("102")]
+
+
+@pytest.mark.asyncio
+async def test_binance_stream_preserves_network_error_classification() -> None:
+    class FailingWebsocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise aiohttp.ClientConnectionError("fixture connection loss")
+
+    class FakeSession:
+        @staticmethod
+        def ws_connect(*args, **kwargs):
+            del args, kwargs
+            return FailingWebsocket()
+
+    provider = BinanceProvider(
+        symbol_bindings={"BTC:USDC": "BTCUSDC"},
+        session=FakeSession(),
+        stream_emit_interval_seconds=0.001,
+    )
+
+    with pytest.raises(NetworkUnavailable, match="ClientConnectionError"):
+        async for _item in provider.stream_quotes(("BTC:USDC",)):
+            pass
 
 
 @pytest.mark.asyncio

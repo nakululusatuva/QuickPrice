@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,6 +27,7 @@ from .base import (
 BINANCE_STREAMS_PER_CONNECTION = 250
 BINANCE_STREAM_PATH_MAX_CHARACTERS = 8_000
 BINANCE_MAX_STREAM_CONNECTIONS = 10
+BINANCE_STREAM_EMIT_INTERVAL_SECONDS = 0.25
 
 
 class BinanceProvider(HttpProvider):
@@ -55,6 +57,7 @@ class BinanceProvider(HttpProvider):
         midpoint_symbols: Sequence[str] | None = None,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         maximum_relative_book_spread: Decimal = Decimal("0.005"),
+        stream_emit_interval_seconds: float = BINANCE_STREAM_EMIT_INTERVAL_SECONDS,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -75,6 +78,12 @@ class BinanceProvider(HttpProvider):
         self.maximum_relative_book_spread = decimal_value(maximum_relative_book_spread)
         if self.maximum_relative_book_spread <= 0:
             raise ValueError("maximum_relative_book_spread must be positive")
+        self.stream_emit_interval_seconds = float(stream_emit_interval_seconds)
+        if (
+            not math.isfinite(self.stream_emit_interval_seconds)
+            or self.stream_emit_interval_seconds <= 0
+        ):
+            raise ValueError("stream_emit_interval_seconds must be finite and positive")
 
     def _exchange_symbol(self, symbol: str) -> str:
         normalized = symbol.strip().upper()
@@ -270,24 +279,73 @@ class BinanceProvider(HttpProvider):
                 receive_timeout=60,
                 **self._proxy_request_options(),
             ) as websocket:
-                async for message in websocket:
-                    if message.type is aiohttp.WSMsgType.TEXT:
-                        try:
-                            payload = message.json()
-                        except ValueError as exc:
-                            raise MalformedResponse(self.name, "invalid stream JSON") from exc
-                        data = payload.get("data", payload) if isinstance(payload, dict) else None
-                        if not isinstance(data, dict) or data.get("e") != "trade":
-                            continue
-                        exchange_symbol = str(data.get("s", "")).upper()
-                        output_symbol = self._reverse_symbols.get(exchange_symbol)
-                        if output_symbol is None:
-                            continue
-                        try:
+                pending: dict[str, tuple[str, int]] = {}
+                pending_event = asyncio.Event()
+
+                async def read_messages() -> None:
+                    async for message in websocket:
+                        if message.type is aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = message.json()
+                            except ValueError as exc:
+                                raise MalformedResponse(self.name, "invalid stream JSON") from exc
+                            data = (
+                                payload.get("data", payload) if isinstance(payload, dict) else None
+                            )
+                            if not isinstance(data, dict) or data.get("e") != "trade":
+                                continue
+                            exchange_symbol = str(data.get("s", "")).upper()
+                            output_symbol = self._reverse_symbols.get(exchange_symbol)
+                            if output_symbol is None:
+                                continue
+                            try:
+                                raw_price = str(data["p"])
+                                timestamp_ms = int(data["T"])
+                                numeric_price = float(raw_price)
+                            except KeyError, TypeError, ValueError, OverflowError:
+                                continue
+                            if not math.isfinite(numeric_price) or numeric_price <= 0:
+                                continue
+                            previous = pending.get(output_symbol)
+                            if previous is None or timestamp_ms >= previous[1]:
+                                pending[output_symbol] = (raw_price, timestamp_ms)
+                                pending_event.set()
+                        elif message.type in {
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            break
+
+                reader = asyncio.create_task(
+                    read_messages(),
+                    name="binance-stream-reader",
+                )
+                reader.add_done_callback(lambda _task: pending_event.set())
+                try:
+                    while True:
+                        if not pending:
+                            if reader.done():
+                                await reader
+                                return
+                            await pending_event.wait()
+                            if not pending and reader.done():
+                                await reader
+                                return
+
+                        # Keep consuming the socket during the coalescing window.
+                        # The pending map is bounded by the subscribed symbols,
+                        # and domain quotes are constructed only for values that
+                        # survive as the newest valid trade in that window.
+                        await asyncio.sleep(self.stream_emit_interval_seconds)
+                        batch = tuple(pending.items())
+                        pending.clear()
+                        pending_event.clear()
+                        for output_symbol, (raw_price, timestamp_ms) in batch:
                             yield quote(
                                 symbol=output_symbol,
-                                price=decimal_value(data["p"]),
-                                as_of=utc_datetime(data["T"], milliseconds=True),
+                                price=decimal_value(raw_price),
+                                as_of=utc_datetime(timestamp_ms, milliseconds=True),
                                 provider=self.name,
                                 feed=self.feed,
                                 price_basis="last_trade",
@@ -298,14 +356,9 @@ class BinanceProvider(HttpProvider):
                                 license_scope="personal_internal",
                                 coverage="exchange",
                             )
-                        except KeyError, ValueError:
-                            continue
-                    elif message.type in {
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.ERROR,
-                    }:
-                        break
+                finally:
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
         except (TimeoutError, aiohttp.ClientError) as exc:  # type: ignore[name-defined]
             from .base import NetworkUnavailable
 

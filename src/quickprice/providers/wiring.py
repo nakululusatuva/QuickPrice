@@ -70,7 +70,10 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     router = context.router
     providers = context.providers
 
-    providers["binance"] = create_builtin_binance_provider(**_proxy_options(settings, "binance"))
+    providers["binance"] = create_builtin_binance_provider(
+        stream_emit_interval_seconds=settings.high_frequency_publish_ms / 1_000,
+        **_proxy_options(settings, "binance"),
+    )
     providers["kraken"] = create_builtin_kraken_provider(**_proxy_options(settings, "kraken"))
     providers["okx"] = create_builtin_okx_market_provider(
         request_timeout=settings.provider_timeout_seconds,

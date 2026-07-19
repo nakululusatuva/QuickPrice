@@ -1549,6 +1549,7 @@ def _install_instance_bindings(
         replacement = BinanceProvider(
             symbol_bindings=symbols,
             midpoint_symbols=BUILTIN_BINANCE_MIDPOINT_SYMBOLS,
+            stream_emit_interval_seconds=settings.high_frequency_publish_ms / 1_000,
             **_proxy_options(settings, "binance"),
         )
         _replace_graph_provider(graph, "binance", replacement, metrics=metrics)
