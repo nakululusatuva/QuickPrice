@@ -350,7 +350,9 @@ burst.
 With the default 9,000-credit monthly CoinGecko budget and healthy primary spot
 providers, stETH and wstETH drive one all-symbol quote batch on a 660-second
 cadence. Ordinary spot fallback demand reuses that cache; its refresh floor and
-the durable monthly budget prevent an unbounded request fan-out. CoinGecko
+the durable monthly budget prevent an unbounded request fan-out. Failed shared
+quote refreshes are retried on the same ten-minute quota-safe cadence instead
+of entering an hour-long negative-cache backoff. CoinGecko
 ordinary spot routes are aggregated, USD-to-USDC-normalized quote fallbacks
 only and are never used as ordinary spot history. Source timestamps and
 staleness remain explicit, and a paid or plugin-provided feed can replace this

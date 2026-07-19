@@ -366,7 +366,8 @@ that cannot observe those units.
   and every 900 seconds for the other USD hubs. Alpha FX fallback values and
   expected Alpha errors are cached per hub for six hours, so those primary
   probes do not consume another Alpha credit on every scheduler cycle.
-- CoinGecko uses one all-symbol request no more than every five minutes.
+- CoinGecko uses one all-symbol request no more than every ten minutes; failed
+  refreshes use the same bounded retry cadence.
 - Binance's primary WBETH APR route uses only a read-only USER_DATA key.
 - Accept a disclosed stale value or upgrade to an authorized paid plan.
 
