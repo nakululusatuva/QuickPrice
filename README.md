@@ -13,7 +13,7 @@ QuickPrice also includes a responsive operator dashboard for inspecting live
 quotes, rolling returns, income metrics, market status, freshness, and provider
 provenance.
 
-[![QuickPrice dashboard displaying instruments, prices, rolling changes, income, market status, and provider sources](docs/assets/quickprice-dashboard.png)](docs/assets/quickprice-dashboard.png)
+[![QuickPrice dashboard displaying instruments, prices, rolling changes, income, market status, and provider sources](docs/assets/quickprice-dashboard.jpg)](docs/assets/quickprice-dashboard.jpg)
 
 <p align="center"><em>QuickPrice operator dashboard - sortable live quotes with explicit income, freshness, and source metadata.</em></p>
 
