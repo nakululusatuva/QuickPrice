@@ -36,6 +36,7 @@ class AuthContext:
     key_id: str
     name: str
     digest: str
+    expires_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +141,7 @@ class ApiKeyManager:
                 matched = record
         if matched is None:
             return None
-        return AuthContext(matched.key_id, matched.name, candidate)
+        return AuthContext(matched.key_id, matched.name, candidate, matched.expires_at)
 
     def list_records(self, *, include_revoked: bool = False) -> tuple[dict[str, Any], ...]:
         now = datetime.now(UTC)
@@ -393,6 +394,7 @@ class ApiKeyManager:
             "created_at": cls._timestamp(record.created_at),
             "updated_at": cls._timestamp(record.updated_at),
             "expires_at": cls._timestamp(record.expires_at),
+            "is_permanent": record.expires_at is None,
             "revoked_at": cls._timestamp(record.revoked_at),
             "origin": record.origin,
             "status": status,

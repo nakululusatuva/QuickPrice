@@ -406,8 +406,8 @@ tbody tr:hover { background: color-mix(in srgb, var(--surface-muted) 46%, transp
 .status-pill.is-warning { background: var(--warning-soft); color: var(--warning); }
 .status-pill.is-negative { background: var(--negative-soft); color: var(--negative); }
 
-.inline-expiry { display: flex; min-width: 235px; align-items: center; gap: 6px; }
-.inline-expiry input { min-height: 34px; padding: 5px 7px; font-size: 11px; }
+.inline-expiry { display: flex; min-width: 355px; align-items: center; gap: 6px; }
+.inline-expiry input, .inline-expiry select { min-height: 34px; padding: 5px 7px; font-size: 11px; }
 .provider-secret { display: flex; min-width: 250px; gap: 6px; }
 .provider-secret input { min-height: 34px; padding: 5px 8px; }
 

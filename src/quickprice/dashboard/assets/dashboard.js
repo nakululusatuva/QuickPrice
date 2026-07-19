@@ -4,6 +4,7 @@ const SESSION_KEY = "quickprice-dashboard-api-key";
 const THEME_KEY = "quickprice-dashboard-theme";
 const REFRESH_INTERVAL_MS = 10_000;
 const CATALOG_REFRESH_INTERVAL_MS = 30_000;
+const ACCESS_REFRESH_INTERVAL_MS = 60_000;
 const GENERATION_REFRESH_ATTEMPTS = 3;
 const CATALOG_REVISION_HEADER = "X-QuickPrice-Catalog-Revision";
 const LOG_LIMIT = 500;
@@ -31,6 +32,8 @@ const state = {
   catalogRevision: null,
   catalogRefreshing: false,
   catalogRefreshTimer: null,
+  access: null,
+  accessRefreshTimer: null,
   logs: [],
   logCursor: null,
   logController: null,
@@ -45,6 +48,9 @@ const ui = {
   credentialForm: element("credential-form"),
   forgetKey: element("forget-key"),
   connectionBadge: element("connection-badge"),
+  apiKeyValidity: element("api-key-validity"),
+  apiKeyName: element("api-key-name"),
+  apiKeyExpiry: element("api-key-expiry"),
   themeToggle: element("theme-toggle"),
   tabs: [...document.querySelectorAll("[data-tab]")],
   marketPanel: element("market-panel"),
@@ -244,6 +250,39 @@ function compactTime(value) {
     minute: "2-digit",
     second: "2-digit",
   }).format(parsed);
+}
+
+function renderApiKeyAccess(access) {
+  state.access = access && typeof access === "object" ? access : null;
+  ui.apiKeyValidity.hidden = state.access === null;
+  ui.apiKeyValidity.classList.remove("is-warning");
+  if (!state.access) {
+    ui.apiKeyName.textContent = "Current API key";
+    ui.apiKeyExpiry.textContent = "Not connected";
+    return;
+  }
+  ui.apiKeyName.textContent = state.access.name || "Current API key";
+  if (state.access.is_permanent || !state.access.expires_at) {
+    ui.apiKeyExpiry.textContent = "Permanent";
+    return;
+  }
+  const expiry = new Date(state.access.expires_at);
+  ui.apiKeyExpiry.textContent = `Expires ${dateTime(state.access.expires_at)}`;
+  if (!Number.isNaN(expiry.getTime()) && expiry.getTime() <= Date.now() + 7 * 86_400_000) {
+    ui.apiKeyValidity.classList.add("is-warning");
+  }
+}
+
+async function refreshApiKeyAccess() {
+  if (!state.apiKey) return false;
+  try {
+    const result = await apiJson("/v1/access");
+    renderApiKeyAccess(result.envelope.data);
+    return true;
+  } catch (error) {
+    handleConnectionError(error);
+    return false;
+  }
 }
 
 function price(value) {
@@ -907,7 +946,11 @@ async function connect() {
   setBadge(ui.connectionBadge, "Connecting", "neutral");
   setNotice(ui.marketNotice, "Loading the installed instrument catalog...");
   try {
-    const catalog = await fetchInstrumentCatalog();
+    const [catalog, access] = await Promise.all([
+      fetchInstrumentCatalog(),
+      apiJson("/v1/access"),
+    ]);
+    renderApiKeyAccess(access.envelope.data);
     const candidate = catalog.notModified ? currentCatalogSnapshot() : catalog;
     sessionStorage.setItem(SESSION_KEY, state.apiKey);
     await refreshQuotes(candidate);
@@ -934,18 +977,25 @@ function handleConnectionError(error) {
 function startRefreshTimers() {
   window.clearInterval(state.refreshTimer);
   window.clearInterval(state.catalogRefreshTimer);
+  window.clearInterval(state.accessRefreshTimer);
   state.refreshTimer = window.setInterval(refreshQuotes, REFRESH_INTERVAL_MS);
   state.catalogRefreshTimer = window.setInterval(
     refreshInstrumentCatalog,
     CATALOG_REFRESH_INTERVAL_MS,
+  );
+  state.accessRefreshTimer = window.setInterval(
+    refreshApiKeyAccess,
+    ACCESS_REFRESH_INTERVAL_MS,
   );
 }
 
 function stopRefreshTimers() {
   window.clearInterval(state.refreshTimer);
   window.clearInterval(state.catalogRefreshTimer);
+  window.clearInterval(state.accessRefreshTimer);
   state.refreshTimer = null;
   state.catalogRefreshTimer = null;
+  state.accessRefreshTimer = null;
 }
 
 function stopLogStream() {
@@ -960,6 +1010,7 @@ function clearDashboardData() {
   state.instruments = [];
   state.catalogEtag = null;
   state.catalogRevision = null;
+  renderApiKeyAccess(null);
   state.quotes.clear();
   state.quoteErrors.clear();
   state.expandedSymbols.clear();

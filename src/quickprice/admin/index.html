@@ -259,8 +259,9 @@
   <dialog id="create-key-dialog" aria-labelledby="create-key-title">
     <form id="create-key-form" class="dialog-card" method="post" action="/admin" autocomplete="off">
       <div class="dialog-heading"><div><p class="eyebrow">New client credential</p><h2 id="create-key-title">Create API key</h2></div><button class="dialog-close" type="button" data-close-dialog="create-key-dialog" aria-label="Close">&times;</button></div>
-      <label><span>Name</span><input id="new-key-name" type="text" maxlength="100" autocomplete="off" placeholder="Excel workstation" required></label>
-      <label><span>Expiration <small>optional</small></span><input id="new-key-expiry" type="datetime-local"></label>
+      <label><span>Name</span><input id="new-key-name" type="text" maxlength="80" autocomplete="off" placeholder="Excel workstation" required></label>
+      <label><span>Validity</span><select id="new-key-validity"><option value="permanent">Permanent</option><option value="expires">Expires at a specific time</option></select></label>
+      <label id="new-key-expiry-field" hidden><span>Expiration</span><input id="new-key-expiry" type="datetime-local" disabled></label>
       <p class="field-help">The complete key is displayed once after creation. QuickPrice stores only its cryptographic hash.</p>
       <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="create-key-dialog">Cancel</button><button class="button button-primary" type="submit">Create key</button></div>
     </form>
@@ -270,7 +271,7 @@
     <form id="import-keys-form" class="dialog-card dialog-wide" method="post" action="/admin" autocomplete="off">
       <div class="dialog-heading"><div><p class="eyebrow">Controlled migration</p><h2 id="import-keys-title">Import API keys</h2></div><button class="dialog-close" type="button" data-close-dialog="import-keys-dialog" aria-label="Close">&times;</button></div>
       <label><span>JSON key records</span><textarea id="import-keys-json" rows="10" autocomplete="off" spellcheck="false" placeholder='[{"name":"Excel workstation","api_key":"qp_...","expires_at":"2027-01-01T00:00:00Z"}]' required></textarea></label>
-      <p class="field-help">Each record requires <code>name</code> and <code>api_key</code>. <code>expires_at</code> may be omitted or set to <code>null</code>. Plaintext exists only for this request.</p>
+      <p class="field-help">Each record requires <code>name</code> and <code>api_key</code>. Omit <code>expires_at</code> or set it to <code>null</code> for a permanent key. Plaintext exists only for this request.</p>
       <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog="import-keys-dialog">Cancel</button><button class="button button-primary" type="submit">Import keys</button></div>
     </form>
   </dialog>

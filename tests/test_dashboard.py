@@ -63,6 +63,8 @@ def test_dashboard_shell_is_public_and_hardened(client, path: str) -> None:
     assert 'autocomplete="current-password"' not in response.text
     assert "<canvas" not in response.text.lower()
     assert 'id="fixture-warning"' in response.text
+    assert 'id="api-key-validity"' in response.text
+    assert 'id="api-key-expiry"' in response.text
     assert 'role="alert"' in response.text
     assert 'aria-live="assertive"' in response.text
     assert "Non-live test fixture data" in response.text
@@ -90,6 +92,9 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert '"X-API-Key"' in javascript.text
     assert 'headers["Last-Event-ID"]' in javascript.text
     assert 'apiJson("/v1/quotes"' in javascript.text
+    assert 'apiJson("/v1/access")' in javascript.text
+    assert "ACCESS_REFRESH_INTERVAL_MS = 60_000" in javascript.text
+    assert 'ui.apiKeyExpiry.textContent = "Permanent"' in javascript.text
     assert "chunks(symbols, 100)" not in javascript.text
     assert "/internal/dashboard/quotes?symbols=" not in javascript.text
     assert 'CATALOG_REVISION_HEADER = "X-QuickPrice-Catalog-Revision"' in javascript.text
@@ -114,6 +119,22 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert "Chart(" not in javascript.text
     _assert_security_headers(css)
     _assert_security_headers(javascript)
+
+
+def test_api_key_access_reports_only_current_key_validity(client, auth_headers) -> None:
+    unauthorized = client.get("/v1/access")
+    response = client.get("/v1/access", headers=auth_headers)
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "name": "Legacy API key 1",
+        "expires_at": None,
+        "is_permanent": True,
+    }
+    assert "test-key-with-enough-entropy" not in response.text
+    assert "sha256:" not in response.text
+    _assert_security_headers(response)
 
 
 def test_dashboard_income_help_labels_align_with_the_numeric_column(client) -> None:

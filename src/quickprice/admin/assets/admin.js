@@ -56,6 +56,8 @@ const ui = {
   createKeyDialog: element("create-key-dialog"),
   createKeyForm: element("create-key-form"),
   newKeyName: element("new-key-name"),
+  newKeyValidity: element("new-key-validity"),
+  newKeyExpiryField: element("new-key-expiry-field"),
   newKeyExpiry: element("new-key-expiry"),
   importKeysDialog: element("import-keys-dialog"),
   importKeysForm: element("import-keys-form"),
@@ -532,15 +534,32 @@ function apiKeyRow(item) {
   const expiry = document.createElement("td");
   const expiryControls = document.createElement("div");
   expiryControls.className = "inline-expiry";
+  const expiryMode = document.createElement("select");
+  expiryMode.setAttribute("aria-label", `Validity mode for ${item.name || keyIdentifier(item)}`);
+  for (const [value, label] of [["permanent", "Permanent"], ["expires", "Expires"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    expiryMode.append(option);
+  }
+  expiryMode.value = item.is_permanent || !item.expires_at ? "permanent" : "expires";
   const expiryInput = document.createElement("input");
   expiryInput.type = "datetime-local";
   expiryInput.value = toLocalDateTimeValue(item.expires_at);
   expiryInput.setAttribute("aria-label", `Expiration for ${item.name || keyIdentifier(item)}`);
+  const syncExpiryMode = () => {
+    const permanent = expiryMode.value === "permanent";
+    expiryInput.disabled = permanent;
+    expiryInput.required = !permanent;
+    if (permanent) expiryInput.value = "";
+  };
+  expiryMode.addEventListener("change", syncExpiryMode);
+  syncExpiryMode();
   const update = textNode("button", "Update", "button button-quiet button-small");
   update.type = "button";
-  update.addEventListener("click", () => updateApiKeyExpiry(item, expiryInput, update));
-  if (keyStatus(item).label === "Revoked") { expiryInput.disabled = true; update.disabled = true; }
-  expiryControls.append(expiryInput, update);
+  update.addEventListener("click", () => updateApiKeyExpiry(item, expiryMode, expiryInput, update));
+  if (keyStatus(item).label === "Revoked") { expiryMode.disabled = true; expiryInput.disabled = true; update.disabled = true; }
+  expiryControls.append(expiryMode, expiryInput, update);
   expiry.append(expiryControls);
   const status = document.createElement("td");
   const currentStatus = keyStatus(item);
@@ -556,12 +575,15 @@ function apiKeyRow(item) {
   return row;
 }
 
-async function updateApiKeyExpiry(item, input, button) {
+async function updateApiKeyExpiry(item, mode, input, button) {
   button.disabled = true;
   try {
+    if (mode.value !== "permanent" && !input.value) {
+      throw new Error("Choose an expiration date and time.");
+    }
     await adminRequest(`/api-keys/${encodeURIComponent(keyIdentifier(item))}`, {
       method: "PATCH",
-      body: { expires_at: toUtcDateTime(input.value) },
+      body: { expires_at: mode.value === "permanent" ? null : toUtcDateTime(input.value) },
     });
     showToast("API key expiration updated.", "success");
     await loadApiKeys({ quiet: true });
@@ -601,12 +623,16 @@ async function createApiKey(event) {
   try {
     const body = await adminRequest("/api-keys", {
       method: "POST",
-      body: { name: ui.newKeyName.value.trim(), expires_at: toUtcDateTime(ui.newKeyExpiry.value) },
+      body: {
+        name: ui.newKeyName.value.trim(),
+        expires_at: ui.newKeyValidity.value === "permanent" ? null : toUtcDateTime(ui.newKeyExpiry.value),
+      },
     });
     const rawKey = rawKeyFromResponse(body);
     if (!rawKey) throw new Error("The server created a key but did not return its one-time value.");
     ui.createKeyDialog.close();
     ui.createKeyForm.reset();
+    syncNewKeyValidity();
     revealApiKey(rawKey);
     await loadApiKeys({ quiet: true });
   } catch (error) {
@@ -614,6 +640,14 @@ async function createApiKey(event) {
   } finally {
     submit.disabled = false;
   }
+}
+
+function syncNewKeyValidity() {
+  const permanent = ui.newKeyValidity.value === "permanent";
+  ui.newKeyExpiryField.hidden = permanent;
+  ui.newKeyExpiry.disabled = permanent;
+  ui.newKeyExpiry.required = !permanent;
+  if (permanent) ui.newKeyExpiry.value = "";
 }
 
 async function importApiKeys(event) {
@@ -2146,15 +2180,22 @@ function bindEvents() {
   }
   ui.apiKeySearch.addEventListener("input", renderApiKeys);
   ui.refreshApiKeys.addEventListener("click", () => loadApiKeys());
-  ui.createApiKey.addEventListener("click", () => ui.createKeyDialog.showModal());
+  ui.createApiKey.addEventListener("click", () => {
+    syncNewKeyValidity();
+    ui.createKeyDialog.showModal();
+  });
   ui.importApiKeys.addEventListener("click", () => ui.importKeysDialog.showModal());
+  ui.newKeyValidity.addEventListener("change", syncNewKeyValidity);
   ui.createKeyForm.addEventListener("submit", createApiKey);
   ui.importKeysForm.addEventListener("submit", importApiKeys);
   ui.copyApiKey.addEventListener("click", copyApiKey);
   ui.closeRevealKey.addEventListener("click", closeApiKeyReveal);
   ui.revealKeyDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeApiKeyReveal(); });
   for (const close of document.querySelectorAll("[data-close-dialog]")) close.addEventListener("click", () => element(close.dataset.closeDialog)?.close());
-  ui.createKeyDialog.addEventListener("close", () => ui.createKeyForm.reset());
+  ui.createKeyDialog.addEventListener("close", () => {
+    ui.createKeyForm.reset();
+    syncNewKeyValidity();
+  });
   ui.importKeysDialog.addEventListener("close", () => { ui.importKeysJson.value = ""; });
   ui.refreshProviderKeys.addEventListener("click", loadProviderKeys);
   ui.instrumentSearch.addEventListener("input", renderInstruments);
@@ -2205,4 +2246,5 @@ function bindEvents() {
 
 initializeTheme();
 bindEvents();
+syncNewKeyValidity();
 restoreSession();

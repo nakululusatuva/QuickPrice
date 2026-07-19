@@ -430,7 +430,7 @@ a:focus-visible {
 
 .credential-panel {
   display: grid;
-  grid-template-columns: minmax(190px, 0.55fr) minmax(360px, 1.45fr);
+  grid-template-columns: minmax(170px, 0.45fr) minmax(360px, 1.25fr) minmax(190px, 0.5fr);
   align-items: center;
   gap: 22px;
   margin-bottom: 20px;
@@ -470,6 +470,35 @@ a:focus-visible {
   flex: 1;
   min-width: 120px;
   padding: 8px 11px;
+}
+
+.credential-validity {
+  min-width: 0;
+  padding-left: 18px;
+  border-left: 1px solid var(--border);
+}
+
+.credential-validity span,
+.credential-validity strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.credential-validity span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.credential-validity strong {
+  margin-top: 3px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.credential-validity.is-warning strong {
+  color: var(--warning);
 }
 
 .kpi-grid {
@@ -1046,6 +1075,12 @@ a:focus-visible {
   .credential-panel {
     grid-template-columns: 1fr;
     gap: 12px;
+  }
+
+  .credential-validity {
+    padding: 10px 0 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
   }
 
   .credential-input {

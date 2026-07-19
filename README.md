@@ -185,6 +185,13 @@ Returns the complete active catalog and its names, descriptions,
 classifications, price bases, change windows, reward mechanics, and income
 policies.
 
+### `GET /v1/access`
+
+Returns the authenticated API key's non-secret display name and expiration.
+`is_permanent=true` and `expires_at=null` identify a key with no expiration.
+The dashboard refreshes this metadata while connected so administrator changes
+are reflected without exposing the key identifier, hash, or plaintext value.
+
 ### Response model
 
 Every endpoint uses the same envelope:
@@ -245,6 +252,9 @@ Authentication and browser state follow these boundaries:
   `sessionStorage`, sent as `X-API-Key`, and scoped to the current browser tab
   session. It is not embedded in static assets, persisted in `localStorage`, or
   placed in a URL, query string, fragment, cookie, or server-rendered document.
+- The connected view shows whether the current key is permanent or its exact
+  expiration time. This comes from the protected `/v1/access` endpoint and
+  contains no key material.
 - Closing the tab clears the session key according to normal browser
   `sessionStorage` behavior. Shared or untrusted browser profiles remain
   inappropriate places to enter credentials.

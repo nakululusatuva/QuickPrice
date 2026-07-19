@@ -24,6 +24,7 @@ async def test_api_key_expiry_revocation_and_restart_persistence(tmp_path) -> No
         expires_at=expires_at,
         audit=AuditContext(request_id="request-create", client_ip="127.0.0.1"),
     )
+    assert created["is_permanent"] is False
     assert manager.authenticate_digest(hash_api_key(raw_key), now=expires_at - timedelta(seconds=1))
     assert manager.authenticate_digest(hash_api_key(raw_key), now=expires_at) is None
     await storage.stop()
@@ -68,6 +69,10 @@ async def test_revocation_updates_auth_snapshot_without_a_database_reload(
         expires_at=None,
         audit=AuditContext(request_id="request-create", client_ip="127.0.0.1"),
     )
+    assert created["is_permanent"] is True
+    context = manager.authenticate_digest(hash_api_key(raw_key))
+    assert context is not None
+    assert context.expires_at is None
 
     def fail_reload():
         raise RuntimeError("simulated read failure")

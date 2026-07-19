@@ -34,7 +34,7 @@ from .admin_security import (
     AdminRateLimitError,
     AdminSecurity,
 )
-from .api_keys import ApiKeyManager
+from .api_keys import ApiKeyManager, AuthContext
 from .auth import AuthenticationError, Authenticator, RateLimitError
 from .config import Settings
 from .dashboard_logs import DashboardLogBroker, DashboardLogCapacityError
@@ -534,7 +534,9 @@ def create_app(
                 request.headers.get("X-Real-IP"),
             )
             try:
-                authenticator.authenticate(request.headers.get("X-API-Key"), client_ip)
+                request.state.api_key_context = authenticator.authenticate(
+                    request.headers.get("X-API-Key"), client_ip
+                )
             except RateLimitError as exc:
                 response = JSONResponse(
                     _envelope(
@@ -723,6 +725,25 @@ def create_app(
     @app.get("/internal/metrics", include_in_schema=False)
     async def metrics_endpoint(request: Request) -> dict[str, Any]:
         return _envelope(request, data=service.operational_metrics())
+
+    @app.get("/v1/access", include_in_schema=False)
+    async def current_api_key_access(request: Request) -> dict[str, Any]:
+        """Return non-secret validity metadata for the authenticated client key."""
+
+        context = request.state.api_key_context
+        if not isinstance(context, AuthContext):
+            raise APIError(503, "api_key_metadata_unavailable", "API key metadata is unavailable")
+        expires_at = context.expires_at
+        return _envelope(
+            request,
+            data={
+                "name": context.name,
+                "expires_at": (
+                    None if expires_at is None else expires_at.isoformat().replace("+00:00", "Z")
+                ),
+                "is_permanent": expires_at is None,
+            },
+        )
 
     @app.get("/internal/dashboard/quotes", include_in_schema=False)
     async def dashboard_quotes(

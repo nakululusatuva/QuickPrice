@@ -96,7 +96,15 @@ def test_admin_can_create_expire_and_revoke_client_api_keys(settings, tmp_path) 
         raw_key = body["raw_key"]
         key_id = body["api_key"]["key_id"]
         assert body["display_once"] is True
+        assert body["api_key"]["is_permanent"] is False
         assert client.get("/v1/quotes/BTC:USDC", headers={"X-API-Key": raw_key}).status_code == 200
+        access = client.get("/v1/access", headers={"X-API-Key": raw_key})
+        assert access.status_code == 200
+        assert access.json()["data"] == {
+            "name": "Excel desktop",
+            "expires_at": body["api_key"]["expires_at"],
+            "is_permanent": False,
+        }
 
         listing = client.get("/admin-api/api-keys").json()
         assert raw_key not in repr(listing)
@@ -117,6 +125,10 @@ def test_admin_can_create_expire_and_revoke_client_api_keys(settings, tmp_path) 
         )
         assert expiry_removed.status_code == 200, expiry_removed.text
         assert expiry_removed.json()["api_key"]["expires_at"] is None
+        assert expiry_removed.json()["api_key"]["is_permanent"] is True
+        permanent_access = client.get("/v1/access", headers={"X-API-Key": raw_key})
+        assert permanent_access.json()["data"]["is_permanent"] is True
+        assert permanent_access.json()["data"]["expires_at"] is None
 
         revoked = client.request(
             "DELETE",

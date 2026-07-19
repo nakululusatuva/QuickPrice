@@ -84,8 +84,20 @@ def test_admin_client_does_not_persist_credentials_or_render_untrusted_html() ->
     assert 'ui.revealedApiKey.textContent = ""' in source
     assert 'input.autocomplete = "off"' in source
     assert "rawKeyFromResponse" in source
+    assert 'newKeyValidity: element("new-key-validity")' in source
+    assert "expiryMode.value = item.is_permanent || !item.expires_at" in source
+    assert 'mode.value === "permanent" ? null' in source
     assert "CATALOG_JOB_KEY" in source
     assert "adminRequest(path, { csrf: true })" in source
+
+
+def test_admin_api_key_forms_make_permanent_validity_explicit() -> None:
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+
+    assert 'id="new-key-validity"' in html
+    assert '<option value="permanent">Permanent</option>' in html
+    assert 'id="new-key-expiry-field" hidden' in html
+    assert "set it to <code>null</code> for a permanent key" in html
 
 
 @pytest.mark.parametrize(
