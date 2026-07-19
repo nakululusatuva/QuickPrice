@@ -16,6 +16,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .admin_account import AdminAccountError, AdminAccountRevisionError
 from .admin_security import (
     AdminAuthenticationError,
     AdminAuthorizationError,
@@ -49,8 +50,23 @@ class _StrictModel(BaseModel):
 
 
 class LoginRequest(_StrictModel):
-    admin_key: str = Field(min_length=1, max_length=256)
+    username: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    password: str = Field(min_length=8, max_length=256)
     totp: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+class UpdateAdminAccountRequest(_StrictModel):
+    current_password: str = Field(min_length=8, max_length=256)
+    new_username: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    new_password: str = Field(min_length=8, max_length=256)
 
 
 class CreateApiKeyRequest(_StrictModel):
@@ -193,6 +209,7 @@ def install_admin_routes(
         *,
         mutation: bool = False,
         same_origin_action: bool = False,
+        allow_password_change: bool = False,
     ):
         preauthorized = getattr(request.state, "quickprice_admin_session", None)
         authorization_level = getattr(
@@ -210,6 +227,12 @@ def install_admin_routes(
         if preauthorized is not None and authorization_level in accepted_levels:
             if mutation:
                 _json_content_required(request)
+            if preauthorized.password_change_required and not allow_password_change:
+                raise AdminRouteError(
+                    403,
+                    "admin_password_change_required",
+                    "administrator password change is required",
+                )
             return preauthorized
         try:
             if mutation:
@@ -226,12 +249,20 @@ def install_admin_routes(
                     sec_fetch_site=request.headers.get("Sec-Fetch-Site"),
                     effective_scheme=_effective_scheme(request, security),
                 )
-            return security.authorize(
+            session = security.authorize(
                 session_token=request.cookies.get(security.cookie_name),
                 user_agent=request.headers.get("User-Agent", ""),
                 csrf_token=request.headers.get("X-CSRF-Token"),
                 mutation=mutation or same_origin_action,
+                allow_password_change_required=True,
             )
+            if session.password_change_required and not allow_password_change:
+                raise AdminRouteError(
+                    403,
+                    "admin_password_change_required",
+                    "administrator password change is required",
+                )
+            return session
         except AdminNotConfiguredError as exc:
             raise AdminRouteError(
                 503, "admin_not_configured", "administrator access is unavailable"
@@ -307,7 +338,8 @@ def install_admin_routes(
             )
             result = await asyncio.to_thread(
                 security.login,
-                admin_key=body.admin_key,
+                username=body.username,
+                password=body.password,
                 otp=body.totp,
                 client_ip=_client_ip(request, security),
                 user_agent=request.headers.get("User-Agent", ""),
@@ -351,6 +383,8 @@ def install_admin_routes(
                 "authenticated": True,
                 "csrf_token": result.csrf_token,
                 "expires_at": _timestamp_from_epoch(result.expires_at_epoch),
+                "username": result.username,
+                "password_change_required": result.password_change_required,
             }
         )
         response.set_cookie(
@@ -366,16 +400,18 @@ def install_admin_routes(
 
     @app.get("/admin-api/session", include_in_schema=False)
     async def admin_session(request: Request) -> dict[str, Any]:
-        session = authorize(request)
+        session = authorize(request, allow_password_change=True)
         return {
             "authenticated": True,
             "csrf_token": session.csrf_token,
             "expires_at": _timestamp_from_epoch(security.expires_at_epoch(session)),
+            "username": session.username,
+            "password_change_required": session.password_change_required,
         }
 
     @app.delete("/admin-api/session", include_in_schema=False)
     async def admin_logout(request: Request) -> JSONResponse:
-        authorize(request, mutation=True)
+        authorize(request, mutation=True, allow_password_change=True)
         token = request.cookies.get(security.cookie_name)
         security.logout(token)
         response = JSONResponse({"authenticated": False})
@@ -385,6 +421,101 @@ def install_admin_routes(
             secure=security.production or security.require_https,
             httponly=True,
             samesite="strict",
+        )
+        return response
+
+    @app.get("/admin-api/account", include_in_schema=False)
+    async def admin_account(request: Request) -> dict[str, Any]:
+        session = authorize(request, allow_password_change=True)
+        return {
+            "username": session.username,
+            "password_change_required": session.password_change_required,
+        }
+
+    @app.patch("/admin-api/account", include_in_schema=False)
+    async def update_admin_account(
+        request: Request,
+        body: UpdateAdminAccountRequest,
+    ) -> JSONResponse:
+        session = authorize(request, mutation=True, allow_password_change=True)
+        await audit_intent(
+            request,
+            action="admin.account.change_requested",
+            target_type="admin_account",
+            target_id=None,
+            fields=["username", "password"],
+        )
+        try:
+            result = await asyncio.to_thread(
+                security.change_account,
+                session=session,
+                current_password=body.current_password,
+                new_username=body.new_username,
+                new_password=body.new_password,
+                client_ip=_client_ip(request, security),
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+        except AdminRateLimitError as exc:
+            raise AdminRouteError(
+                429,
+                "admin_rate_limited",
+                "administrator authentication is temporarily unavailable",
+                retry_after=exc.retry_after,
+            ) from exc
+        except AdminAuthenticationError as exc:
+            raise AdminRouteError(
+                401,
+                "admin_authentication_failed",
+                "administrator authentication failed",
+            ) from exc
+        except AdminAuthorizationError as exc:
+            raise AdminRouteError(
+                401,
+                "admin_unauthorized",
+                "administrator authorization failed",
+            ) from exc
+        except AdminAccountRevisionError as exc:
+            raise AdminRouteError(
+                409,
+                "admin_account_conflict",
+                "administrator account changed concurrently",
+            ) from exc
+        except ValueError as exc:
+            raise AdminRouteError(
+                422,
+                "invalid_admin_account",
+                "administrator account values are invalid",
+            ) from exc
+        except AdminAccountError as exc:
+            raise AdminRouteError(
+                503,
+                "admin_account_unavailable",
+                "administrator account could not be updated",
+            ) from exc
+        await audit_completion(
+            request,
+            action="admin.account.changed",
+            target_type="admin_account",
+            target_id=None,
+            fields=["username", "password"],
+        )
+        response = JSONResponse(
+            {
+                "authenticated": True,
+                "csrf_token": result.csrf_token,
+                "expires_at": _timestamp_from_epoch(result.expires_at_epoch),
+                "username": result.username,
+                "password_change_required": result.password_change_required,
+            }
+        )
+        response.set_cookie(
+            key=security.cookie_name,
+            value=result.session_token,
+            max_age=security.absolute_seconds,
+            secure=security.production or security.require_https,
+            httponly=True,
+            samesite="strict",
+            path="/",
         )
         return response
 

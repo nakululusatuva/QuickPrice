@@ -27,6 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
+from .admin_account import AdminAccountStore
 from .admin_api import install_admin_routes
 from .admin_security import (
     AdminAuthorizationError,
@@ -184,6 +185,7 @@ class _AdminRequestGuardMiddleware:
                     user_agent=request.headers.get("User-Agent", ""),
                     csrf_token=request.headers.get("X-CSRF-Token"),
                     mutation=mutation or provider_search,
+                    allow_password_change_required=True,
                 )
             except AdminNotConfiguredError:
                 await self._error(
@@ -214,6 +216,22 @@ class _AdminRequestGuardMiddleware:
                     status_code=401,
                     code="admin_unauthorized",
                     message="administrator authorization failed",
+                )
+                return
+            password_change_routes = {
+                ("GET", "/admin-api/session"),
+                ("DELETE", "/admin-api/session"),
+                ("GET", "/admin-api/account"),
+                ("PATCH", "/admin-api/account"),
+            }
+            if session.password_change_required and (method, path) not in password_change_routes:
+                await self._error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=403,
+                    code="admin_password_change_required",
+                    message="administrator password change is required",
                 )
                 return
             state = scope.setdefault("state", {})
@@ -310,7 +328,7 @@ def _request_id() -> str:
 def _dashboard_redacted_values(settings: Settings) -> tuple[str | None, ...]:
     return (
         *settings.api_key_hashes,
-        settings.admin_key_verifier,
+        settings.admin_password_verifier,
         settings.admin_totp_secret,
         settings.alpaca_api_key,
         settings.alpaca_api_secret,
@@ -401,8 +419,21 @@ def create_app(
     api_key_manager = ApiKeyManager(settings.api_key_hashes)
     authenticator = Authenticator(settings, api_key_manager)
     service.bind_api_key_state(lambda: authenticator.configured)
+    admin_account_store = AdminAccountStore(settings.managed_admin_account_path)
+    bootstrap_account = (
+        settings.admin_username,
+        settings.admin_password_verifier,
+    )
+    if any(bootstrap_account) and not all(bootstrap_account):
+        raise ValueError("administrator username and password verifier must be configured together")
+    if all(bootstrap_account):
+        admin_account_store.bootstrap(
+            username=settings.admin_username or "",
+            password_verifier=settings.admin_password_verifier or "",
+            password_change_required=settings.admin_password_change_required,
+        )
     admin_security = AdminSecurity(
-        key_verifier=settings.admin_key_verifier,
+        account_store=admin_account_store,
         totp_secret=settings.admin_totp_secret,
         expected_origin=settings.admin_origin,
         require_https=settings.admin_require_https,
@@ -689,7 +720,7 @@ def create_app(
             effective_scheme = forwarded
         if admin_security.require_https and effective_scheme.lower() != "https":
             # Do not present a credential form over a transport that would
-            # expose the administrator key and one-time code before the login
+            # expose administrator credentials before the login
             # endpoint has an opportunity to reject the request.
             return Response(status_code=404)
         return HTMLResponse(admin_html)

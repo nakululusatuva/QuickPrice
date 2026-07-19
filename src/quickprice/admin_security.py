@@ -19,14 +19,18 @@ from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlsplit
 
+from .admin_account import (
+    AdminAccount,
+    AdminAccountStore,
+    create_admin_password_verifier,
+    validate_admin_username,
+    verify_admin_password,
+)
 from .auth import RateLimitError, TokenBucketLimiter
 
-_SCRYPT_NAME: Final[str] = "scrypt"
-_SCRYPT_N: Final[int] = 2**15
-_SCRYPT_R: Final[int] = 8
-_SCRYPT_P: Final[int] = 1
-_SCRYPT_MAXMEM: Final[int] = 128 * 1024 * 1024
 _SESSION_LIMIT: Final[int] = 64
+_SCRYPT_WORK_LIMIT: Final[int] = 2
+_ACCOUNT_CHANGE_MAX_SESSION_AGE: Final[float] = 300.0
 _COOKIE_PRODUCTION: Final[str] = "__Host-quickprice_admin"
 _COOKIE_DEVELOPMENT: Final[str] = "quickprice_admin"
 
@@ -47,6 +51,10 @@ class AdminAuthorizationError(AdminSecurityError):
     pass
 
 
+class AdminPasswordChangeRequiredError(AdminAuthorizationError):
+    pass
+
+
 class AdminRateLimitError(AdminSecurityError):
     def __init__(self, retry_after: int) -> None:
         super().__init__("administrator authentication rate limit exceeded")
@@ -63,6 +71,9 @@ class AdminSession:
     absolute_expires_monotonic: float
     created_at_epoch: float
     client_ip: str
+    username: str
+    account_revision: str
+    password_change_required: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,66 +81,14 @@ class AdminLoginResult:
     session_token: str
     csrf_token: str
     expires_at_epoch: float
-
-
-def _b64encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
-
-
-def _b64decode(value: str) -> bytes:
-    padding = "=" * ((4 - len(value) % 4) % 4)
-    return base64.urlsafe_b64decode(value + padding)
-
-
-def generate_admin_key() -> str:
-    """Return a 256-bit administrator credential suitable for one-time display."""
-
-    return "qpa_" + secrets.token_urlsafe(32)
+    username: str
+    password_change_required: bool
 
 
 def generate_totp_secret() -> str:
     """Return a 160-bit RFC 6238 Base32 seed suitable for local enrollment."""
 
     return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
-
-
-def create_admin_key_verifier(raw_key: str) -> str:
-    if not 20 <= len(raw_key) <= 256:
-        raise ValueError("administrator key must contain 20 to 256 characters")
-    salt = secrets.token_bytes(16)
-    digest = hashlib.scrypt(
-        raw_key.encode("utf-8"),
-        salt=salt,
-        n=_SCRYPT_N,
-        r=_SCRYPT_R,
-        p=_SCRYPT_P,
-        dklen=32,
-        maxmem=_SCRYPT_MAXMEM,
-    )
-    return "$".join(
-        (
-            _SCRYPT_NAME,
-            str(_SCRYPT_N),
-            str(_SCRYPT_R),
-            str(_SCRYPT_P),
-            _b64encode(salt),
-            _b64encode(digest),
-        )
-    )
-
-
-def _parse_admin_key_verifier(value: str) -> tuple[int, int, int, bytes, bytes]:
-    try:
-        name, raw_n, raw_r, raw_p, raw_salt, raw_digest = value.split("$")
-        n, r, p = int(raw_n), int(raw_r), int(raw_p)
-        salt, digest = _b64decode(raw_salt), _b64decode(raw_digest)
-    except (TypeError, ValueError, base64.binascii.Error) as exc:
-        raise ValueError("invalid administrator key verifier") from exc
-    if name != _SCRYPT_NAME or (n, r, p) != (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P):
-        raise ValueError("unsupported administrator key verifier parameters")
-    if len(salt) != 16 or len(digest) != 32:
-        raise ValueError("invalid administrator key verifier length")
-    return n, r, p, salt, digest
 
 
 def _decode_totp_secret(value: str) -> bytes:
@@ -189,7 +148,7 @@ class AdminSecurity:
     def __init__(
         self,
         *,
-        key_verifier: str | None,
+        account_store: AdminAccountStore | None,
         totp_secret: str | None,
         expected_origin: str | None,
         require_https: bool,
@@ -200,15 +159,14 @@ class AdminSecurity:
     ) -> None:
         if idle_seconds < 300 or absolute_seconds < 900 or idle_seconds > absolute_seconds:
             raise ValueError("invalid administrator session lifetime")
-        configured_values = (key_verifier, totp_secret, expected_origin)
+        account_configured = account_store is not None and account_store.configured
+        configured_values = (account_configured, bool(totp_secret), bool(expected_origin))
         if any(configured_values) and not all(configured_values):
             raise ValueError(
-                "administrator key verifier, TOTP secret, and origin must be configured together"
+                "administrator account, TOTP secret, and origin must be configured together"
             )
         self._configured = bool(all(configured_values))
-        self._verifier = (
-            _parse_admin_key_verifier(key_verifier) if key_verifier is not None else None
-        )
+        self._account_store = account_store
         self._totp_secret = _decode_totp_secret(totp_secret) if totp_secret is not None else None
         self._expected_origin = expected_origin.rstrip("/") if expected_origin else None
         parsed_origin = urlsplit(self._expected_origin) if self._expected_origin else None
@@ -247,10 +205,17 @@ class AdminSecurity:
         self._sessions: dict[str, AdminSession] = {}
         self._last_totp_counter = -1
         self._lock = threading.Lock()
+        self._scrypt_slots = threading.BoundedSemaphore(_SCRYPT_WORK_LIMIT)
         self._ip_login_limiter = TokenBucketLimiter(
             5, 3, max_identities=4096, idle_ttl_seconds=3600
         )
         self._global_login_limiter = TokenBucketLimiter(
+            30, 10, max_identities=1, idle_ttl_seconds=3600
+        )
+        self._account_change_limiter = TokenBucketLimiter(
+            5, 3, max_identities=_SESSION_LIMIT, idle_ttl_seconds=3600
+        )
+        self._global_account_change_limiter = TokenBucketLimiter(
             30, 10, max_identities=1, idle_ttl_seconds=3600
         )
         self._mutation_limiter = TokenBucketLimiter(
@@ -339,7 +304,8 @@ class AdminSecurity:
     def login(
         self,
         *,
-        admin_key: str,
+        username: str,
+        password: str,
         otp: str,
         client_ip: str,
         user_agent: str,
@@ -353,19 +319,17 @@ class AdminSecurity:
         except RateLimitError as exc:
             raise AdminRateLimitError(exc.retry_after) from exc
 
-        bounded_key = admin_key if isinstance(admin_key, str) and len(admin_key) <= 256 else ""
-        bounded_otp = otp if isinstance(otp, str) and len(otp) == 6 and otp.isascii() else ""
-        n, r, p, salt, expected = self._verifier or (0, 0, 0, b"", b"")
-        candidate = hashlib.scrypt(
-            bounded_key.encode("utf-8"),
-            salt=salt,
-            n=n,
-            r=r,
-            p=p,
-            dklen=32,
-            maxmem=_SCRYPT_MAXMEM,
+        account = self._require_account()
+        bounded_username = username if isinstance(username, str) and len(username) <= 64 else ""
+        bounded_otp = (
+            otp
+            if isinstance(otp, str) and len(otp) == 6 and otp.isascii() and otp.isdigit()
+            else ""
         )
-        key_valid = 20 <= len(bounded_key) <= 256 and hmac.compare_digest(candidate, expected)
+        password_valid = self._verify_password(password, account)
+        username_valid = hmac.compare_digest(
+            bounded_username.encode("utf-8"), account.username.encode("utf-8")
+        )
         epoch = time.time() if now_epoch is None else now_epoch
         current_counter = int(epoch // 30)
         matching_counter = -1
@@ -380,32 +344,16 @@ class AdminSecurity:
         with self._lock:
             self._prune_locked(monotonic)
             replayed = matching_counter <= self._last_totp_counter
-            if not key_valid or matching_counter < 0 or replayed:
+            if not username_valid or not password_valid or matching_counter < 0 or replayed:
                 raise AdminAuthenticationError("administrator authentication failed")
             self._last_totp_counter = matching_counter
-            if len(self._sessions) >= _SESSION_LIMIT:
-                oldest = min(
-                    self._sessions, key=lambda item: self._sessions[item].last_seen_monotonic
-                )
-                self._sessions.pop(oldest, None)
-            raw_session = secrets.token_urlsafe(32)
-            session_digest = self._session_digest(raw_session)
-            csrf_token = secrets.token_urlsafe(32)
-            self._sessions[session_digest] = AdminSession(
-                session_digest=session_digest,
-                csrf_token=csrf_token,
-                user_agent_digest=self._user_agent_digest(user_agent),
-                created_monotonic=monotonic,
-                last_seen_monotonic=monotonic,
-                absolute_expires_monotonic=monotonic + self.absolute_seconds,
-                created_at_epoch=epoch,
+            return self._create_session_locked(
+                account=account,
                 client_ip=client_ip,
+                user_agent=user_agent,
+                epoch=epoch,
+                monotonic=monotonic,
             )
-        return AdminLoginResult(
-            session_token=raw_session,
-            csrf_token=csrf_token,
-            expires_at_epoch=epoch + self.absolute_seconds,
-        )
 
     def authorize(
         self,
@@ -414,19 +362,30 @@ class AdminSecurity:
         user_agent: str,
         csrf_token: str | None = None,
         mutation: bool = False,
+        allow_password_change_required: bool = False,
         now_monotonic: float | None = None,
     ) -> AdminSession:
         self._require_configured()
+        account = self._require_account()
         raw = session_token if session_token and len(session_token) <= 256 else ""
         digest = self._session_digest(raw)
         monotonic = time.monotonic() if now_monotonic is None else now_monotonic
         with self._lock:
             self._prune_locked(monotonic)
             session = self._sessions.get(digest)
-            if session is None or not hmac.compare_digest(
-                session.user_agent_digest, self._user_agent_digest(user_agent)
+            if (
+                session is None
+                or not hmac.compare_digest(
+                    session.user_agent_digest, self._user_agent_digest(user_agent)
+                )
+                or not hmac.compare_digest(session.account_revision, account.revision)
             ):
+                self._sessions.pop(digest, None)
                 raise AdminAuthorizationError("administrator session is invalid")
+            if session.password_change_required and not allow_password_change_required:
+                raise AdminPasswordChangeRequiredError(
+                    "administrator password must be changed before continuing"
+                )
             if mutation and not (
                 csrf_token
                 and len(csrf_token) <= 256
@@ -441,6 +400,96 @@ class AdminSecurity:
                     raise AdminRateLimitError(exc.retry_after) from exc
             session.last_seen_monotonic = monotonic
             return session
+
+    def account_snapshot(self) -> dict[str, object]:
+        """Return secret-free metadata for the single administrator account."""
+
+        self._require_configured()
+        store = self._account_store
+        if store is None:
+            raise AdminNotConfiguredError("administrator authentication is not configured")
+        return store.snapshot()
+
+    def change_account(
+        self,
+        *,
+        session: AdminSession,
+        current_password: str,
+        new_username: str,
+        new_password: str,
+        client_ip: str,
+        user_agent: str,
+        now_epoch: float | None = None,
+        now_monotonic: float | None = None,
+    ) -> AdminLoginResult:
+        """Replace the account after recent reauthentication and rotate the session.
+
+        The caller receives a new session and CSRF token. Every prior session,
+        including the session used for this request, is revoked atomically from
+        the perspective of subsequent authorization checks.
+        """
+
+        epoch = time.time() if now_epoch is None else now_epoch
+        monotonic = time.monotonic() if now_monotonic is None else now_monotonic
+        age = monotonic - session.created_monotonic
+        if age < 0 or age > _ACCOUNT_CHANGE_MAX_SESSION_AGE:
+            raise AdminAuthenticationError(
+                "administrator account change requires recent authentication"
+            )
+        account = self._require_account()
+        with self._lock:
+            if (
+                self._sessions.get(session.session_digest) is not session
+                or not hmac.compare_digest(
+                    session.user_agent_digest, self._user_agent_digest(user_agent)
+                )
+                or not hmac.compare_digest(session.account_revision, account.revision)
+            ):
+                raise AdminAuthorizationError("administrator session is invalid")
+        try:
+            self._account_change_limiter.consume(session.session_digest)
+            self._global_account_change_limiter.consume("global")
+        except RateLimitError as exc:
+            raise AdminRateLimitError(exc.retry_after) from exc
+        if not self._verify_password(current_password, account):
+            raise AdminAuthenticationError("administrator authentication failed")
+        validate_admin_username(new_username)
+        if new_password == current_password:
+            raise ValueError("new administrator password must differ from the current password")
+        new_verifier = self._create_password_verifier(new_password)
+        store = self._account_store
+        if store is None:
+            raise AdminNotConfiguredError("administrator authentication is not configured")
+        with self._lock:
+            current_session = self._sessions.get(session.session_digest)
+            current_account = store.current()
+            if (
+                current_session is not session
+                or current_account is None
+                or not hmac.compare_digest(
+                    session.user_agent_digest, self._user_agent_digest(user_agent)
+                )
+                or not hmac.compare_digest(session.account_revision, current_account.revision)
+            ):
+                raise AdminAuthorizationError("administrator session is invalid")
+            replacement = store.replace(
+                username=new_username,
+                password_verifier=new_verifier,
+                password_change_required=False,
+                expected_revision=session.account_revision,
+            )
+            self._sessions.clear()
+            return self._create_session_locked(
+                account=replacement,
+                client_ip=client_ip,
+                user_agent=user_agent,
+                epoch=epoch,
+                monotonic=monotonic,
+            )
+
+    def invalidate_sessions(self) -> None:
+        with self._lock:
+            self._sessions.clear()
 
     def logout(self, session_token: str | None) -> None:
         digest = self._session_digest(session_token or "")
@@ -466,6 +515,66 @@ class AdminSecurity:
         if not self._configured:
             raise AdminNotConfiguredError("administrator authentication is not configured")
 
+    def _require_account(self) -> AdminAccount:
+        self._require_configured()
+        store = self._account_store
+        account = store.current() if store is not None else None
+        if account is None:
+            raise AdminNotConfiguredError("administrator authentication is not configured")
+        return account
+
+    def _verify_password(self, password: str, account: AdminAccount) -> bool:
+        if not self._scrypt_slots.acquire(blocking=False):
+            raise AdminRateLimitError(1)
+        try:
+            return verify_admin_password(password, account.password_verifier)
+        finally:
+            self._scrypt_slots.release()
+
+    def _create_password_verifier(self, password: str) -> str:
+        if not self._scrypt_slots.acquire(blocking=False):
+            raise AdminRateLimitError(1)
+        try:
+            return create_admin_password_verifier(password)
+        finally:
+            self._scrypt_slots.release()
+
+    def _create_session_locked(
+        self,
+        *,
+        account: AdminAccount,
+        client_ip: str,
+        user_agent: str,
+        epoch: float,
+        monotonic: float,
+    ) -> AdminLoginResult:
+        if len(self._sessions) >= _SESSION_LIMIT:
+            oldest = min(self._sessions, key=lambda item: self._sessions[item].last_seen_monotonic)
+            self._sessions.pop(oldest, None)
+        raw_session = secrets.token_urlsafe(32)
+        session_digest = self._session_digest(raw_session)
+        csrf_token = secrets.token_urlsafe(32)
+        self._sessions[session_digest] = AdminSession(
+            session_digest=session_digest,
+            csrf_token=csrf_token,
+            user_agent_digest=self._user_agent_digest(user_agent),
+            created_monotonic=monotonic,
+            last_seen_monotonic=monotonic,
+            absolute_expires_monotonic=monotonic + self.absolute_seconds,
+            created_at_epoch=epoch,
+            client_ip=client_ip,
+            username=account.username,
+            account_revision=account.revision,
+            password_change_required=account.password_change_required,
+        )
+        return AdminLoginResult(
+            session_token=raw_session,
+            csrf_token=csrf_token,
+            expires_at_epoch=epoch + self.absolute_seconds,
+            username=account.username,
+            password_change_required=account.password_change_required,
+        )
+
     @staticmethod
     def _session_digest(raw: str) -> str:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -480,10 +589,10 @@ __all__ = [
     "AdminAuthorizationError",
     "AdminLoginResult",
     "AdminNotConfiguredError",
+    "AdminPasswordChangeRequiredError",
     "AdminRateLimitError",
     "AdminSecurity",
-    "create_admin_key_verifier",
-    "generate_admin_key",
+    "create_admin_password_verifier",
     "generate_totp_secret",
     "resolve_client_ip",
     "totp_code",

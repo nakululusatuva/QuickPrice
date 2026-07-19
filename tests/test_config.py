@@ -121,6 +121,31 @@ def test_admin_trusted_proxies_require_explicit_ip_addresses(monkeypatch) -> Non
         Settings.from_env()
 
 
+def test_admin_account_bootstrap_and_managed_path_are_configurable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    account_file = tmp_path / "admin-account.json"
+    monkeypatch.setenv("QUICKPRICE_ADMIN_USERNAME", " operator ")
+    monkeypatch.setenv("QUICKPRICE_ADMIN_PASSWORD_VERIFIER", " verifier ")
+    monkeypatch.setenv("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED", "false")
+    monkeypatch.setenv("QUICKPRICE_MANAGED_ADMIN_ACCOUNT_FILE", str(account_file))
+    monkeypatch.setenv("QUICKPRICE_ADMIN_KEY_VERIFIER", "legacy-must-not-load")
+
+    settings = Settings.from_env()
+
+    assert settings.admin_username == "operator"
+    assert settings.admin_password_verifier == "verifier"
+    assert settings.admin_password_change_required is False
+    assert settings.managed_admin_account_path == account_file
+    assert not hasattr(settings, "admin_key_verifier")
+
+
+def test_admin_password_change_bootstrap_defaults_to_required(monkeypatch) -> None:
+    monkeypatch.delenv("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED", raising=False)
+
+    assert Settings.from_env().admin_password_change_required is True
+
+
 def test_alpaca_trading_clock_defaults_to_paper_and_is_configurable(monkeypatch) -> None:
     monkeypatch.delenv("QUICKPRICE_ALPACA_TRADING_BASE_URL", raising=False)
     assert Settings.from_env().alpaca_trading_base_url == ("https://paper-api.alpaca.markets/v2")

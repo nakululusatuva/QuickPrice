@@ -18,12 +18,17 @@ settings = Settings(
     database_path=Path("data/load-fixture.db"),
     api_key_hashes=(hash_api_key(API_KEY),),
     rate_limit_enabled=False,
-    admin_key_verifier=os.getenv("QUICKPRICE_ADMIN_KEY_VERIFIER"),
+    admin_username=os.getenv("QUICKPRICE_ADMIN_USERNAME"),
+    admin_password_verifier=os.getenv("QUICKPRICE_ADMIN_PASSWORD_VERIFIER"),
+    admin_password_change_required=(
+        os.getenv("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED", "true").lower() == "true"
+    ),
     admin_totp_secret=os.getenv("QUICKPRICE_ADMIN_TOTP_SECRET"),
     admin_origin=admin_origin,
     admin_require_https=False,
     managed_config_path=Path("data/preview-config/quickprice.env"),
     managed_provider_keys_path=Path("data/preview-config/provider-keys.env"),
+    managed_admin_account_path=Path("data/preview-config/admin-account.json"),
     managed_instruments_path=Path("data/preview-config/instruments.json"),
 )
 service = QuickPriceService(settings)

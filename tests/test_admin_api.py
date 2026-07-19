@@ -5,9 +5,8 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
+from quickprice.admin_account import create_admin_password_verifier
 from quickprice.admin_security import (
-    create_admin_key_verifier,
-    generate_admin_key,
     generate_totp_secret,
     totp_code,
 )
@@ -16,35 +15,49 @@ from quickprice.config import Settings
 from quickprice.service import QuickPriceService
 from tests.helpers import API_KEY, seed_complete
 
+_ADMIN_USERNAME = "admin"
+_ADMIN_PASSWORD = "test-password"
 
-def _admin_client(settings: Settings, tmp_path):
-    raw_admin_key = generate_admin_key()
+
+def _admin_client(
+    settings: Settings,
+    tmp_path,
+    *,
+    password_change_required: bool = False,
+):
     totp_secret = generate_totp_secret()
     configured = replace(
         settings,
-        admin_key_verifier=create_admin_key_verifier(raw_admin_key),
+        admin_username=_ADMIN_USERNAME,
+        admin_password_verifier=create_admin_password_verifier(_ADMIN_PASSWORD),
+        admin_password_change_required=password_change_required,
         admin_totp_secret=totp_secret,
         admin_origin="http://testserver",
         admin_require_https=False,
+        managed_admin_account_path=tmp_path / "managed" / "admin-account.json",
         managed_config_path=tmp_path / "managed" / "quickprice.env",
         managed_provider_keys_path=tmp_path / "managed" / "provider-keys.env",
         managed_instruments_path=tmp_path / "managed" / "instruments.json",
     )
     service = QuickPriceService(configured)
     seed_complete(service)
-    return TestClient(create_app(configured, service)), raw_admin_key, totp_secret
+    return TestClient(create_app(configured, service)), _ADMIN_PASSWORD, totp_secret
 
 
-def _login(client: TestClient, admin_key: str, secret: str) -> str:
+def _login(client: TestClient, admin_password: str, secret: str) -> str:
     response = client.post(
         "/admin-api/session",
         headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
-        json={"admin_key": admin_key, "totp": totp_code(secret)},
+        json={
+            "username": _ADMIN_USERNAME,
+            "password": admin_password,
+            "totp": totp_code(secret),
+        },
     )
     assert response.status_code == 200, response.text
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=strict" in response.headers["set-cookie"]
-    assert admin_key not in response.text
+    assert admin_password not in response.text
     return response.json()["csrf_token"]
 
 
@@ -79,6 +92,91 @@ def test_client_api_key_cannot_authorize_admin_and_admin_session_is_csrf_protect
             json={"name": "Excel"},
         )
         assert sibling.status_code == 401
+
+
+def test_admin_login_rejects_legacy_key_and_forces_bootstrap_account_change(
+    settings, tmp_path
+) -> None:
+    client, password, secret = _admin_client(
+        settings,
+        tmp_path,
+        password_change_required=True,
+    )
+    login_headers = {
+        "Origin": "http://testserver",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    with client:
+        legacy = client.post(
+            "/admin-api/session",
+            headers=login_headers,
+            json={"admin_key": password, "totp": totp_code(secret)},
+        )
+        assert legacy.status_code == 422
+        assert legacy.json()["error"]["code"] == "invalid_request"
+
+        login = client.post(
+            "/admin-api/session",
+            headers=login_headers,
+            json={
+                "username": _ADMIN_USERNAME,
+                "password": password,
+                "totp": totp_code(secret),
+            },
+        )
+        assert login.status_code == 200, login.text
+        login_body = login.json()
+        assert login_body["username"] == _ADMIN_USERNAME
+        assert login_body["password_change_required"] is True
+        csrf = login_body["csrf_token"]
+
+        locked = client.get("/admin-api/api-keys")
+        assert locked.status_code == 403
+        assert locked.json()["error"]["code"] == "admin_password_change_required"
+        account = client.get("/admin-api/account")
+        assert account.status_code == 200
+        assert account.json() == {
+            "username": _ADMIN_USERNAME,
+            "password_change_required": True,
+        }
+
+        unchanged = client.patch(
+            "/admin-api/account",
+            headers=_mutation_headers(csrf),
+            json={
+                "current_password": password,
+                "new_username": "nova",
+                "new_password": password,
+            },
+        )
+        assert unchanged.status_code == 422
+        assert unchanged.json()["error"]["code"] == "invalid_admin_account"
+        assert client.get("/admin-api/api-keys").status_code == 403
+
+        changed = client.patch(
+            "/admin-api/account",
+            headers=_mutation_headers(csrf),
+            json={
+                "current_password": password,
+                "new_username": "nova",
+                "new_password": "new-password",
+            },
+        )
+        assert changed.status_code == 200, changed.text
+        changed_body = changed.json()
+        assert changed_body["username"] == "nova"
+        assert changed_body["password_change_required"] is False
+        assert changed_body["csrf_token"] != csrf
+        assert client.get("/admin-api/api-keys").status_code == 200
+        assert client.get("/v1/quotes/BTC:USDC", headers={"X-API-Key": API_KEY}).status_code == 200
+
+        account_file = tmp_path / "managed" / "admin-account.json"
+        serialized = account_file.read_text(encoding="utf-8")
+        assert password not in serialized
+        assert "new-password" not in serialized
+        events = client.get("/admin-api/audit-events").json()["events"]
+        assert any(item["action"] == "admin.account.change_requested" for item in events)
+        assert any(item["action"] == "admin.account.changed" for item in events)
 
 
 def test_admin_can_create_expire_and_revoke_client_api_keys(settings, tmp_path) -> None:
@@ -210,14 +308,16 @@ def test_runtime_configuration_rejects_non_finite_numbers_without_writing(
 def test_admin_shell_requires_https_and_trusts_only_the_configured_proxy(
     settings, tmp_path
 ) -> None:
-    raw_admin_key = generate_admin_key()
     configured = replace(
         settings,
-        admin_key_verifier=create_admin_key_verifier(raw_admin_key),
+        admin_username=_ADMIN_USERNAME,
+        admin_password_verifier=create_admin_password_verifier(_ADMIN_PASSWORD),
+        admin_password_change_required=False,
         admin_totp_secret=generate_totp_secret(),
         admin_origin="https://quickprice.example",
         admin_require_https=True,
         admin_trusted_proxy_ips=("127.0.0.1",),
+        managed_admin_account_path=tmp_path / "managed" / "admin-account.json",
         managed_config_path=tmp_path / "managed" / "quickprice.env",
         managed_provider_keys_path=tmp_path / "managed" / "provider-keys.env",
         managed_instruments_path=tmp_path / "managed" / "instruments.json",
@@ -244,11 +344,14 @@ def test_admin_shell_requires_https_and_trusts_only_the_configured_proxy(
 def test_admin_shell_ignores_forwarded_https_from_untrusted_clients(settings, tmp_path) -> None:
     configured = replace(
         settings,
-        admin_key_verifier=create_admin_key_verifier(generate_admin_key()),
+        admin_username=_ADMIN_USERNAME,
+        admin_password_verifier=create_admin_password_verifier(_ADMIN_PASSWORD),
+        admin_password_change_required=False,
         admin_totp_secret=generate_totp_secret(),
         admin_origin="https://quickprice.example",
         admin_require_https=True,
         admin_trusted_proxy_ips=("127.0.0.1",),
+        managed_admin_account_path=tmp_path / "managed" / "admin-account.json",
         managed_config_path=tmp_path / "managed" / "quickprice.env",
         managed_provider_keys_path=tmp_path / "managed" / "provider-keys.env",
         managed_instruments_path=tmp_path / "managed" / "instruments.json",

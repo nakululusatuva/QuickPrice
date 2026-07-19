@@ -7,6 +7,8 @@ const STATISTICS_REFRESH_MS = 15_000;
 const state = {
   csrfToken: null,
   sessionExpiresAt: null,
+  username: null,
+  passwordChangeRequired: false,
   activePanel: "api-keys",
   apiKeys: [],
   providerKeys: [],
@@ -32,18 +34,38 @@ const state = {
 const element = (id) => document.getElementById(id);
 const ui = {
   loginView: element("login-view"),
+  credentialChangeView: element("credential-change-view"),
   consoleView: element("console-view"),
   loginForm: element("login-form"),
-  adminKey: element("admin-key"),
+  adminUsername: element("admin-username"),
+  adminPassword: element("admin-password"),
   totp: element("totp"),
   loginSubmit: element("login-submit"),
   loginNotice: element("login-notice"),
+  bootstrapAccountForm: element("bootstrap-account-form"),
+  bootstrapUsername: element("bootstrap-username"),
+  bootstrapCurrentPassword: element("bootstrap-current-password"),
+  bootstrapNewPassword: element("bootstrap-new-password"),
+  bootstrapConfirmPassword: element("bootstrap-confirm-password"),
+  bootstrapAccountSubmit: element("bootstrap-account-submit"),
+  bootstrapAccountNotice: element("bootstrap-account-notice"),
+  bootstrapLogout: element("bootstrap-logout-button"),
   logout: element("logout-button"),
   themeToggle: element("theme-toggle"),
+  accountIdentity: element("account-identity"),
   sessionExpiry: element("session-expiry"),
   tabs: [...document.querySelectorAll(".admin-tab[data-panel]")],
   panels: [...document.querySelectorAll(".admin-panel")],
   globalNotice: element("global-notice"),
+  accountForm: element("account-form"),
+  accountUsername: element("account-username"),
+  accountNewUsername: element("account-new-username"),
+  accountCurrentPassword: element("account-current-password"),
+  accountNewPassword: element("account-new-password"),
+  accountConfirmPassword: element("account-confirm-password"),
+  accountSubmit: element("account-submit"),
+  accountNotice: element("account-notice"),
+  accountPasswordWarning: element("account-password-warning"),
   keyActiveCount: element("key-active-count"),
   keyExpiringCount: element("key-expiring-count"),
   keyInactiveCount: element("key-inactive-count"),
@@ -206,8 +228,12 @@ function errorMessage(body, status) {
 function updateSessionFromResponse(response, body) {
   const csrfToken = metadata(body, "csrf_token");
   const expiresAt = metadata(body, "expires_at") || response.headers.get("X-Admin-Session-Expires");
+  const username = metadata(body, "username");
+  const passwordChangeRequired = metadata(body, "password_change_required");
   if (typeof csrfToken === "string" && csrfToken) state.csrfToken = csrfToken;
   if (typeof expiresAt === "string" && expiresAt) state.sessionExpiresAt = expiresAt;
+  if (typeof username === "string" && username) state.username = username;
+  if (typeof passwordChangeRequired === "boolean") state.passwordChangeRequired = passwordChangeRequired;
 }
 
 async function adminRequest(path, options = {}) {
@@ -248,8 +274,17 @@ async function adminRequest(path, options = {}) {
 function setLoginNotice(message, kind = "neutral") {
   ui.loginNotice.textContent = message;
   ui.loginNotice.className = "notice";
+  ui.loginNotice.setAttribute("role", kind === "error" ? "alert" : "status");
   if (kind === "error") ui.loginNotice.classList.add("is-error");
   if (kind === "success") ui.loginNotice.classList.add("is-success");
+}
+
+function setAccountNotice(target, message, kind = "neutral") {
+  target.textContent = message;
+  target.className = target === ui.bootstrapAccountNotice ? "notice" : "field-help account-notice";
+  target.setAttribute("role", kind === "error" ? "alert" : "status");
+  if (kind === "error") target.classList.add("is-error");
+  if (kind === "success") target.classList.add("is-success");
 }
 
 function showToast(message, kind = "neutral") {
@@ -275,18 +310,45 @@ function initializeTheme() {
 }
 
 function showConsole() {
+  if (state.passwordChangeRequired) {
+    showCredentialChange();
+    return;
+  }
   ui.loginView.hidden = true;
+  ui.credentialChangeView.hidden = true;
   ui.consoleView.hidden = false;
-  ui.adminKey.value = "";
+  ui.adminUsername.value = "";
+  ui.adminPassword.value = "";
   ui.totp.value = "";
+  ui.accountIdentity.textContent = state.username || "Administrator";
+  clearBootstrapAccountInputs();
   startSessionClock();
   selectPanel(state.activePanel, { force: true });
   resumeCatalogJob();
 }
 
+function clearBootstrapAccountInputs() {
+  ui.bootstrapUsername.value = "";
+  ui.bootstrapCurrentPassword.value = "";
+  ui.bootstrapNewPassword.value = "";
+  ui.bootstrapConfirmPassword.value = "";
+  for (const input of ui.bootstrapAccountForm.querySelectorAll("input")) input.removeAttribute("aria-invalid");
+}
+
+function clearAccountInputs({ keepUsername = false } = {}) {
+  if (!keepUsername) ui.accountNewUsername.value = "";
+  ui.accountCurrentPassword.value = "";
+  ui.accountNewPassword.value = "";
+  ui.accountConfirmPassword.value = "";
+  for (const input of ui.accountForm.querySelectorAll("input")) input.removeAttribute("aria-invalid");
+}
+
 function clearSensitiveInputs() {
-  ui.adminKey.value = "";
+  ui.adminUsername.value = "";
+  ui.adminPassword.value = "";
   ui.totp.value = "";
+  clearBootstrapAccountInputs();
+  clearAccountInputs();
   ui.importKeysJson.value = "";
   ui.importInstrumentJson.value = "";
   ui.revealedApiKey.textContent = "";
@@ -297,6 +359,8 @@ function clearSensitiveInputs() {
 function endSession(message = "Verify your administrator credentials to continue.") {
   state.csrfToken = null;
   state.sessionExpiresAt = null;
+  state.username = null;
+  state.passwordChangeRequired = false;
   state.apiKeys = [];
   state.providerKeys = [];
   state.instruments = [];
@@ -309,10 +373,29 @@ function endSession(message = "Verify your administrator credentials to continue
   window.clearInterval(state.sessionTimer);
   window.clearTimeout(state.catalogJobTimer);
   ui.consoleView.hidden = true;
+  ui.credentialChangeView.hidden = true;
   ui.loginView.hidden = false;
   clearSensitiveInputs();
   setLoginNotice(message);
-  window.setTimeout(() => ui.adminKey.focus(), 0);
+  window.setTimeout(() => ui.adminUsername.focus(), 0);
+}
+
+function showCredentialChange() {
+  window.clearInterval(state.statisticsTimer);
+  window.clearTimeout(state.catalogJobTimer);
+  ui.loginView.hidden = true;
+  ui.consoleView.hidden = true;
+  ui.credentialChangeView.hidden = false;
+  clearBootstrapAccountInputs();
+  ui.bootstrapUsername.value = state.username || "";
+  setAccountNotice(
+    ui.bootstrapAccountNotice,
+    "Other administration functions remain locked until this change is complete.",
+  );
+  window.setTimeout(() => {
+    ui.bootstrapUsername.focus();
+    ui.bootstrapUsername.select();
+  }, 0);
 }
 
 function startSessionClock() {
@@ -342,7 +425,8 @@ async function restoreSession() {
       endSession("Verify your administrator credentials to continue.");
       return;
     }
-    showConsole();
+    if (state.passwordChangeRequired) showCredentialChange();
+    else showConsole();
   } catch (error) {
     if (error.status !== 401) setLoginNotice(error.message, "error");
     else endSession("Verify your administrator credentials to continue.");
@@ -351,7 +435,8 @@ async function restoreSession() {
 
 async function login(event) {
   event.preventDefault();
-  const adminKey = ui.adminKey.value;
+  const username = ui.adminUsername.value;
+  const password = ui.adminPassword.value;
   const totp = ui.totp.value.replace(/\s+/g, "");
   if (!/^\d{6}$/.test(totp)) {
     setLoginNotice("Enter the current six-digit authenticator code.", "error");
@@ -365,16 +450,19 @@ async function login(event) {
       method: "POST",
       csrf: false,
       handleUnauthorized: false,
-      body: { admin_key: adminKey, totp },
+      body: { username, password, totp },
     });
     if (!state.csrfToken) throw new Error("The server did not issue a CSRF token.");
     setLoginNotice("Verification complete.", "success");
-    showConsole();
+    ui.adminPassword.value = "";
+    ui.totp.value = "";
+    if (state.passwordChangeRequired) showCredentialChange();
+    else showConsole();
   } catch (error) {
-    ui.adminKey.value = "";
+    ui.adminPassword.value = "";
     ui.totp.value = "";
     setLoginNotice(error.status === 401 ? "Administrator verification failed." : error.message, "error");
-    ui.adminKey.focus();
+    ui.adminPassword.focus();
   } finally {
     ui.loginSubmit.disabled = false;
   }
@@ -382,13 +470,149 @@ async function login(event) {
 
 async function logout() {
   ui.logout.disabled = true;
+  ui.bootstrapLogout.disabled = true;
   try {
     await adminRequest("/session", { method: "DELETE" });
   } catch (error) {
     if (error.status !== 401) showToast(error.message, "error");
   } finally {
     ui.logout.disabled = false;
+    ui.bootstrapLogout.disabled = false;
     endSession("Signed out. Verify again to reopen the administration console.");
+  }
+}
+
+function accountInputs(blocking) {
+  return blocking
+    ? {
+        username: ui.bootstrapUsername,
+        currentPassword: ui.bootstrapCurrentPassword,
+        newPassword: ui.bootstrapNewPassword,
+        confirmPassword: ui.bootstrapConfirmPassword,
+        submit: ui.bootstrapAccountSubmit,
+        notice: ui.bootstrapAccountNotice,
+      }
+    : {
+        username: ui.accountNewUsername,
+        currentPassword: ui.accountCurrentPassword,
+        newPassword: ui.accountNewPassword,
+        confirmPassword: ui.accountConfirmPassword,
+        submit: ui.accountSubmit,
+        notice: ui.accountNotice,
+      };
+}
+
+function validateAccountInputs(inputs) {
+  for (const input of [inputs.username, inputs.currentPassword, inputs.newPassword, inputs.confirmPassword]) {
+    input.removeAttribute("aria-invalid");
+  }
+  const username = inputs.username.value.trim();
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(username)) {
+    inputs.username.setAttribute("aria-invalid", "true");
+    inputs.username.focus();
+    return "Use 1 to 64 letters, numbers, periods, underscores, or hyphens for the username.";
+  }
+  if (inputs.currentPassword.value.length < 8 || inputs.currentPassword.value.length > 256) {
+    inputs.currentPassword.setAttribute("aria-invalid", "true");
+    inputs.currentPassword.focus();
+    return "Enter the current password.";
+  }
+  if (inputs.newPassword.value.length < 8 || inputs.newPassword.value.length > 256) {
+    inputs.newPassword.setAttribute("aria-invalid", "true");
+    inputs.newPassword.focus();
+    return "The new password must contain 8 to 256 characters.";
+  }
+  if (inputs.newPassword.value === inputs.currentPassword.value) {
+    inputs.newPassword.setAttribute("aria-invalid", "true");
+    inputs.newPassword.focus();
+    return "The new password must differ from the current password.";
+  }
+  if (inputs.confirmPassword.value !== inputs.newPassword.value) {
+    inputs.confirmPassword.setAttribute("aria-invalid", "true");
+    inputs.confirmPassword.focus();
+    return "The new passwords do not match.";
+  }
+  return null;
+}
+
+async function changeAccount(event, { blocking = false } = {}) {
+  event.preventDefault();
+  const inputs = accountInputs(blocking);
+  const validationError = validateAccountInputs(inputs);
+  if (validationError) {
+    setAccountNotice(inputs.notice, validationError, "error");
+    return;
+  }
+  inputs.submit.disabled = true;
+  setAccountNotice(inputs.notice, "Updating the administrator account...");
+  try {
+    const previousCsrfToken = state.csrfToken;
+    const body = await adminRequest("/account", {
+      method: "PATCH",
+      handleUnauthorized: false,
+      body: {
+        current_password: inputs.currentPassword.value,
+        new_username: inputs.username.value.trim(),
+        new_password: inputs.newPassword.value,
+      },
+    });
+    if (!state.csrfToken || state.csrfToken === previousCsrfToken) {
+      throw new Error("The server did not rotate the administrator session.");
+    }
+    state.passwordChangeRequired = metadata(body, "password_change_required", false) === true;
+    if (state.passwordChangeRequired) throw new Error("The server still requires a password change.");
+    if (blocking) {
+      clearBootstrapAccountInputs();
+      state.activePanel = "account";
+      showConsole();
+      showToast("Administrator credentials replaced.", "success");
+    } else {
+      clearAccountInputs({ keepUsername: true });
+      ui.accountNewUsername.value = state.username || inputs.username.value.trim();
+      ui.accountUsername.textContent = state.username || inputs.username.value.trim();
+      ui.accountIdentity.textContent = state.username || inputs.username.value.trim();
+      setAccountNotice(ui.accountNotice, "Administrator credentials updated.", "success");
+    }
+  } catch (error) {
+    inputs.currentPassword.value = "";
+    inputs.newPassword.value = "";
+    inputs.confirmPassword.value = "";
+    setAccountNotice(
+      inputs.notice,
+      error.status === 401 ? "The current password was not accepted." : error.message,
+      "error",
+    );
+    inputs.currentPassword.focus();
+  } finally {
+    inputs.submit.disabled = false;
+  }
+}
+
+async function loadAccount() {
+  try {
+    const body = await adminRequest("/account");
+    const username = metadata(body, "username", state.username);
+    const passwordChangeRequired = metadata(
+      body,
+      "password_change_required",
+      state.passwordChangeRequired,
+    );
+    if (typeof username === "string" && username) state.username = username;
+    state.passwordChangeRequired = passwordChangeRequired === true;
+    if (state.passwordChangeRequired) {
+      showCredentialChange();
+      return;
+    }
+    ui.accountUsername.textContent = state.username || "-";
+    ui.accountNewUsername.value = state.username || "";
+    ui.accountIdentity.textContent = state.username || "Administrator";
+    ui.accountPasswordWarning.hidden = true;
+    setAccountNotice(
+      ui.accountNotice,
+      "Changing the password invalidates other administrator sessions.",
+    );
+  } catch (error) {
+    showToast(error.message, "error");
   }
 }
 
@@ -397,6 +621,7 @@ function selectPanel(name, { force = false } = {}) {
   if (state.activePanel === "provider-keys" && name !== "provider-keys") {
     for (const input of document.querySelectorAll('#provider-keys-body input[type="password"]')) input.value = "";
   }
+  if (state.activePanel === "account" && name !== "account") clearAccountInputs();
   state.activePanel = name;
   for (const tab of ui.tabs) {
     const active = tab.dataset.panel === name;
@@ -407,6 +632,7 @@ function selectPanel(name, { force = false } = {}) {
   for (const panel of ui.panels) panel.hidden = panel.id !== `${name}-panel`;
   window.clearInterval(state.statisticsTimer);
   const loaders = {
+    account: loadAccount,
     "api-keys": loadApiKeys,
     "provider-keys": loadProviderKeys,
     instruments: loadInstruments,
@@ -2165,6 +2391,9 @@ function finishConfirmation(accepted) {
 
 function bindEvents() {
   ui.loginForm.addEventListener("submit", login);
+  ui.bootstrapAccountForm.addEventListener("submit", (event) => changeAccount(event, { blocking: true }));
+  ui.accountForm.addEventListener("submit", (event) => changeAccount(event));
+  ui.bootstrapLogout.addEventListener("click", logout);
   ui.logout.addEventListener("click", logout);
   ui.themeToggle.addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
   for (const [index, tab] of ui.tabs.entries()) {

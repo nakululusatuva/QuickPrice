@@ -169,7 +169,9 @@ class Settings:
     background_enabled: bool = True
     database_path: Path = field(default_factory=lambda: Path("data/quickprice.db"))
     api_key_hashes: tuple[str, ...] = ()
-    admin_key_verifier: str | None = None
+    admin_username: str | None = None
+    admin_password_verifier: str | None = None
+    admin_password_change_required: bool = True
     admin_totp_secret: str | None = None
     admin_origin: str | None = None
     admin_require_https: bool = True
@@ -179,6 +181,9 @@ class Settings:
     managed_config_path: Path = field(default_factory=lambda: Path("data/config/quickprice.env"))
     managed_provider_keys_path: Path = field(
         default_factory=lambda: Path("data/config/provider-keys.env")
+    )
+    managed_admin_account_path: Path = field(
+        default_factory=lambda: Path("data/config/admin-account.json")
     )
     managed_instruments_path: Path = field(
         default_factory=lambda: Path("data/config/instruments.json")
@@ -259,7 +264,11 @@ class Settings:
             background_enabled=_bool("QUICKPRICE_BACKGROUND_ENABLED", True),
             database_path=Path(os.getenv("QUICKPRICE_DATABASE_PATH", "data/quickprice.db")),
             api_key_hashes=hashes,
-            admin_key_verifier=(os.getenv("QUICKPRICE_ADMIN_KEY_VERIFIER", "").strip() or None),
+            admin_username=(os.getenv("QUICKPRICE_ADMIN_USERNAME", "").strip() or None),
+            admin_password_verifier=(
+                os.getenv("QUICKPRICE_ADMIN_PASSWORD_VERIFIER", "").strip() or None
+            ),
+            admin_password_change_required=_bool("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED", True),
             admin_totp_secret=(os.getenv("QUICKPRICE_ADMIN_TOTP_SECRET", "").strip() or None),
             admin_origin=(os.getenv("QUICKPRICE_ADMIN_ORIGIN", "").strip() or None),
             admin_require_https=_bool("QUICKPRICE_ADMIN_REQUIRE_HTTPS", True),
@@ -283,6 +292,12 @@ class Settings:
                         "QUICKPRICE_PROVIDER_KEYS_FILE",
                         "data/config/provider-keys.env",
                     ),
+                )
+            ),
+            managed_admin_account_path=Path(
+                os.getenv(
+                    "QUICKPRICE_MANAGED_ADMIN_ACCOUNT_FILE",
+                    "data/config/admin-account.json",
                 )
             ),
             managed_instruments_path=Path(

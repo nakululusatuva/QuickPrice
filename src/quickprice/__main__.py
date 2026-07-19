@@ -10,11 +10,8 @@ from urllib.parse import quote, urlencode, urlsplit
 
 import uvicorn
 
-from .admin_security import (
-    create_admin_key_verifier,
-    generate_admin_key,
-    generate_totp_secret,
-)
+from .admin_account import create_admin_password_verifier, validate_admin_username
+from .admin_security import generate_totp_secret
 from .auth import hash_api_key
 from .config import Settings
 
@@ -29,10 +26,15 @@ def _parser() -> argparse.ArgumentParser:
     key.add_argument("--generate", action="store_true", help="generate a new high-entropy key")
     admin = subparsers.add_parser(
         "admin-credentials",
-        help="generate the local-only administrator key and TOTP enrollment values",
+        help="generate administrator password bootstrap and TOTP enrollment values",
     )
     admin.add_argument("--origin", required=True, help="exact public origin, including scheme")
-    admin.add_argument("--account", default="admin", help="TOTP account label")
+    admin.add_argument("--username", default="admin", help="administrator username")
+    password = subparsers.add_parser(
+        "admin-password-verifier",
+        help="hash an administrator password without replacing TOTP enrollment",
+    )
+    password.add_argument("--username", default="admin", help="administrator username")
     plugins = subparsers.add_parser("plugins", help="inspect trusted instrument plugins")
     plugin_commands = plugins.add_subparsers(dest="plugin_command", required=True)
     plugin_commands.add_parser("list", help="list enabled plugins and their instruments")
@@ -47,6 +49,23 @@ def main() -> None:
         if args.generate:
             print(f"API key (save it now): {raw_key}")
         print(f"Configured hash: {hash_api_key(raw_key)}")
+        return
+    if args.command == "admin-password-verifier":
+        try:
+            username = validate_admin_username(args.username)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        password = getpass.getpass("Administrator password: ")
+        confirmation = getpass.getpass("Confirm administrator password: ")
+        if not secrets.compare_digest(password, confirmation):
+            raise SystemExit("administrator passwords do not match")
+        try:
+            verifier = create_admin_password_verifier(password)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"QUICKPRICE_ADMIN_USERNAME={username}")
+        print(f"QUICKPRICE_ADMIN_PASSWORD_VERIFIER={verifier}")
+        print("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED=true")
         return
     if args.command == "admin-credentials":
         origin = args.origin.rstrip("/")
@@ -70,10 +89,14 @@ def main() -> None:
             or parsed_origin.fragment
         ):
             raise SystemExit("administrator origin must use HTTPS outside local development")
-        raw_key = generate_admin_key()
+        try:
+            username = validate_admin_username(args.username)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        temporary_password = secrets.token_urlsafe(32)
         totp_secret = generate_totp_secret()
-        verifier = create_admin_key_verifier(raw_key)
-        label = quote(f"QuickPrice:{args.account}")
+        verifier = create_admin_password_verifier(temporary_password)
+        label = quote(f"QuickPrice:{username}")
         query = urlencode(
             {
                 "secret": totp_secret,
@@ -83,10 +106,13 @@ def main() -> None:
                 "period": "30",
             }
         )
-        print(f"Administrator key (save it now): {raw_key}")
+        print(f"Administrator username: {username}")
+        print(f"Temporary administrator password (save it now): {temporary_password}")
         print(f"TOTP secret (enroll it now): {totp_secret}")
         print(f"TOTP URI: otpauth://totp/{label}?{query}")
-        print(f"QUICKPRICE_ADMIN_KEY_VERIFIER={verifier}")
+        print(f"QUICKPRICE_ADMIN_USERNAME={username}")
+        print(f"QUICKPRICE_ADMIN_PASSWORD_VERIFIER={verifier}")
+        print("QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED=true")
         print(f"QUICKPRICE_ADMIN_TOTP_SECRET={totp_secret}")
         print(f"QUICKPRICE_ADMIN_ORIGIN={origin}")
         return

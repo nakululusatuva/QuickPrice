@@ -26,12 +26,16 @@
       </div>
       <p class="eyebrow">Restricted control plane</p>
       <h1 id="login-title">Administrator verification</h1>
-      <p class="login-intro">Enter the dedicated administrator key and a current authenticator code. API keys cannot open this console.</p>
+      <p class="login-intro">Enter the administrator account credentials and a current authenticator code. API keys cannot open this console.</p>
 
       <form id="login-form" class="login-form" method="post" action="/admin" autocomplete="off">
         <label>
-          <span>Administrator key</span>
-          <input id="admin-key" type="password" autocomplete="off" spellcheck="false" required>
+          <span>Username</span>
+          <input id="admin-username" type="text" autocomplete="username" pattern="[A-Za-z0-9._-]+" maxlength="64" spellcheck="false" required>
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="admin-password" type="password" autocomplete="current-password" minlength="8" maxlength="256" required>
         </label>
         <label>
           <span>Authenticator code</span>
@@ -49,6 +53,46 @@
     </section>
   </main>
 
+  <main id="credential-change-view" class="login-shell" hidden>
+    <section class="login-card credential-change-card" aria-labelledby="credential-change-title">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">QP</span>
+        <div>
+          <strong>QuickPrice</strong>
+          <span>Administration console</span>
+        </div>
+      </div>
+      <aside class="warning-banner bootstrap-warning" aria-labelledby="credential-change-title">
+        <strong>Bootstrap credentials must be replaced</strong>
+        <p>This first sign-in used the initial administrator account. Choose a private username and password before opening the control plane.</p>
+      </aside>
+      <h1 id="credential-change-title">Secure the administrator account</h1>
+      <p class="login-intro">The current authenticator enrollment remains active. This step changes only the username and password.</p>
+      <form id="bootstrap-account-form" class="login-form" method="post" action="/admin" autocomplete="off">
+        <label>
+          <span>New username</span>
+          <input id="bootstrap-username" type="text" autocomplete="username" pattern="[A-Za-z0-9._-]+" maxlength="64" spellcheck="false" required>
+        </label>
+        <label>
+          <span>Current password</span>
+          <input id="bootstrap-current-password" type="password" autocomplete="current-password" minlength="8" maxlength="256" required>
+        </label>
+        <label>
+          <span>New password</span>
+          <input id="bootstrap-new-password" type="password" autocomplete="new-password" minlength="8" maxlength="256" aria-describedby="bootstrap-password-help" required>
+          <small id="bootstrap-password-help" class="field-help">Use 8 to 256 characters and choose a value different from the current password. No other composition rule is enforced.</small>
+        </label>
+        <label>
+          <span>Confirm new password</span>
+          <input id="bootstrap-confirm-password" type="password" autocomplete="new-password" minlength="8" maxlength="256" required>
+        </label>
+        <button id="bootstrap-account-submit" class="button button-primary button-wide" type="submit">Replace bootstrap credentials</button>
+      </form>
+      <p id="bootstrap-account-notice" class="notice" role="status" aria-live="polite">Other administration functions remain locked until this change is complete.</p>
+      <button id="bootstrap-logout-button" class="button button-quiet button-wide bootstrap-signout" type="button">Sign out</button>
+    </section>
+  </main>
+
   <div id="console-view" class="console-shell" hidden>
     <header class="app-header">
       <div class="brand" aria-label="QuickPrice Administration">
@@ -60,6 +104,7 @@
       </div>
       <div class="header-context">
         <span class="environment-badge">Private control plane</span>
+        <span id="account-identity" class="account-identity">Administrator</span>
         <span id="session-expiry" class="session-expiry">Session active</span>
         <button id="theme-toggle" class="button button-quiet" type="button">Dark mode</button>
         <button id="logout-button" class="button button-secondary" type="button">Sign out</button>
@@ -70,6 +115,9 @@
       <aside class="sidebar" aria-label="Administration sections">
         <p class="sidebar-label">Management</p>
         <nav class="admin-tabs" role="tablist" aria-orientation="vertical">
+          <button id="account-tab" class="admin-tab" type="button" role="tab" data-panel="account" aria-selected="false" aria-controls="account-panel" tabindex="-1">
+            <span class="tab-icon" aria-hidden="true">AC</span><span>Account</span>
+          </button>
           <button id="api-keys-tab" class="admin-tab is-active" type="button" role="tab" data-panel="api-keys" aria-selected="true" aria-controls="api-keys-panel">
             <span class="tab-icon" aria-hidden="true">AK</span><span>API keys</span>
           </button>
@@ -94,6 +142,49 @@
 
       <main id="main-content" class="admin-main">
         <div id="global-notice" class="toast" role="status" aria-live="polite" hidden></div>
+
+        <section id="account-panel" class="admin-panel" role="tabpanel" aria-labelledby="account-tab" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Administrator identity</p>
+              <h1>Account</h1>
+              <p>Change the single administrator username and password without replacing the current authenticator enrollment.</p>
+            </div>
+          </div>
+          <aside id="account-password-warning" class="warning-banner" hidden>
+            <strong>Password change required</strong>
+            <p>The bootstrap credentials must be replaced before other administration functions are available.</p>
+          </aside>
+          <form id="account-form" class="settings-group account-form" method="post" action="/admin" autocomplete="off">
+            <div class="account-summary">
+              <span>Signed in account</span>
+              <strong id="account-username">-</strong>
+            </div>
+            <div class="setting-fields">
+              <label class="setting-field">
+                <span>New username</span>
+                <input id="account-new-username" type="text" autocomplete="username" pattern="[A-Za-z0-9._-]+" maxlength="64" spellcheck="false" required>
+              </label>
+              <label class="setting-field">
+                <span>Current password</span>
+                <input id="account-current-password" type="password" autocomplete="current-password" minlength="8" maxlength="256" required>
+              </label>
+              <label class="setting-field">
+                <span>New password</span>
+                <input id="account-new-password" type="password" autocomplete="new-password" minlength="8" maxlength="256" aria-describedby="account-password-help" required>
+                <small id="account-password-help" class="field-help">Use 8 to 256 characters and choose a value different from the current password. No other composition rule is enforced.</small>
+              </label>
+              <label class="setting-field">
+                <span>Confirm new password</span>
+                <input id="account-confirm-password" type="password" autocomplete="new-password" minlength="8" maxlength="256" required>
+              </label>
+            </div>
+            <div class="account-actions">
+              <p id="account-notice" class="field-help" role="status" aria-live="polite">Changing the password invalidates other administrator sessions.</p>
+              <button id="account-submit" class="button button-primary" type="submit">Update account</button>
+            </div>
+          </form>
+        </section>
 
         <section id="api-keys-panel" class="admin-panel" role="tabpanel" aria-labelledby="api-keys-tab">
           <div class="page-heading">

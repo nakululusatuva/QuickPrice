@@ -43,6 +43,7 @@ def test_admin_shell_is_separate_and_csp_compatible() -> None:
     assert parser.inline_scripts == 0
     assert parser.inline_styles == 0
     assert parser.panel_ids == {
+        "account-panel",
         "api-keys-panel",
         "provider-keys-panel",
         "instruments-panel",
@@ -53,13 +54,24 @@ def test_admin_shell_is_separate_and_csp_compatible() -> None:
     assert 'href="/admin/assets/admin.css"' in source
     assert 'src="/admin/assets/admin.js"' in source
     assert "Administrator verification" in source
-    assert 'id="admin-key" type="password" autocomplete="off"' in source
-    assert 'id="admin-key" name=' not in source
+    assert (
+        'id="admin-username" type="text" autocomplete="username" '
+        'pattern="[A-Za-z0-9._-]+" maxlength="64"' in source
+    )
+    assert (
+        'id="admin-password" type="password" autocomplete="current-password" '
+        'minlength="8" maxlength="256"' in source
+    )
+    assert 'id="admin-key"' not in source
+    assert 'id="admin-username" name=' not in source
+    assert 'id="admin-password" name=' not in source
     assert 'id="totp" name=' not in source
     assert "Write-only secret handling" in source
     assert "Trusted definitions only" in source
     for form_id in (
         "login-form",
+        "bootstrap-account-form",
+        "account-form",
         "configuration-form",
         "create-key-form",
         "import-keys-form",
@@ -76,11 +88,22 @@ def test_admin_client_does_not_persist_credentials_or_render_untrusted_html() ->
     assert "sessionStorage" not in source
     assert "localStorage.setItem(THEME_KEY" in source
     assert 'localStorage.setItem("admin' not in source
+    assert "admin_key" not in source
+    assert "adminKey" not in source
     assert ".innerHTML" not in source
     assert "insertAdjacentHTML" not in source
     assert 'credentials: "same-origin"' in source
     assert 'headers["X-CSRF-Token"] = state.csrfToken' in source
     assert "state.csrfToken = null" in source
+    assert 'ui.adminPassword.value = ""' in source
+    assert 'ui.bootstrapCurrentPassword.value = ""' in source
+    assert 'ui.bootstrapNewPassword.value = ""' in source
+    assert 'ui.accountCurrentPassword.value = ""' in source
+    assert 'ui.accountNewPassword.value = ""' in source
+    assert "body: { username, password, totp }" in source
+    assert "current_password: inputs.currentPassword.value" in source
+    assert "new_username: inputs.username.value.trim()" in source
+    assert "new_password: inputs.newPassword.value" in source
     assert 'ui.revealedApiKey.textContent = ""' in source
     assert 'input.autocomplete = "off"' in source
     assert "rawKeyFromResponse" in source
@@ -89,6 +112,41 @@ def test_admin_client_does_not_persist_credentials_or_render_untrusted_html() ->
     assert 'mode.value === "permanent" ? null' in source
     assert "CATALOG_JOB_KEY" in source
     assert "adminRequest(path, { csrf: true })" in source
+
+
+def test_admin_account_ui_blocks_bootstrap_credentials_and_supports_later_changes() -> None:
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+    javascript = ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="credential-change-view" class="login-shell" hidden' in html
+    assert "Bootstrap credentials must be replaced" in html
+    assert 'id="bootstrap-account-form"' in html
+    assert (
+        'id="bootstrap-username" type="text" autocomplete="username" '
+        'pattern="[A-Za-z0-9._-]+" maxlength="64"' in html
+    )
+    assert (
+        'id="bootstrap-current-password" type="password" '
+        'autocomplete="current-password" minlength="8" maxlength="256"' in html
+    )
+    assert (
+        'id="bootstrap-new-password" type="password" autocomplete="new-password" '
+        'minlength="8" maxlength="256"' in html
+    )
+    assert "No other composition rule is enforced." in html
+    assert 'id="bootstrap-account-notice" class="notice" role="status"' in html
+    assert 'id="account-tab"' in html
+    assert 'id="account-panel"' in html
+    assert 'id="account-form"' in html
+    assert 'id="account-username"' in html
+    assert 'id="account-password-help"' in html
+    assert '"/account"' in javascript
+    assert "state.passwordChangeRequired" in javascript
+    assert "function showCredentialChange()" in javascript
+    assert "if (state.passwordChangeRequired) showCredentialChange();" in javascript
+    assert 'state.activePanel = "account"' in javascript
+    assert "ui.credentialChangeView.hidden = false" in javascript
+    assert "state.csrfToken === previousCsrfToken" in javascript
 
 
 def test_admin_api_key_forms_make_permanent_validity_explicit() -> None:
@@ -104,6 +162,7 @@ def test_admin_api_key_forms_make_permanent_validity_explicit() -> None:
     "path",
     [
         '"/session"',
+        '"/account"',
         '"/api-keys"',
         '"/api-keys/import"',
         '"/configuration"',
@@ -132,6 +191,10 @@ def test_admin_styles_cover_responsive_and_accessible_states() -> None:
     assert ":focus-visible" in source
     assert ".status-pill.is-negative" in source
     assert ".security-banner" in source
+    assert ".credential-change-card" in source
+    assert ".account-form" in source
+    assert ".account-notice.is-error" in source
+    assert 'input[aria-invalid="true"]' in source
     assert ".catalog-status" in source
     assert ".provider-route-grid" in source
     assert ".capability-chip" in source
@@ -406,6 +469,53 @@ const flexible = treasurySeriesConstraint("treasury_proxy_minus_expense", "DGS6M
 if (flexible.legacy || flexible.series !== "DGS6MO") throw new Error("generic strategy lost its maturity");
 const unrelated = treasurySeriesConstraint("staking_provider_metric", "");
 if (unrelated.legacy || unrelated.series !== "") throw new Error("unrelated strategy was changed");
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-e", helper + assertions],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_account_client_validation_enforces_only_length_and_safe_username() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    helper = source[
+        source.index("function validateAccountInputs") : source.index(
+            "\n\nasync function changeAccount"
+        )
+    ]
+    assertions = r"""
+function field(value) {
+  return {
+    value,
+    invalid: false,
+    focused: false,
+    removeAttribute() { this.invalid = false; },
+    setAttribute(name, state) { if (name === "aria-invalid") this.invalid = state === "true"; },
+    focus() { this.focused = true; },
+  };
+}
+function inputs(username, currentPassword, newPassword, confirmation) {
+  return {
+    username: field(username),
+    currentPassword: field(currentPassword),
+    newPassword: field(newPassword),
+    confirmPassword: field(confirmation),
+  };
+}
+const simple = inputs("nova", "current1", "........", "........");
+if (validateAccountInputs(simple) !== null) throw new Error("simple eight-character password rejected");
+const short = inputs("nova", "current1", "1234567", "1234567");
+if (!validateAccountInputs(short).includes("8 to 256")) throw new Error("short password accepted");
+if (!short.newPassword.invalid || !short.newPassword.focused) throw new Error("short password was not identified");
+const unsafe = inputs("nova user", "current1", "abcdefgh", "abcdefgh");
+if (!validateAccountInputs(unsafe).includes("letters, numbers")) throw new Error("unsafe username accepted");
+const mismatch = inputs("nova", "current1", "abcdefgh", "abcdefgi");
+if (!validateAccountInputs(mismatch).includes("do not match")) throw new Error("mismatch accepted");
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-e", helper + assertions],

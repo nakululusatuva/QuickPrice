@@ -220,6 +220,10 @@ textarea:focus-visible,
   content: "";
 }
 
+.credential-change-card { width: min(100%, 540px); }
+.bootstrap-warning { margin-top: -8px; }
+.bootstrap-signout { margin-top: 12px; }
+
 .login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 38px; }
 .login-brand strong, .login-brand span { display: block; }
 .login-brand strong { font-size: 17px; }
@@ -265,6 +269,8 @@ input, select, textarea {
   color: var(--text);
 }
 
+input[aria-invalid="true"] { border-color: var(--negative); box-shadow: 0 0 0 3px color-mix(in srgb, var(--negative) 14%, transparent); }
+
 textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.5; }
 
 .notice {
@@ -307,6 +313,7 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas
 
 .header-context { display: flex; align-items: center; gap: 10px; }
 .environment-badge { padding: 6px 9px; border-radius: 999px; background: var(--positive-soft); color: var(--positive); font-size: 10px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.account-identity { max-width: 180px; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
 .session-expiry { color: var(--text-muted); font-size: 12px; }
 
 .workspace { display: grid; min-height: calc(100vh - 70px); grid-template-columns: 230px minmax(0, 1fr); }
@@ -430,6 +437,14 @@ tbody tr:hover { background: color-mix(in srgb, var(--surface-muted) 46%, transp
 .settings-group { padding: 20px; overflow: visible; }
 .settings-group h2 { margin-bottom: 4px; }
 .settings-group > p { margin-bottom: 18px; color: var(--text-muted); font-size: 12px; }
+.account-form { width: min(100%, 820px); }
+.account-summary { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: -20px -20px 20px; padding: 16px 20px; border-bottom: 1px solid var(--border); background: var(--surface-muted); }
+.account-summary span { color: var(--text-muted); font-size: 11px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.account-summary strong { overflow-wrap: anywhere; }
+.account-actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 20px; }
+.account-notice { margin: 0; }
+.account-notice.is-error { color: var(--negative); }
+.account-notice.is-success { color: var(--positive); }
 .setting-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .setting-field { display: grid; align-content: start; }
 .setting-field.is-wide { grid-column: 1 / -1; }
@@ -492,7 +507,7 @@ dialog::backdrop { background: rgb(4 10 20 / 62%); backdrop-filter: blur(3px); }
   .sidebar-footer { justify-content: center; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .catalog-status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .session-expiry, .environment-badge { display: none; }
+  .session-expiry, .environment-badge, .account-identity { display: none; }
 }
 
 @media (max-width: 700px) {
@@ -513,6 +528,8 @@ dialog::backdrop { background: rgb(4 10 20 / 62%); backdrop-filter: blur(3px); }
   .heading-actions .button { flex: 1; }
   .summary-strip, .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .setting-fields { grid-template-columns: 1fr; }
+  .account-actions { align-items: stretch; flex-direction: column; }
+  .account-actions .button { width: 100%; }
   .setting-field.is-wide { grid-column: auto; }
   .provider-route-grid, .provider-search { grid-template-columns: 1fr; }
   .catalog-actions { align-items: stretch; flex-direction: column; }
