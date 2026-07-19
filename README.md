@@ -457,13 +457,45 @@ terminal on the host or another trusted workstation:
 quickprice admin-credentials --origin https://quickprice.example.com
 ```
 
-The command generates a 256-bit administrator key, an scrypt verifier, a
-160-bit TOTP seed, and an `otpauth://` enrollment URI. Save the raw key in a
-password manager, enroll the TOTP seed immediately, and place only the emitted
-`QUICKPRICE_ADMIN_*` configuration values in the root-controlled
+The username defaults to `admin`; use `--username NAME` to select another valid
+single-account name. The command generates a unique temporary password, its
+scrypt verifier, a 160-bit TOTP seed, and an `otpauth://` enrollment URI. Save
+the temporary password in a password manager, enroll the TOTP seed immediately,
+and place only the five emitted `QUICKPRICE_ADMIN_*` assignments in the
+root-controlled
 `/etc/quickprice/admin-auth.env`; [admin-auth.env.example](admin-auth.env.example)
-documents the boundary without containing usable credentials. The web UI
-cannot read or change this file.
+documents the boundary without containing usable credentials. The plaintext
+password is displayed once and is never an argv value or environment setting.
+
+On first start, QuickPrice creates
+`/var/lib/quickprice/config/admin-account.json` with mode 0600 on POSIX. Windows
+uses a protected owner-only DACL and rejects inherited or additional access
+entries. QuickPrice imports the username, verifier, and
+`password_change_required=true` bootstrap state. The temporary password can
+establish a session only for choosing a different password; other privileged
+operations remain blocked until the change succeeds. The account file then
+becomes the authoritative username and verifier. Remove
+`QUICKPRICE_ADMIN_USERNAME`, `QUICKPRICE_ADMIN_PASSWORD_VERIFIER`, and
+`QUICKPRICE_ADMIN_PASSWORD_CHANGE_REQUIRED` from `admin-auth.env` and restart
+after the first password change. Keep the TOTP seed and exact origin in the
+root-controlled file. The web UI cannot read either verifier.
+
+`QUICKPRICE_ADMIN_KEY_VERIFIER` is no longer loaded. Before upgrading an
+installation that used an administrator key, preserve its existing
+`QUICKPRICE_ADMIN_TOTP_SECRET` and run:
+
+```bash
+quickprice admin-password-verifier --username admin
+```
+
+The command prompts twice without placing the password in argv and emits only
+the username, scrypt verifier, and forced-change bootstrap flag. Replace the
+old administrator-key assignment with those values, keep the existing TOTP
+secret and origin, and expect all old process-local sessions to end on restart.
+The legacy verifier is not a password verifier and must not be copied into the
+new setting. Quote API keys and their validity metadata are unaffected. A
+rollback requires restoring the old administrator-key environment separately;
+older versions do not understand the managed account file.
 
 Successful verification creates an opaque process-local session. The browser
 receives only a `Secure`, `HttpOnly`, `SameSite=Strict`, path-root cookie and an
@@ -508,7 +540,7 @@ and restart-bound. Instrument catalog activation is an in-process atomic
 generation switch after validation and shadow warm-up.
 For a public deployment, place an identity-aware proxy, mTLS, VPN, or strict IP
 policy in front of `/admin` as a second boundary. TOTP is strong protection
-against a stolen administrator key but is not phishing-resistant.
+against a stolen administrator password but is not phishing-resistant.
 
 ## Managed instrument catalog
 
@@ -610,6 +642,7 @@ The supplied Linux service layout is:
 /etc/quickprice/admin-auth.env          root-controlled administrator factors
 /var/lib/quickprice/config/quickprice.env       web-managed allowlisted settings
 /var/lib/quickprice/config/provider-keys.env    web-managed provider credentials
+/var/lib/quickprice/config/admin-account.json   managed administrator account
 /var/lib/quickprice/config/instruments.json     revisioned managed catalog
 /var/lib/quickprice                     SQLite database, configuration, backups
 /etc/systemd/system/quickprice.service  application service unit

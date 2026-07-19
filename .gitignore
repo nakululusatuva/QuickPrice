@@ -11,6 +11,8 @@ build/
 *.egg-info/
 .env
 admin-auth.env
+admin-account.json
+admin-account.*.json
 quickprice.env
 provider-keys.env
 provider-keys.*.env

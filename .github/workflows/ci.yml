@@ -125,6 +125,7 @@ jobs:
           git check-ignore --quiet provider-keys.env
           git check-ignore --quiet provider-keys.production.env
           git check-ignore --quiet admin-auth.env
+          git check-ignore --quiet admin-account.json
           git check-ignore --quiet quickprice.env
           test -f provider-keys.env.example
           test -f admin-auth.env.example
