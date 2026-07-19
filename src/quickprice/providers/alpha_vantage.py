@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time as monotonic_time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, time
 from math import ceil
 from typing import Any
@@ -51,6 +51,9 @@ class AlphaVantageProvider(HttpProvider):
         dividend_frequencies: Mapping[str, str] | None = None,
         fx_quote_ttl_seconds: float = ALPHA_VANTAGE_FX_QUOTE_TTL_SECONDS,
         quote_cache_clock: Callable[[], float] = monotonic_time.monotonic,
+        request_clock: Callable[[], float] = monotonic_time.monotonic,
+        request_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        minimum_request_interval_seconds: float = 12.5,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         **kwargs,
     ):
@@ -85,10 +88,18 @@ class AlphaVantageProvider(HttpProvider):
         )
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
         self._wall_clock = wall_clock
+        if minimum_request_interval_seconds < 0:
+            raise ValueError("minimum_request_interval_seconds cannot be negative")
+        self.minimum_request_interval_seconds = float(minimum_request_interval_seconds)
+        self._request_clock = request_clock
+        self._request_sleeper = request_sleeper
+        self._next_request_at = 0.0
         self._request_lock = asyncio.Lock()
         self.routing_timeout_seconds = max(
-            60.0,
-            (len(self.fx_symbols) + 1) * self.request_timeout,
+            90.0,
+            len(self.fx_symbols) * self.minimum_request_interval_seconds
+            + self.request_timeout
+            + 1.0,
         )
 
     async def _request_json(self, *args, **kwargs):
@@ -96,6 +107,10 @@ class AlphaVantageProvider(HttpProvider):
         # in-flight request per key so the five emergency FX spokes do not
         # rate-limit one another during startup.
         async with self._request_lock:
+            delay = self._next_request_at - self._request_clock()
+            if delay > 0:
+                await self._request_sleeper(delay)
+            self._next_request_at = self._request_clock() + self.minimum_request_interval_seconds
             return await super()._request_json(*args, **kwargs)
 
     def _document(self, payload: Any) -> Mapping[str, Any]:

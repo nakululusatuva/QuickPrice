@@ -1273,7 +1273,10 @@ async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
 
 @pytest.mark.asyncio
 async def test_alpha_vantage_serializes_emergency_requests(monkeypatch) -> None:
-    provider = create_builtin_alpha_vantage_provider("key")
+    provider = create_builtin_alpha_vantage_provider(
+        "key",
+        minimum_request_interval_seconds=0,
+    )
     inflight = 0
     maximum_inflight = 0
 
@@ -1299,6 +1302,38 @@ async def test_alpha_vantage_serializes_emergency_requests(monkeypatch) -> None:
 
     assert maximum_inflight == 1
     assert provider.routing_timeout_seconds >= 60
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_paces_request_starts(monkeypatch) -> None:
+    clock = [100.0]
+    sleeps: list[float] = []
+
+    async def advance(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    provider = create_builtin_alpha_vantage_provider(
+        "key",
+        request_clock=lambda: clock[0],
+        request_sleeper=advance,
+        minimum_request_interval_seconds=12.5,
+    )
+    upstream = AsyncMock(
+        return_value={
+            "Realtime Currency Exchange Rate": {
+                "5. Exchange Rate": "1.25",
+                "6. Last Refreshed": "2026-07-21 14:00:00",
+            }
+        }
+    )
+    monkeypatch.setattr(HttpProvider, "_request_json", upstream)
+
+    await provider.get_quote("USD:EUR")
+    await provider.get_quote("USD:GBP")
+
+    assert sleeps == [12.5]
+    assert upstream.await_count == 2
 
 
 @pytest.mark.asyncio
