@@ -54,6 +54,12 @@ A healthy service has:
 - expected provider quotas, circuits, and fallback levels;
 - snapshot age consistent with market status and provider cadence.
 
+The supplied systemd unit uses `MemoryTHP=disable` on systemd 260 or newer.
+This is a per-process policy: it prevents CPython 3.14t's mimalloc arenas from
+retaining disproportionate 2 MiB transparent huge pages without changing the
+host-wide THP setting. Older systemd versions may omit this optional directive;
+QuickPrice remains functional with a potentially higher resident set.
+
 Suggested alerts:
 
 | Signal | Warning | Critical |

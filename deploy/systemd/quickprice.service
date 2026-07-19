@@ -25,6 +25,7 @@ TimeoutStopSec=30s
 KillSignal=SIGINT
 LimitNOFILE=65536
 UMask=0077
+MemoryTHP=disable
 
 NoNewPrivileges=true
 CapabilityBoundingSet=
