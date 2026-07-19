@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 
+from quickprice.cache import HistoryCache
 from quickprice.domain import (
     AccrualIndexPoint,
     DividendEvent,
@@ -28,6 +29,7 @@ from quickprice.storage import (
     ProviderCheckpointRecord,
     SQLiteStorage,
     StorageBatchError,
+    StorageCorruptionError,
     YieldMetricRecord,
 )
 
@@ -269,6 +271,122 @@ def test_restore_windows_latest_state_and_cleanup(tmp_path) -> None:
         finally:
             connection.close()
         await storage.stop()
+
+    run(scenario())
+
+
+def test_streaming_history_restore_loads_essential_rows_per_symbol(tmp_path) -> None:
+    class RecordingHistoryCache(HistoryCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loaded_symbols: list[set[str]] = []
+
+        def load(self, points: list[PricePoint]) -> None:
+            self.loaded_symbols.append({point.symbol for point in points})
+            super().load(points)
+
+    async def scenario() -> None:
+        now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+        database = tmp_path / "quickprice.db"
+        storage = SQLiteStorage(database, batch_interval_ms=10)
+        await storage.start()
+        await storage.enqueue_many(
+            [
+                minute("AAA:USD", now - timedelta(hours=49), 1),
+                minute("AAA:USD", now - timedelta(minutes=1), 2),
+                minute("BBB:USD", now - timedelta(minutes=2), 3),
+                aggregate("AAA:USD", now - timedelta(days=44), 4),
+                aggregate(
+                    "AAA:USD",
+                    now - timedelta(days=399),
+                    5,
+                    interval_seconds=86_400,
+                ),
+                aggregate("BBB:USD", now - timedelta(days=46), 6),
+            ]
+        )
+        await storage.flush()
+        await storage.stop()
+
+        # The streaming path intentionally ignores large source payloads. An
+        # invalid source JSON value therefore cannot affect history recovery.
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("UPDATE minute_prices SET source_json = 'not-json'")
+            connection.execute("UPDATE aggregate_prices SET source_json = 'not-json'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        cache = RecordingHistoryCache()
+        restored = SQLiteStorage(database)
+        loaded = await restored.restore_history_into(cache, now=now, fetch_size=1)
+
+        assert loaded == 4
+        assert cache.sizes() == {
+            "AAA:USD": {"1m": 1, "5m": 2, "1d": 1},
+            "BBB:USD": {"1m": 1, "5m": 1, "1d": 0},
+        }
+        assert cache.loaded_symbols
+        assert all(len(symbols) == 1 for symbols in cache.loaded_symbols)
+
+        metadata_only = await restored.restore(now=now, include_history=False)
+        assert metadata_only.minute_prices == ()
+        assert metadata_only.aggregate_prices == ()
+
+        scoped_cache = RecordingHistoryCache()
+        scoped_loaded = await restored.restore_history_into(
+            scoped_cache,
+            now=now,
+            symbols=("BBB:USD", "BBB:USD"),
+            fetch_size=1,
+        )
+        assert scoped_loaded == 1
+        assert set(scoped_cache.sizes()) == {"BBB:USD"}
+
+        empty_cache = RecordingHistoryCache()
+        assert await restored.restore_history_into(empty_cache, now=now, symbols=()) == 0
+        assert empty_cache.loaded_symbols == []
+
+    run(scenario())
+
+
+def test_streaming_history_restore_validates_options_and_wraps_corruption(tmp_path) -> None:
+    async def scenario() -> None:
+        now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+        database = tmp_path / "quickprice.db"
+        storage = SQLiteStorage(database, batch_interval_ms=10)
+        await storage.start()
+        await storage.enqueue_minute_price(minute("AAA:USD", now, 1))
+        await storage.flush()
+        await storage.stop()
+
+        with pytest.raises(ValueError, match="retention durations must be positive"):
+            await storage.restore_history_into(
+                HistoryCache(),
+                now=now,
+                minute_retention=timedelta(0),
+            )
+        with pytest.raises(ValueError, match="aggregate_interval_seconds must be positive"):
+            await storage.restore_history_into(
+                HistoryCache(),
+                now=now,
+                aggregate_interval_seconds=0,
+            )
+        with pytest.raises(ValueError, match="fetch_size must be positive"):
+            await storage.restore_history_into(HistoryCache(), now=now, fetch_size=0)
+        with pytest.raises(ValueError, match="restore symbols"):
+            await storage.restore_history_into(HistoryCache(), now=now, symbols=("",))
+
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("UPDATE minute_prices SET price = 'invalid-decimal'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with pytest.raises(StorageCorruptionError, match="persisted QuickPrice history"):
+            await storage.restore_history_into(HistoryCache(), now=now)
 
     run(scenario())
 

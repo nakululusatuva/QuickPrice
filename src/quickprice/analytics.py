@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -41,6 +41,28 @@ def calculate_changes(
     for name, duration in WINDOWS.items():
         cutoff = current_as_of - duration
         reference = next((point for point in reversed(ordered) if point.timestamp <= cutoff), None)
+        if reference is None:
+            result[name] = None
+            continue
+        percent = (current_price / reference.price - Decimal(1)) * Decimal(100)
+        result[name] = ChangeValue(percent, reference.price, reference.timestamp)
+    return result
+
+
+def calculate_changes_from_references(
+    current_price: Decimal,
+    references: Mapping[str, PricePoint | None],
+) -> dict[str, ChangeValue | None]:
+    """Calculate rolling changes from preselected cutoff observations.
+
+    ``HistoryCache`` uses this path for live quotes so the full retained
+    history does not need to be copied and sorted for every stream update.
+    """
+
+    current_price = decimal(current_price)
+    result: dict[str, ChangeValue | None] = {}
+    for name in WINDOWS:
+        reference = references.get(name)
         if reference is None:
             result[name] = None
             continue

@@ -774,12 +774,10 @@ class MarketDataCoordinator:
         if self._stop.is_set():
             self._started.set()
             return
-        # Publish synthetic inverses and crosses from the restored/seeded USD
-        # hubs before readiness is exposed.  Otherwise the first materialize
-        # pass waits behind every regular history worker and the API can be
-        # temporarily complete for hub pairs but missing long-horizon changes
-        # for all derived FX instruments.
-        await self._materialize_builtin_fx_history()
+        # Register virtual inverses and crosses over the restored/seeded USD
+        # hubs before readiness is exposed. This makes long-horizon changes
+        # available without retaining 25 duplicate history rings.
+        await self._register_builtin_fx_history()
         if self._stop.is_set():
             self._started.set()
             return
@@ -1550,23 +1548,19 @@ class MarketDataCoordinator:
                 for index in range(min(2, len(self.registry))):
                     group.create_task(worker(), name=f"history-worker:{index}")
             if include_fx:
-                await self._materialize_builtin_fx_history()
+                await self._register_builtin_fx_history()
         finally:
             self._daily_preseeded_symbols.clear()
             self._fx_history_intervals_for_cycle.clear()
         return not self._fx_daily_retry_symbols and not self._fx_failed_history_intervals
 
-    async def _materialize_builtin_fx_history(self) -> None:
-        """Build every public FX inverse and cross from cached USD-spoke rings."""
+    async def _register_builtin_fx_history(self) -> None:
+        """Register virtual FX histories backed by the five retained USD spokes."""
 
         history = getattr(self.service, "history", None)
-        publish = getattr(self.service, "publish_history_async", None)
-        if history is None or not callable(publish):
+        register = getattr(history, "register_synthetic_history", None)
+        if not callable(register):
             return
-        points_for_interval = getattr(history, "points_for_interval", None)
-        if not callable(points_for_interval):
-            return
-        daily_analytics_start = utc_now() - timedelta(days=365)
 
         for symbol in FX_SYMBOLS:
             instrument = self.registry.resolve(symbol)
@@ -1574,70 +1568,13 @@ class MarketDataCoordinator:
                 continue
             requirements = fx_hub_requirements(symbol)
             _, quote_currency = symbol.split(":", 1)
-            derived: list[PricePoint] = []
-            for interval in ("1m", "5m", "1d"):
-                step = {
-                    "1m": timedelta(minutes=1),
-                    "5m": timedelta(minutes=5),
-                    "1d": timedelta(days=1),
-                }[interval]
-                existing = points_for_interval(symbol, interval)
-                cutoff = max((item.timestamp for item in existing), default=None)
-                if (
-                    interval == "1d"
-                    and existing
-                    and min(item.timestamp for item in existing) > daily_analytics_start
-                ):
-                    # A restored synthetic tail must not hide an older prefix
-                    # that became available after the USD hubs were backfilled.
-                    # Rebuild the complete daily ring until it can support the
-                    # rolling 365-day reference, then resume tail updates.
-                    cutoff = None
-                if cutoff is not None:
-                    cutoff -= step
-                numerator = tuple(
-                    item
-                    for item in points_for_interval(requirements[0], interval)
-                    if cutoff is None or item.timestamp >= cutoff
-                )
-                if quote_currency == "USD":
-                    derived.extend(
-                        PricePoint(
-                            symbol=symbol,
-                            timestamp=item.timestamp,
-                            price=Decimal(1) / item.price,
-                            provider="synthetic_fx",
-                            is_derived=True,
-                            interval=interval,
-                        )
-                        for item in numerator
-                    )
-                    continue
-                denominator = tuple(
-                    item
-                    for item in points_for_interval(requirements[1], interval)
-                    if cutoff is None or item.timestamp >= cutoff - FX_MAX_SKEW
-                )
-                derived.extend(
-                    derive_cross_history(
-                        symbol,
-                        numerator,
-                        denominator,
-                        operation="divide",
-                        max_skew=FX_MAX_SKEW,
-                        provider="synthetic_fx",
-                        interval=interval,
-                    )
-                )
-            if derived:
-                if "publish_history_async" in self._generation_publishers:
-                    await publish(
-                        derived,
-                        persist=False,
-                        generation_id=self.generation_id,
-                    )
-                else:
-                    await publish(derived, persist=False)
+            register(
+                symbol,
+                requirements,
+                operation="inverse" if quote_currency == "USD" else "divide",
+                max_skew=FX_MAX_SKEW,
+                provider="synthetic_fx",
+            )
 
     async def _backfill_symbol(self, symbol: str) -> dict[str, BaseException]:
         instrument = self.registry[symbol]

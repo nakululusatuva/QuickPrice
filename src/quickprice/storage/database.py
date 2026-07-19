@@ -10,9 +10,12 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    from quickprice.cache import HistoryCache
 
 from .records import (
     AdminAuditEventRecord,
@@ -110,6 +113,7 @@ class _Envelope:
 _STOP = object()
 _RESTORE_SYMBOL_MARKER = "/* QUICKPRICE_SYMBOL_SCOPE */"
 _RESTORE_SYMBOL_BATCH_SIZE = 500
+_HISTORY_RESTORE_FETCH_SIZE = 1_024
 
 
 class SQLiteStorage:
@@ -1105,6 +1109,7 @@ class SQLiteStorage:
         daily_retention: timedelta = timedelta(days=400),
         aggregate_interval_seconds: int = 300,
         symbols: Iterable[str] | None = None,
+        include_history: bool = True,
     ) -> RestoredState:
         """Restore retained state, optionally for an explicit instrument subset.
 
@@ -1124,7 +1129,123 @@ class SQLiteStorage:
             daily_retention=daily_retention,
             aggregate_interval_seconds=aggregate_interval_seconds,
             symbols=symbol_scope,
+            include_history=include_history,
         )
+
+    async def restore_history_into(
+        self,
+        history_cache: HistoryCache,
+        *,
+        now: datetime | None = None,
+        minute_retention: timedelta = timedelta(hours=48),
+        aggregate_retention: timedelta = timedelta(days=45),
+        daily_retention: timedelta = timedelta(days=400),
+        aggregate_interval_seconds: int = 300,
+        symbols: Iterable[str] | None = None,
+        fetch_size: int = _HISTORY_RESTORE_FETCH_SIZE,
+    ) -> int:
+        """Stream retained price history directly into ``history_cache``.
+
+        Unlike :meth:`restore`, this path never materializes every SQLite row,
+        storage record, and domain point at the same time. SQLite rows are read
+        in bounded chunks and only one instrument's domain points are retained
+        before they are handed to ``HistoryCache.load``. The return value is the
+        number of price points loaded.
+
+        The existing :meth:`restore` API keeps its default behavior for callers
+        that also need snapshots, dividends, yields, and checkpoints.
+        """
+
+        symbol_scope = self._normalize_restore_symbols(symbols)
+        await asyncio.to_thread(self.initialize)
+        return await asyncio.to_thread(
+            self.restore_history_into_sync,
+            history_cache,
+            now=now,
+            minute_retention=minute_retention,
+            aggregate_retention=aggregate_retention,
+            daily_retention=daily_retention,
+            aggregate_interval_seconds=aggregate_interval_seconds,
+            symbols=symbol_scope,
+            fetch_size=fetch_size,
+        )
+
+    def restore_history_into_sync(
+        self,
+        history_cache: HistoryCache,
+        *,
+        now: datetime | None = None,
+        minute_retention: timedelta = timedelta(hours=48),
+        aggregate_retention: timedelta = timedelta(days=45),
+        daily_retention: timedelta = timedelta(days=400),
+        aggregate_interval_seconds: int = 300,
+        symbols: Iterable[str] | None = None,
+        fetch_size: int = _HISTORY_RESTORE_FETCH_SIZE,
+    ) -> int:
+        """Synchronous implementation of :meth:`restore_history_into`."""
+
+        self.initialize()
+        symbol_scope = self._normalize_restore_symbols(symbols)
+        current = utc_datetime(now or datetime.now(UTC))
+        if (
+            minute_retention <= timedelta(0)
+            or aggregate_retention <= timedelta(0)
+            or daily_retention <= timedelta(0)
+        ):
+            raise ValueError("retention durations must be positive")
+        if aggregate_interval_seconds <= 0:
+            raise ValueError("aggregate_interval_seconds must be positive")
+        if fetch_size <= 0:
+            raise ValueError("fetch_size must be positive")
+
+        minute_cutoff = encode_timestamp(current - minute_retention)
+        aggregate_cutoff = encode_timestamp(current - aggregate_retention)
+        daily_cutoff = encode_timestamp(current - daily_retention)
+        points_loaded = 0
+        try:
+            with self._reader_connection() as connection:
+                # Keep all symbol batches and both history tables on one WAL
+                # snapshot. A concurrent writer therefore cannot produce a
+                # mixed restoration image.
+                connection.execute("BEGIN")
+                for symbol_batch in self._restore_symbol_batches(symbol_scope):
+                    points_loaded += self._stream_history_query_into(
+                        connection,
+                        history_cache,
+                        """
+                        SELECT symbol, timestamp AS point_timestamp, price,
+                               provider, is_derived, 60 AS interval_seconds
+                        FROM minute_prices
+                        WHERE timestamp >= ?
+                        /* QUICKPRICE_SYMBOL_SCOPE */
+                        ORDER BY symbol, timestamp, provider
+                        """,
+                        (minute_cutoff,),
+                        symbol_batch,
+                        fetch_size=fetch_size,
+                    )
+                    points_loaded += self._stream_history_query_into(
+                        connection,
+                        history_cache,
+                        """
+                        SELECT symbol, bucket_start AS point_timestamp, close AS price,
+                               provider, is_derived, interval_seconds
+                        FROM aggregate_prices
+                        WHERE ((interval_seconds = ? AND bucket_start >= ?)
+                           OR (interval_seconds = 86400 AND bucket_start >= ?))
+                        /* QUICKPRICE_SYMBOL_SCOPE */
+                        ORDER BY symbol, interval_seconds, bucket_start, provider
+                        """,
+                        (aggregate_interval_seconds, aggregate_cutoff, daily_cutoff),
+                        symbol_batch,
+                        fetch_size=fetch_size,
+                    )
+                connection.execute("COMMIT")
+        except (sqlite3.Error, InvalidOperation, ValueError, TypeError, KeyError) as exc:
+            raise StorageCorruptionError(
+                f"could not restore persisted QuickPrice history: {exc}"
+            ) from exc
+        return points_loaded
 
     def restore_sync(
         self,
@@ -1135,6 +1256,7 @@ class SQLiteStorage:
         daily_retention: timedelta = timedelta(days=400),
         aggregate_interval_seconds: int = 300,
         symbols: Iterable[str] | None = None,
+        include_history: bool = True,
     ) -> RestoredState:
         self.initialize()
         symbol_scope = self._normalize_restore_symbols(symbols)
@@ -1156,33 +1278,41 @@ class SQLiteStorage:
                 # Otherwise a writer commit between batches could produce a
                 # mixed restoration image during a catalog activation.
                 connection.execute("BEGIN")
-                minute_rows = self._fetch_restore_rows(
-                    connection,
-                    """
-                    SELECT symbol, timestamp, price, provider, is_derived, source_json
-                    FROM minute_prices
-                    WHERE timestamp >= ?
-                    /* QUICKPRICE_SYMBOL_SCOPE */
-                    ORDER BY timestamp, symbol, provider
-                    """,
-                    (minute_cutoff,),
-                    symbol_scope,
-                    order_columns=("timestamp", "symbol", "provider"),
+                minute_rows = (
+                    self._fetch_restore_rows(
+                        connection,
+                        """
+                        SELECT symbol, timestamp, price, provider, is_derived, source_json
+                        FROM minute_prices
+                        WHERE timestamp >= ?
+                        /* QUICKPRICE_SYMBOL_SCOPE */
+                        ORDER BY timestamp, symbol, provider
+                        """,
+                        (minute_cutoff,),
+                        symbol_scope,
+                        order_columns=("timestamp", "symbol", "provider"),
+                    )
+                    if include_history
+                    else []
                 )
-                aggregate_rows = self._fetch_restore_rows(
-                    connection,
-                    """
-                    SELECT symbol, bucket_start, interval_seconds, open, high, low, close,
-                           sample_count, provider, is_derived, source_json
-                    FROM aggregate_prices
-                    WHERE ((interval_seconds = ? AND bucket_start >= ?)
-                       OR (interval_seconds = 86400 AND bucket_start >= ?))
-                    /* QUICKPRICE_SYMBOL_SCOPE */
-                    ORDER BY bucket_start, symbol, provider
-                    """,
-                    (aggregate_interval_seconds, aggregate_cutoff, daily_cutoff),
-                    symbol_scope,
-                    order_columns=("bucket_start", "symbol", "provider"),
+                aggregate_rows = (
+                    self._fetch_restore_rows(
+                        connection,
+                        """
+                        SELECT symbol, bucket_start, interval_seconds, open, high, low, close,
+                               sample_count, provider, is_derived, source_json
+                        FROM aggregate_prices
+                        WHERE ((interval_seconds = ? AND bucket_start >= ?)
+                           OR (interval_seconds = 86400 AND bucket_start >= ?))
+                        /* QUICKPRICE_SYMBOL_SCOPE */
+                        ORDER BY bucket_start, symbol, provider
+                        """,
+                        (aggregate_interval_seconds, aggregate_cutoff, daily_cutoff),
+                        symbol_scope,
+                        order_columns=("bucket_start", "symbol", "provider"),
+                    )
+                    if include_history
+                    else []
                 )
                 snapshot_rows = self._fetch_restore_rows(
                     connection,
@@ -1360,6 +1490,76 @@ class SQLiteStorage:
                 raise ValueError("restore symbols must be non-empty normalized strings")
             normalized.add(symbol)
         return tuple(sorted(normalized))
+
+    @staticmethod
+    def _restore_symbol_batches(
+        symbols: tuple[str, ...] | None,
+    ) -> Iterator[tuple[str, ...] | None]:
+        if symbols is None:
+            yield None
+            return
+        for start in range(0, len(symbols), _RESTORE_SYMBOL_BATCH_SIZE):
+            yield symbols[start : start + _RESTORE_SYMBOL_BATCH_SIZE]
+
+    @staticmethod
+    def _stream_history_query_into(
+        connection: sqlite3.Connection,
+        history_cache: HistoryCache,
+        query: str,
+        parameters: Sequence[Any],
+        symbols: tuple[str, ...] | None,
+        *,
+        fetch_size: int,
+    ) -> int:
+        if query.count(_RESTORE_SYMBOL_MARKER) != 1:
+            raise ValueError("restore query must contain exactly one symbol-scope marker")
+        if symbols == ():
+            return 0
+
+        scoped_query = query.replace(_RESTORE_SYMBOL_MARKER, "")
+        scoped_parameters: Sequence[Any] = parameters
+        if symbols is not None:
+            placeholders = ", ".join("?" for _ in symbols)
+            scoped_query = query.replace(
+                _RESTORE_SYMBOL_MARKER,
+                f"AND symbol IN ({placeholders})",
+            )
+            scoped_parameters = (*parameters, *symbols)
+
+        from quickprice.domain import PricePoint
+
+        current_symbol: str | None = None
+        current_points: list[PricePoint] = []
+        points_loaded = 0
+        cursor = connection.execute(scoped_query, scoped_parameters)
+        try:
+            while rows := cursor.fetchmany(fetch_size):
+                for row in rows:
+                    symbol = str(row["symbol"])
+                    if current_symbol is not None and symbol != current_symbol:
+                        history_cache.load(current_points)
+                        points_loaded += len(current_points)
+                        current_points = []
+                    current_symbol = symbol
+                    interval_seconds = int(row["interval_seconds"])
+                    current_points.append(
+                        PricePoint(
+                            symbol=symbol,
+                            timestamp=decode_timestamp(row["point_timestamp"]),
+                            price=Decimal(row["price"]),
+                            provider=str(row["provider"]),
+                            is_derived=bool(row["is_derived"]),
+                            interval="1d"
+                            if interval_seconds == 86_400
+                            else ("5m" if interval_seconds != 60 else "1m"),
+                        )
+                    )
+            if current_points:
+                history_cache.load(current_points)
+                points_loaded += len(current_points)
+        finally:
+            cursor.close()
+        return points_loaded
 
     @staticmethod
     def _fetch_restore_rows(

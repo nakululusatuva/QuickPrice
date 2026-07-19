@@ -162,7 +162,7 @@ def make_coordinator(
         return None
 
     coordinator._startup_preseed_fx_daily = startup_ready
-    coordinator._materialize_builtin_fx_history = startup_noop
+    coordinator._register_builtin_fx_history = startup_noop
     coordinator._publish_loop = idle
     coordinator._quote_scheduler_loop = idle
     coordinator._metadata_loop = idle

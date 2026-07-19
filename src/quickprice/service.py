@@ -14,6 +14,7 @@ from typing import Any
 from .analytics import (
     boxx_yield,
     calculate_changes,
+    calculate_changes_from_references,
     quarterly_dividend,
     sgov_yield,
     treasury_proxy_yield,
@@ -94,6 +95,24 @@ class _RuntimeDataState:
             complete_symbols=set(self.complete_symbols),
             active_aggregates=dict(self.active_aggregates),
         )
+
+    def retain_symbols(self, symbols: tuple[str, ...]) -> None:
+        retained = set(symbols)
+        self.snapshots.retain_symbols(retained)
+        self.history.retain_symbols(retained)
+        for values in (
+            self.dividends,
+            self.yield_metrics,
+            self.yield_stale_after_seconds,
+            self.last_quotes,
+            self.wire_cache,
+            self.active_aggregates,
+        ):
+            for symbol in tuple(values):
+                if symbol not in retained:
+                    values.pop(symbol, None)
+        self.source_failures.intersection_update(retained)
+        self.complete_symbols.intersection_update(retained)
 
 
 class QuickPriceService:
@@ -736,6 +755,7 @@ class QuickPriceService:
                 # active generation; it must not reopen the disk transaction.
                 try:
                     self._publish_warmed_history(warmed, candidate_state)
+                    candidate_state.retain_symbols(registry.symbols)
                     self._persist_warmed_instruments(warmed, candidate_state)
                 except Exception as finalize_exc:
                     self._storage_ready = False
@@ -754,6 +774,7 @@ class QuickPriceService:
                         generation_id=previous.generation_id,
                     )
                     self._bind_runtime_state(self._state_for_generation())
+                previous.data_state.history.retain_symbols(previous.registry.symbols)
                 if reusing_coordinator and previous_coordinator_target is not None:
                     old_registry, old_generation_id = previous_coordinator_target
                     try:
@@ -937,7 +958,19 @@ class QuickPriceService:
             stage = "restore"
             restore = getattr(self._storage, "restore", None)
             if restore is not None:
-                restored = restore()
+                restore_history = getattr(self._storage, "restore_history_into", None)
+                if callable(restore_history):
+                    stage = "restore_history"
+                    history_result = restore_history(
+                        self.history,
+                        symbols=self.registry.symbols,
+                    )
+                    if inspect.isawaitable(history_result):
+                        await history_result
+                    stage = "restore_metadata"
+                    restored = restore(include_history=False)
+                else:
+                    restored = restore()
                 if asyncio.iscoroutine(restored):
                     restored = await restored
                 stage = "apply_restore"
@@ -1601,13 +1634,21 @@ class QuickPriceService:
             and yield_metric is not None
         ):
             annual_yield = estimate_from_staking_metric(yield_metric)
-        snapshot = QuoteSnapshot(
-            quote=quote,
-            changes=calculate_changes(
+        changes = (
+            calculate_changes(
                 quote.price,
                 quote.as_of,
                 (*state.history.points(symbol), *additional_history),
-            ),
+            )
+            if additional_history
+            else calculate_changes_from_references(
+                quote.price,
+                state.history.change_references(symbol, quote.as_of),
+            )
+        )
+        snapshot = QuoteSnapshot(
+            quote=quote,
+            changes=changes,
             dividend=dividend,
             estimated_annual_yield=annual_yield,
         )

@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from quickprice.analytics import calculate_changes
 from quickprice.builtin_plugin import FX_INSTRUMENTS
 from quickprice.cache import HistoryCache
 from quickprice.collectors import MarketDataCoordinator, derive_cross_history
@@ -441,7 +440,7 @@ def test_cross_history_never_uses_a_future_component():
 
 
 @pytest.mark.asyncio
-async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> None:
+async def test_fx_backfill_keeps_only_hubs_and_registers_virtual_crosses() -> None:
     registry = InstrumentRegistry(
         (
             InstrumentPlugin(
@@ -461,27 +460,16 @@ async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> 
     }
     timestamp = datetime(2026, 7, 20, 4, tzinfo=UTC)
 
-    class History:
-        def __init__(self) -> None:
-            self.values: dict[tuple[str, str], list[PricePoint]] = {}
-
-        def points_for_interval(self, symbol: str, interval: str):
-            return tuple(self.values.get((symbol, interval), ()))
-
-        def add(self, points):
-            for item in points:
-                self.values.setdefault((item.symbol, item.interval), []).append(item)
-
     class Service:
         def __init__(self) -> None:
-            self.history = History()
+            self.history = HistoryCache()
             self.published_sizes: list[int] = []
             self.persist_flags: list[bool] = []
 
         async def publish_history_async(self, points, *, persist=True):
             self.published_sizes.append(len(points))
             self.persist_flags.append(persist)
-            self.history.add(points)
+            self.history.load(list(points))
 
     service = Service()
     coordinator = MarketDataCoordinator(
@@ -493,7 +481,7 @@ async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> 
 
     async def backfill(symbol: str) -> None:
         upstream_calls.append(symbol)
-        service.history.add(
+        service.history.load(
             [
                 PricePoint(
                     symbol,
@@ -514,24 +502,30 @@ async def test_fx_backfill_fetches_only_hubs_then_materializes_every_cross() -> 
 
     assert set(upstream_calls) == set(FX_HUB_SYMBOLS)
     assert len(upstream_calls) == len(FX_HUB_SYMBOLS)
-    for symbol in FX_SYMBOLS:
+    for symbol in FX_HUB_SYMBOLS:
         for interval in ("1m", "5m", "1d"):
             assert service.history.points_for_interval(symbol, interval)
-    assert service.history.points_for_interval("GBP:CNH", "1d")[0].price == (
+    derived_symbols = set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS)
+    assert all(
+        not service.history.points_for_interval(symbol, interval)
+        for symbol in derived_symbols
+        for interval in ("1m", "5m", "1d")
+    )
+    reference_at = timestamp + timedelta(days=366)
+    assert service.history.change_references("GBP:CNH", reference_at)["1y"].price == (
         Decimal("7.20") / Decimal("0.75")
     )
-    assert service.history.points_for_interval("EUR:USD", "1d")[0].price == (
+    assert service.history.change_references("EUR:USD", reference_at)["1y"].price == (
         Decimal(1) / Decimal("0.90")
     )
 
-    await coordinator._materialize_builtin_fx_history()
-    assert len(service.published_sizes) == 2 * (len(FX_SYMBOLS) - len(FX_HUB_SYMBOLS))
-    assert sum(service.published_sizes[-25:]) == 75
-    assert service.persist_flags == [False] * len(service.persist_flags)
+    await coordinator._register_builtin_fx_history()
+    assert service.published_sizes == []
+    assert service.persist_flags == []
 
 
 @pytest.mark.asyncio
-async def test_restored_fx_tails_rebuild_one_year_prefix_from_complete_hubs(
+async def test_restored_fx_tails_are_replaced_by_virtual_one_year_references(
     monkeypatch,
 ) -> None:
     now = datetime(2026, 7, 20, 15, tzinfo=UTC)
@@ -578,16 +572,15 @@ async def test_restored_fx_tails_rebuild_one_year_prefix_from_complete_hubs(
     coordinator = MarketDataCoordinator(service, settings, registry)
     monkeypatch.setattr("quickprice.collectors.utc_now", lambda: now)
     try:
-        await coordinator._materialize_builtin_fx_history()
+        await coordinator._register_builtin_fx_history()
     finally:
         await coordinator.graph.close()
 
     derived_symbols = set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS)
     assert len(derived_symbols) == 25
     for symbol in derived_symbols:
-        points = service.history.points_for_interval(symbol, "1d")
-        assert min(point.timestamp for point in points) <= now - timedelta(days=365)
-        assert calculate_changes(points[-1].price, now, points)["1y"] is not None
+        assert service.history.points_for_interval(symbol, "1d") == ()
+        assert service.history.change_references(symbol, now)["1y"] is not None
 
 
 @pytest.mark.asyncio
@@ -649,23 +642,11 @@ async def test_run_awaits_all_fx_daily_preseed_before_quote_and_history_tasks(
     )
     now = datetime(2026, 7, 20, 15, tzinfo=UTC)
 
-    class History:
-        def __init__(self) -> None:
-            self.values: dict[tuple[str, str], dict[datetime, PricePoint]] = {}
-
-        def points_for_interval(self, symbol, interval):
-            points = self.values.get((symbol, interval), {})
-            return tuple(points[key] for key in sorted(points))
-
-        def add(self, points):
-            for point in points:
-                self.values.setdefault((point.symbol, point.interval), {})[point.timestamp] = point
-
-    history = History()
+    history = HistoryCache()
 
     async def publish_history(points, *, persist=True):
         del persist
-        history.add(points)
+        history.load(list(points))
 
     coordinator = MarketDataCoordinator(
         SimpleNamespace(history=history, publish_history_async=publish_history),
@@ -688,7 +669,7 @@ async def test_run_awaits_all_fx_daily_preseed_before_quote_and_history_tasks(
                 interval=interval,
             ),
         )
-        history.add(points)
+        history.load(list(points))
         return points
 
     async def quote_loop():
@@ -716,10 +697,8 @@ async def test_run_awaits_all_fx_daily_preseed_before_quote_and_history_tasks(
         await coordinator._started.wait()
         derived_symbols = set(FX_SYMBOLS) - set(FX_HUB_SYMBOLS)
         for symbol in derived_symbols:
-            points = history.points_for_interval(symbol, "1d")
-            assert points
-            assert points[0].timestamp <= now - timedelta(days=365)
-            assert calculate_changes(points[-1].price, now, points)["1y"] is not None
+            assert history.points_for_interval(symbol, "1d") == ()
+            assert history.change_references(symbol, now)["1y"] is not None
         coordinator._stop.set()
         await task
     finally:

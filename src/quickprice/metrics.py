@@ -64,7 +64,7 @@ class Metrics:
         {"quote", "history", "dividend", "yield", "http", "stream", "other"}
     )
 
-    def __init__(self, latency_window: int = 4096, provider_window: int = 2048) -> None:
+    def __init__(self, latency_window: int = 4096, provider_window: int = 512) -> None:
         if latency_window <= 0 or provider_window <= 0:
             raise ValueError("metric windows must be positive")
         self._lock = threading.Lock()
