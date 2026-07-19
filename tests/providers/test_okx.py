@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -67,6 +68,41 @@ async def test_okx_rejects_a_wide_or_crossed_book() -> None:
 
     with pytest.raises(ProviderUnavailable, match="spread exceeds"):
         await provider.get_quote("BETH:ETH")
+
+
+@pytest.mark.asyncio
+async def test_okx_serializes_complete_proxied_requests() -> None:
+    provider = create_builtin_okx_market_provider(minimum_request_interval_seconds=0)
+    inflight = 0
+    maximum_inflight = 0
+
+    async def request_json(_method, _url, *, params):
+        nonlocal inflight, maximum_inflight
+        inflight += 1
+        maximum_inflight = max(maximum_inflight, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return {
+            "code": "0",
+            "msg": "",
+            "data": [
+                {
+                    "instId": params["instId"],
+                    "bidPx": "0.9997",
+                    "askPx": "0.9999",
+                    "ts": "1784604228062",
+                }
+            ],
+        }
+
+    provider._request_json = request_json
+
+    await asyncio.gather(
+        provider.get_quote("OKX_BETH:ETH"),
+        provider.get_quote("OKX_ETH:USDC"),
+    )
+
+    assert maximum_inflight == 1
 
 
 @pytest.mark.asyncio

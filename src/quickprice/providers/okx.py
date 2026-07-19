@@ -121,11 +121,14 @@ class OkxMarketProvider(HttpProvider):
             if delay > 0:
                 await asyncio.sleep(delay)
             self._next_request_at = self._monotonic_clock() + self.minimum_request_interval_seconds
-        return await self._request_json(
-            "GET",
-            f"{self.base_url}{path}",
-            params=params,
-        )
+            # Keep the complete proxied request inside the gate. Concurrent
+            # synthetic legs and history pages otherwise overload small shared
+            # HTTP proxies even though their request starts are nominally paced.
+            return await self._request_json(
+                "GET",
+                f"{self.base_url}{path}",
+                params=params,
+            )
 
     async def get_quote(self, symbol: str):
         canonical, instrument_id = self._market(symbol)
