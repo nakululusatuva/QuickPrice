@@ -366,8 +366,10 @@ that cannot observe those units.
   and every 900 seconds for the other USD hubs. Alpha FX fallback values and
   expected Alpha errors are cached per hub for six hours, so those primary
   probes do not consume another Alpha credit on every scheduler cycle.
-- CoinGecko uses one all-symbol request no more than every ten minutes; failed
-  refreshes use the same bounded retry cadence.
+- CoinGecko uses one successful all-symbol request no more than every ten
+  minutes. Identifiable connection, TLS, DNS, proxy, and timeout failures retry
+  indefinitely every five minutes, while explicit upstream and quota failures
+  retain their protected backoff and hard credit ceiling.
 - Binance's primary WBETH APR route uses only a read-only USER_DATA key.
 - Accept a disclosed stale value or upgrade to an authorized paid plan.
 
@@ -417,6 +419,9 @@ copy provider values into `quickprice.env` or the reverse-proxy environment.
 1. Record current source, quality, components, quotas, and circuits.
 2. In a controlled test configuration, disable one primary provider.
 3. Confirm that three failures open its circuit and the HTTP cache remains fast.
+   Network-class failures must continue fixed short half-open probes without an
+   exponential retry ceiling; explicit HTTP and quota failures retain bounded
+   exponential backoff.
 4. Confirm fallback metadata and stale behavior.
 5. Restore the provider, wait for the half-open probe, and confirm primary
    recovery without a request storm or quota reset.

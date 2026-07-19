@@ -284,8 +284,11 @@ contracts. Provider modules contain no built-in trading-pair tables; each
 runtime generation injects validated vendor-symbol bindings from the managed
 catalog. Routing is configured per instrument and capability. The router
 applies timeouts, durable quota accounting, single-flight request merging,
-three-failure circuit breakers, 60-second half-open probes, and exponential
-reconnect backoff. The multi-request Ethereum exchange-rate algorithm has a
+three-failure circuit breakers, and half-open probes. Identifiable connection,
+DNS, TLS, proxy, and timeout failures are retried indefinitely at a fixed
+interval of at most 30 seconds; explicit HTTP, quota, and malformed-response
+failures retain bounded exponential backoff. The multi-request Ethereum
+exchange-rate algorithm has a
 separate finite route budget derived from its per-request timeout; every JSON-
 RPC request remains subject to the shorter provider request timeout.
 
@@ -305,13 +308,20 @@ The default route families are:
   Binance synthetic routes for history; signed Binance APR, on-chain exchange-
   rate APY, then the declared 30-day market-ratio proxy for yield.
 - BETH: same-venue OKX `BETH/ETH * ETH/USDC`, then
-  `BETH/USDT / USDC/USDT`; CoinGecko is the final price/history fallback. Yield
-  uses only OKX's provider-reported ETH staking rate, while SQLite can retain
-  the last successful metric with explicit stale metadata during an outage.
-- stETH and wstETH: CoinGecko price normalization and Lido protocol yield.
-  Value-accruing wstETH may finally use the declared 30-day market-ratio
-  proxy; rebasing stETH does not use a price-ratio proxy because rewards accrue
-  as units rather than unit-price appreciation.
+  `BETH/USDT / USDC/USDT`; CoinGecko market price, then an explicitly derived
+  1:1 ETH protocol-backing proxy are quote fallbacks. CoinGecko remains the
+  history fallback. Yield uses only OKX's provider-reported ETH staking rate,
+  while SQLite can retain the last successful metric with explicit stale
+  metadata during an outage.
+- stETH and wstETH: CoinGecko normalized market prices remain preferred. When
+  that endpoint is unreachable, stETH uses an explicitly derived 1:1 ETH
+  backing proxy and wstETH multiplies the current ETH quote by Lido's on-chain
+  `stEthPerToken` ratio. Both expose their components and
+  `price_basis=protocol_backing_proxy`; neither is presented as a traded market
+  price. Lido remains the primary protocol-yield source. Value-accruing wstETH
+  may finally use the declared 30-day market-ratio yield proxy; rebasing stETH
+  does not use a price-ratio yield proxy because rewards accrue as units rather
+  than unit-price appreciation.
 - Common-stock and ETF quotes: Alpaca IEX, Finnhub, Twelve Data, then Alpha
   Vantage end-of-day data. History remains Alpaca, Twelve Data, then Alpha
   Vantage because [Finnhub's free plan](https://finnhub.io/pricing) does not
@@ -351,8 +361,10 @@ With the default 9,000-credit monthly CoinGecko budget and healthy primary spot
 providers, stETH and wstETH drive one all-symbol quote batch on a 660-second
 cadence. Ordinary spot fallback demand reuses that cache; its refresh floor and
 the durable monthly budget prevent an unbounded request fan-out. Failed shared
-quote refreshes are retried on the same ten-minute quota-safe cadence instead
-of entering an hour-long negative-cache backoff. CoinGecko
+quote refreshes caused by a connection, TLS, DNS, proxy, or timeout error are
+retried indefinitely every five minutes. Explicit upstream responses retain
+the ten-minute quota-safe backoff and all attempts remain subject to the hard
+local daily credit budget. CoinGecko
 ordinary spot routes are aggregated, USD-to-USDC-normalized quote fallbacks
 only and are never used as ordinary spot history. Source timestamps and
 staleness remain explicit, and a paid or plugin-provided feed can replace this
@@ -401,11 +413,11 @@ inbound reverse proxy. Set `QUICKPRICE_PROVIDER_PROXY_URL` to proxy every REST
 and WebSocket provider by default. Set `QUICKPRICE_PROVIDER_PROXY_NAMES` to a
 comma-separated allowlist when only selected providers should use it. Built-in
 names include `binance`, `kraken`, `coingecko`, `binance_wbeth_rate`,
-`ethereum_exchange_rate`, `lido`, `alpaca`, `finnhub`, `twelve_data`,
-`alpha_vantage`, and `fred`. A plugin installer can apply the same policy with
-`settings.proxy_url_for_provider(name)`. Treat an authenticated proxy URL as a
-secret even though local unauthenticated proxy addresses normally belong in
-the non-secret application configuration.
+`ethereum_exchange_rate`, `staking_backing_proxy`, `lido`, `alpaca`, `finnhub`,
+`twelve_data`, `alpha_vantage`, and `fred`. A plugin installer can apply the same
+policy with `settings.proxy_url_for_provider(name)`. Treat an authenticated
+proxy URL as a secret even though local unauthenticated proxy addresses normally
+belong in the non-secret application configuration.
 
 `QUICKPRICE_API_KEY_HASHES` is a one-time compatibility bootstrap. On the first
 schema-v2 start, its hashes are imported into SQLite and a durable bootstrap
