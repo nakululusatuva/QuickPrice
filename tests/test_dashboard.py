@@ -73,6 +73,7 @@ def test_dashboard_shell_is_public_and_hardened(client, path: str) -> None:
 def test_dashboard_assets_are_public_and_define_the_client_security_contract(client) -> None:
     css = client.get("/dashboard/assets/dashboard.css")
     javascript = client.get("/dashboard/assets/dashboard.js")
+    javascript_source = javascript.text.replace("\r\n", "\n")
 
     assert css.status_code == 200
     assert css.headers["content-type"].startswith("text/css")
@@ -95,7 +96,7 @@ def test_dashboard_assets_are_public_and_define_the_client_security_contract(cli
     assert "result.catalogRevision === catalog.revision" in javascript.text
     assert 'if (etag) headers["If-None-Match"] = etag' in javascript.text
     assert "CATALOG_REFRESH_INTERVAL_MS = 30_000" in javascript.text
-    assert "window.setInterval(\n    refreshInstrumentCatalog" in javascript.text
+    assert "window.setInterval(\n    refreshInstrumentCatalog" in javascript_source
     assert "expandedSymbols: new Set()" in javascript.text
     assert "state.expandedSymbols.clear()" in javascript.text
     assert 'inspect.setAttribute("aria-expanded", String(expansion.expanded))' in javascript.text
