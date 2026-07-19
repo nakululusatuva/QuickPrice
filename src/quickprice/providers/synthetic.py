@@ -239,52 +239,6 @@ def synthesize_inverse(
     )
 
 
-def synthesize_wbeth(
-    wbeth_eth: ProviderQuote,
-    eth_usdc: ProviderQuote,
-    *,
-    now: datetime | None = None,
-    provider_name: str = "synthetic_binance",
-):
-    """Primary WBETH:USDC formula: WBETH/ETH multiplied by ETH/USDC."""
-
-    return synthesize_multiplication(
-        "WBETH:USDC",
-        wbeth_eth,
-        eth_usdc,
-        max_skew=timedelta(seconds=2),
-        now=now,
-        left_max_age=timedelta(seconds=15),
-        right_max_age=timedelta(seconds=15),
-        provider_name=provider_name,
-    )
-
-
-def synthesize_hkd_cnh(
-    usd_cnh: ProviderQuote,
-    usd_hkd: ProviderQuote,
-    *,
-    now: datetime | None = None,
-    provider_name: str = "synthetic_fx",
-):
-    """HKD/CNH formula: USD/CNH divided by USD/HKD.
-
-    The slower USD/HKD leg may be up to 20 minutes old. USD/CNH retains a
-    tighter five-minute freshness requirement.
-    """
-
-    return synthesize_division(
-        "HKD:CNH",
-        usd_cnh,
-        usd_hkd,
-        max_skew=timedelta(minutes=20),
-        now=now,
-        numerator_max_age=timedelta(minutes=5),
-        denominator_max_age=timedelta(minutes=20),
-        provider_name=provider_name,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class SyntheticRecipe:
     symbol: str
@@ -295,75 +249,6 @@ class SyntheticRecipe:
     left_max_age: timedelta | None = None
     right_max_age: timedelta | None = None
     provider_name: str = "synthetic"
-
-    @classmethod
-    def wbeth_primary(cls) -> SyntheticRecipe:
-        return cls(
-            symbol="WBETH:USDC",
-            left_symbol="WBETH:ETH",
-            right_symbol="ETH:USDC",
-            operation="multiply",
-            max_skew=timedelta(seconds=2),
-            left_max_age=timedelta(seconds=15),
-            right_max_age=timedelta(seconds=15),
-            provider_name="synthetic_binance",
-        )
-
-    @classmethod
-    def wbeth_usdt_fallback(cls) -> SyntheticRecipe:
-        return cls(
-            symbol="WBETH:USDC",
-            left_symbol="WBETH:USDT",
-            right_symbol="USDC:USDT",
-            operation="divide",
-            max_skew=timedelta(seconds=2),
-            left_max_age=timedelta(seconds=15),
-            right_max_age=timedelta(seconds=15),
-            provider_name="synthetic_binance",
-        )
-
-    @classmethod
-    def beth_okx_primary(cls) -> SyntheticRecipe:
-        """Primary BETH formula using only synchronized OKX spot books."""
-
-        return cls(
-            symbol="BETH:USDC",
-            left_symbol="OKX_BETH:ETH",
-            right_symbol="OKX_ETH:USDC",
-            operation="multiply",
-            max_skew=timedelta(seconds=2),
-            left_max_age=timedelta(seconds=15),
-            right_max_age=timedelta(seconds=15),
-            provider_name="synthetic_okx",
-        )
-
-    @classmethod
-    def beth_okx_usdt_fallback(cls) -> SyntheticRecipe:
-        """Alternate BETH formula using only synchronized OKX spot books."""
-
-        return cls(
-            symbol="BETH:USDC",
-            left_symbol="OKX_BETH:USDT",
-            right_symbol="OKX_USDC:USDT",
-            operation="divide",
-            max_skew=timedelta(seconds=2),
-            left_max_age=timedelta(seconds=15),
-            right_max_age=timedelta(seconds=15),
-            provider_name="synthetic_okx",
-        )
-
-    @classmethod
-    def hkd_cnh(cls) -> SyntheticRecipe:
-        return cls(
-            symbol="HKD:CNH",
-            left_symbol="USD:CNH",
-            right_symbol="USD:HKD",
-            operation="divide",
-            max_skew=timedelta(minutes=20),
-            left_max_age=timedelta(minutes=5),
-            right_max_age=timedelta(minutes=20),
-            provider_name="synthetic_fx",
-        )
 
 
 class SyntheticQuoteProvider:

@@ -1373,6 +1373,8 @@ def test_adapters_accept_instance_level_bindings_without_mutating_defaults() -> 
         "key",
         series_bindings={"BOND:USD": "DGS10"},
         expense_ratios={"BOND:USD": "0.10"},
+        method_bindings={"BOND:USD": "treasury_series_proxy_minus_expense"},
+        component_role_bindings={"BOND:USD": "treasury_yield_percent"},
     )
 
     assert binance._exchange_symbol("AVAX:USDC") == "AVAXUSDC"

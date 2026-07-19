@@ -9,8 +9,6 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, ClassVar
 
-from quickprice.equities import LISTED_TICKERS
-from quickprice.fx import FX_HUB_SYMBOLS
 from quickprice.market import seconds_until_next_us_equity_open
 
 from ._models import decimal_value, point, quote, utc_datetime
@@ -35,13 +33,8 @@ class TwelveDataProvider(HttpProvider):
     name = "twelve_data"
     base_url = "https://api.twelvedata.com"
     feed = "twelve_data_rest"
-    symbols: ClassVar[dict[str, str]] = {
-        **LISTED_TICKERS,
-        **{symbol: symbol.replace(":", "/") for symbol in FX_HUB_SYMBOLS},
-    }
-    fx_quote_ttl_floors_seconds: ClassVar[Mapping[str, float]] = MappingProxyType(
-        {symbol: 240.0 if symbol == "USD:CNH" else 900.0 for symbol in FX_HUB_SYMBOLS}
-    )
+    symbols: ClassVar[dict[str, str]] = {}
+    fx_quote_ttl_floors_seconds: ClassVar[Mapping[str, float]] = MappingProxyType({})
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1min",
         "5m": "5min",
@@ -57,8 +50,7 @@ class TwelveDataProvider(HttpProvider):
         *,
         symbol_bindings: Mapping[str, str] | None = None,
         fx_symbols: Sequence[str] | None = None,
-        usd_cnh_quote_ttl_seconds: float = 240.0,
-        usd_hkd_quote_ttl_seconds: float = 900.0,
+        fx_quote_ttl_floors_seconds: Mapping[str, float] | None = None,
         fx_quote_ttl_seconds: Mapping[str, float] | None = None,
         quote_cache_clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -72,39 +64,34 @@ class TwelveDataProvider(HttpProvider):
         self.api_key = api_key
         self.symbols = {
             symbol.strip().upper(): vendor_symbol.strip().upper()
-            for symbol, vendor_symbol in (
-                type(self).symbols if symbol_bindings is None else symbol_bindings
-            ).items()
+            for symbol, vendor_symbol in (symbol_bindings or {}).items()
         }
         requested_fx_symbols = (
-            FX_HUB_SYMBOLS
-            if fx_symbols is None and symbol_bindings is None
-            else (
-                tuple(
-                    symbol for symbol, vendor_symbol in self.symbols.items() if "/" in vendor_symbol
-                )
-                if fx_symbols is None
-                else fx_symbols
-            )
+            tuple(symbol for symbol, vendor_symbol in self.symbols.items() if "/" in vendor_symbol)
+            if fx_symbols is None
+            else fx_symbols
         )
         self.fx_symbols = frozenset(symbol.strip().upper() for symbol in requested_fx_symbols)
         if any(symbol not in self.symbols for symbol in self.fx_symbols):
             raise ValueError("Twelve Data FX symbol is not present in symbol bindings")
         self.equity_symbols = frozenset(self.symbols) - self.fx_symbols
         self.fx_quote_ttl_floors_seconds = MappingProxyType(
-            {symbol: 240.0 if symbol == "USD:CNH" else 900.0 for symbol in self.fx_symbols}
+            {
+                symbol.strip().upper(): float(ttl)
+                for symbol, ttl in (fx_quote_ttl_floors_seconds or {}).items()
+                if symbol.strip().upper() in self.fx_symbols
+            }
         )
+        if self.fx_symbols - self.fx_quote_ttl_floors_seconds.keys():
+            raise ValueError("every Twelve Data FX symbol requires a cache floor policy")
+        if any(ttl <= 0 for ttl in self.fx_quote_ttl_floors_seconds.values()):
+            raise ValueError("Twelve Data FX cache floors must be positive")
         if rate_gate_timeout_seconds <= 0:
             raise ValueError("rate_gate_timeout_seconds must be positive")
         self.rate_gate_timeout_seconds = float(rate_gate_timeout_seconds)
         self.routing_timeout_seconds = self.rate_gate_timeout_seconds + self.request_timeout + 1.0
         self._rate_gate = rate_gate or SlidingWindowRateGate(calls_per_minute, 60.0)
-        requested_ttls = {
-            symbol: (
-                usd_cnh_quote_ttl_seconds if symbol == "USD:CNH" else usd_hkd_quote_ttl_seconds
-            )
-            for symbol in self.fx_symbols
-        }
+        requested_ttls = dict(self.fx_quote_ttl_floors_seconds)
         if fx_quote_ttl_seconds is not None:
             normalized_ttls = {
                 symbol.strip().upper(): float(ttl) for symbol, ttl in fx_quote_ttl_seconds.items()
@@ -113,9 +100,8 @@ class TwelveDataProvider(HttpProvider):
             if unknown:
                 raise ValueError(f"unsupported FX cache policy: {', '.join(sorted(unknown))}")
             requested_ttls.update(normalized_ttls)
-        # Five shared USD-spoke caches consume at most 744 quote credits per
-        # UTC day at their default floors: 360 for CNH plus 96 for each of the
-        # other four spokes. All 30 public pairs reuse these cache entries.
+        # Shared spoke caches keep the configured daily credit plan bounded;
+        # every public cross reuses these observations.
         self.quote_cache_ttl_seconds = {
             symbol: max(self.fx_quote_ttl_floors_seconds[symbol], requested_ttls[symbol])
             for symbol in self.fx_symbols

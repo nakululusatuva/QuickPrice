@@ -1,4 +1,4 @@
-"""OKX public spot-market and BETH staking-rate adapters."""
+"""OKX public spot-market and staking-rate adapters."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def _okx_data(payload: Any, provider: str, context: str) -> Sequence[Any]:
 
 
 class OkxMarketProvider(HttpProvider):
-    """Read current OKX spot books and historical candles for BETH synthesis."""
+    """Read current OKX spot books and historical candles for configured markets."""
 
     name = "okx"
     base_url = "https://www.okx.com"
@@ -55,20 +55,8 @@ class OkxMarketProvider(HttpProvider):
     maximum_pages = 50
     minimum_quote_poll_seconds = 1.0
 
-    _canonical_markets: ClassVar[dict[str, str]] = {
-        "BETH:ETH": "BETH-ETH",
-        "ETH:USDC": "ETH-USDC",
-        "BETH:USDT": "BETH-USDT",
-        "USDC:USDT": "USDC-USDT",
-    }
-    # The router already owns the public ETH:USDC route. Provider-qualified
-    # aliases keep both legs on OKX without exposing implementation symbols.
-    _internal_aliases: ClassVar[dict[str, str]] = {
-        "OKX_BETH:ETH": "BETH:ETH",
-        "OKX_ETH:USDC": "ETH:USDC",
-        "OKX_BETH:USDT": "BETH:USDT",
-        "OKX_USDC:USDT": "USDC:USDT",
-    }
+    _canonical_markets: ClassVar[dict[str, str]] = {}
+    _internal_aliases: ClassVar[dict[str, str]] = {}
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1m",
         "5m": "5m",
@@ -92,15 +80,11 @@ class OkxMarketProvider(HttpProvider):
         super().__init__(*args, **kwargs)
         self._canonical_markets = {
             symbol.strip().upper(): instrument_id.strip().upper()
-            for symbol, instrument_id in (
-                type(self)._canonical_markets if market_bindings is None else market_bindings
-            ).items()
+            for symbol, instrument_id in (market_bindings or {}).items()
         }
         self._internal_aliases = {
             alias.strip().upper(): canonical.strip().upper()
-            for alias, canonical in (
-                type(self)._internal_aliases if internal_aliases is None else internal_aliases
-            ).items()
+            for alias, canonical in (internal_aliases or {}).items()
         }
         if any(
             canonical not in self._canonical_markets
@@ -287,7 +271,7 @@ class OkxMarketProvider(HttpProvider):
 
 
 class OkxBethYieldProvider(HttpProvider):
-    """Read OKX's public, provider-reported annualized BETH staking rate."""
+    """Read OKX's public, provider-reported annualized staking rate."""
 
     name = "okx_beth_yield"
     base_url = "https://www.okx.com"
@@ -296,6 +280,7 @@ class OkxBethYieldProvider(HttpProvider):
     def __init__(
         self,
         *args: Any,
+        yield_policies: Mapping[str, Mapping[str, Any]] | None = None,
         days: int = 30,
         clock: Callable[[], datetime] = _utc_now,
         **kwargs: Any,
@@ -303,32 +288,44 @@ class OkxBethYieldProvider(HttpProvider):
         super().__init__(*args, **kwargs)
         if not 1 <= days <= 365:
             raise ValueError("days must be between 1 and 365")
+        self.yield_policies = {
+            symbol.strip().upper(): dict(policy)
+            for symbol, policy in (yield_policies or {}).items()
+        }
         self.days = days
         self._clock = clock
 
     async def get_yield(self, symbol: str) -> YieldMetric:
         normalized = symbol.strip().upper()
-        parts = normalized.split(":")
-        if len(parts) != 2 or parts[0] != "BETH" or not parts[1]:
-            raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
+        try:
+            policy = self.yield_policies[normalized]
+            component_symbol = str(policy["component_symbol"]).strip().upper()
+            underlying_asset = str(policy["underlying_asset"]).strip().upper()
+            accrual_mode = RewardAccrualMode(policy["accrual_mode"])
+            method = str(policy["method"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UnsupportedInstrument(
+                self.name,
+                f"unsupported yield symbol {normalized}",
+            ) from exc
         payload = await self._request_json(
             "GET",
             f"{self.base_url}{self.path}",
             params={"days": str(self.days)},
         )
-        rows = _okx_data(payload, self.name, "BETH rate data")
+        rows = _okx_data(payload, self.name, "staking-rate data")
         if not rows:
-            raise ProviderUnavailable(self.name, "BETH rate history is empty")
+            raise ProviderUnavailable(self.name, "staking-rate history is empty")
         observations: list[tuple[datetime, Decimal]] = []
         for item in rows:
-            row = require_mapping(item, self.name, "BETH rate observation")
+            row = require_mapping(item, self.name, "staking-rate observation")
             try:
                 as_of = utc_datetime(row["ts"], milliseconds=True)
                 rate_fraction = decimal_value(row["rate"])
             except (KeyError, ValueError) as exc:
-                raise MalformedResponse(self.name, "invalid BETH rate observation") from exc
+                raise MalformedResponse(self.name, "invalid staking-rate observation") from exc
             if rate_fraction < 0:
-                raise MalformedResponse(self.name, "BETH rate cannot be negative")
+                raise MalformedResponse(self.name, "staking rate cannot be negative")
             observations.append((as_of, rate_fraction))
         as_of, rate_fraction = max(observations, key=lambda item: item[0])
         now = ensure_utc(self._clock())
@@ -338,12 +335,12 @@ class OkxBethYieldProvider(HttpProvider):
             # OKX encodes the already annualized rate as a fraction.
             value=rate_fraction * Decimal(100),
             as_of=as_of,
-            method="okx_beth_provider_reported_apr",
+            method=method,
             provider=self.name,
             is_proxy=False,
             components=(
                 SourceComponent(
-                    symbol="BETH",
+                    symbol=component_symbol,
                     provider=self.name,
                     price=rate_fraction,
                     as_of=as_of,
@@ -352,8 +349,8 @@ class OkxBethYieldProvider(HttpProvider):
                 ),
             ),
             rate_type=YieldRateType.APR,
-            accrual_mode=RewardAccrualMode.DISTRIBUTED_UNITS,
-            underlying_asset="ETH",
+            accrual_mode=accrual_mode,
+            underlying_asset=underlying_asset,
             is_estimate=False,
             quality=YieldQuality(
                 stale=staleness_ms > 2 * 24 * 60 * 60 * 1000,

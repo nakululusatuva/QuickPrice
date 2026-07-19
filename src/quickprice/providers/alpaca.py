@@ -10,8 +10,6 @@ from typing import Any, ClassVar
 
 import aiohttp
 
-from quickprice.equities import DIVIDEND_FREQUENCIES, LISTED_TICKERS
-
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
 from .base import (
     HttpProvider,
@@ -39,10 +37,10 @@ class AlpacaProvider(HttpProvider):
     # oversized WebSocket subscription forever.
     default_stream_symbol_limit = 30
     default_rest_calls_per_minute = 180
-    symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
-    stream_symbols: ClassVar[tuple[str, ...]] = tuple(symbols)[:default_stream_symbol_limit]
-    _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
-    _frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
+    symbols: ClassVar[dict[str, str]] = {}
+    stream_symbols: ClassVar[tuple[str, ...]] = ()
+    _reverse_symbols: ClassVar[dict[str, str]] = {}
+    _frequencies: ClassVar[dict[str, str]] = {}
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1Min",
         "5m": "5Min",
@@ -59,6 +57,7 @@ class AlpacaProvider(HttpProvider):
         trading_base_url: str | None = None,
         symbol_bindings: Mapping[str, str] | None = None,
         dividend_frequencies: Mapping[str, str] | None = None,
+        regular_dividend_subtypes: Mapping[str, Sequence[str]] | None = None,
         stream_symbols: Sequence[str] | None = None,
         stream_symbol_limit: int = default_stream_symbol_limit,
         rest_calls_per_minute: int = default_rest_calls_per_minute,
@@ -70,9 +69,7 @@ class AlpacaProvider(HttpProvider):
         self.api_secret = api_secret
         self.symbols = {
             symbol.strip().upper(): ticker.strip().upper()
-            for symbol, ticker in (
-                type(self).symbols if symbol_bindings is None else symbol_bindings
-            ).items()
+            for symbol, ticker in (symbol_bindings or {}).items()
         }
         if len(set(self.symbols.values())) != len(self.symbols):
             raise ValueError("Alpaca tickers must be unique")
@@ -105,11 +102,16 @@ class AlpacaProvider(HttpProvider):
         self._rest_gate = rest_gate or SlidingWindowRateGate(rest_calls_per_minute, 60.0)
         self._frequencies = {
             symbol.strip().upper(): frequency.strip().lower()
-            for symbol, frequency in (
-                type(self)._frequencies if dividend_frequencies is None else dividend_frequencies
-            ).items()
+            for symbol, frequency in (dividend_frequencies or {}).items()
             if symbol.strip().upper() in self.symbols
         }
+        self._regular_dividend_subtypes = {
+            symbol.strip().upper(): frozenset(str(item).strip().lower() for item in subtypes)
+            for symbol, subtypes in (regular_dividend_subtypes or {}).items()
+            if symbol.strip().upper() in self._frequencies
+        }
+        if self._frequencies.keys() - self._regular_dividend_subtypes.keys():
+            raise ValueError("every Alpaca dividend symbol requires a subtype policy")
         resolved_trading_url = (
             type(self).trading_base_url if trading_base_url is None else trading_base_url
         ).strip()
@@ -310,7 +312,7 @@ class AlpacaProvider(HttpProvider):
             if row.get("special") is not False or row.get("foreign") is True:
                 continue
             subtype = str(row.get("sub_type") or "").strip().lower()
-            allowed_subtypes = {"", "interest"} if normalized == "SGOV:USD" else {""}
+            allowed_subtypes = self._regular_dividend_subtypes[normalized]
             if subtype not in allowed_subtypes:
                 # ``return_of_capital`` must never be presented as a regular
                 # dividend. Unknown future subtypes also fail closed.

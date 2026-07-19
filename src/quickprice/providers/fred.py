@@ -1,4 +1,4 @@
-"""FRED DGS3MO adapter for the BOXX Treasury proxy yield."""
+"""FRED Treasury-series proxy-yield adapter."""
 
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ from .base import (
 class FredProvider(HttpProvider):
     name = "fred"
     base_url = "https://api.stlouisfed.org/fred/series/observations"
-    series_id = "DGS3MO"
-    expense_ratio_percentage_points = Decimal("0.1949")
 
     def __init__(
         self,
@@ -29,35 +27,23 @@ class FredProvider(HttpProvider):
         series_bindings: Mapping[str, str] | None = None,
         expense_ratios: Mapping[str, Decimal | str | int | float] | None = None,
         method_bindings: Mapping[str, str] | None = None,
+        component_role_bindings: Mapping[str, str] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.api_key = api_key
         self.series_bindings = {
             symbol.strip().upper(): series.strip().upper()
-            for symbol, series in (
-                {"BOXX:USD": type(self).series_id} if series_bindings is None else series_bindings
-            ).items()
+            for symbol, series in (series_bindings or {}).items()
         }
-        requested_expenses = (
-            {"BOXX:USD": type(self).expense_ratio_percentage_points}
-            if expense_ratios is None
-            else expense_ratios
-        )
+        requested_expenses = expense_ratios or {}
         self.expense_ratios = {
             symbol.strip().upper(): decimal_value(value)
             for symbol, value in requested_expenses.items()
         }
         if self.series_bindings.keys() != self.expense_ratios.keys():
             raise ValueError("FRED series and expense-ratio bindings must have the same symbols")
-        requested_methods = method_bindings or {
-            symbol: (
-                "treasury_3m_proxy_minus_expense"
-                if series == "DGS3MO"
-                else "treasury_series_proxy_minus_expense"
-            )
-            for symbol, series in self.series_bindings.items()
-        }
+        requested_methods = method_bindings or {}
         self.method_bindings = {
             symbol.strip().upper(): method.strip().lower()
             for symbol, method in requested_methods.items()
@@ -71,6 +57,12 @@ class FredProvider(HttpProvider):
             }
         ):
             raise ValueError("unsupported FRED yield method binding")
+        self.component_role_bindings = {
+            symbol.strip().upper(): role.strip().lower()
+            for symbol, role in (component_role_bindings or {}).items()
+        }
+        if self.series_bindings.keys() != self.component_role_bindings.keys():
+            raise ValueError("FRED component-role and series bindings must have the same symbols")
 
     async def get_yield(self, symbol: str):
         normalized = symbol.strip().upper()
@@ -118,11 +110,7 @@ class FredProvider(HttpProvider):
                 price=treasury_yield,
                 as_of=as_of,
                 feed="fred_daily",
-                role=(
-                    "treasury_3m_yield_percent"
-                    if series_id == "DGS3MO"
-                    else "treasury_yield_percent"
-                ),
+                role=self.component_role_bindings[normalized],
             ),
         )
         return yield_metric(

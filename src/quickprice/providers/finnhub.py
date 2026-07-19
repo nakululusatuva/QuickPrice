@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import Any, ClassVar
+from typing import Any
 
 import aiohttp
-
-from quickprice.equities import LISTED_TICKERS
 
 from ._models import decimal_value, quote, utc_datetime
 from ._ttl import AsyncTtlCache
@@ -33,13 +31,8 @@ class FinnhubProvider(HttpProvider):
     stream_feed = "finnhub_websocket"
     stream_poll_suppression_seconds = 120.0
     closed_market_quote_poll_seconds = 900.0
-    symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
     # Finnhub's personal free tier accepts at most 50 WebSocket symbols. Any
     # future symbols beyond this prefix continue to use quota-bounded REST.
-    stream_symbols: ClassVar[tuple[str, ...]] = tuple(symbols)[:50]
-    _reverse_symbols: ClassVar[dict[str, str]] = {
-        ticker: symbol for symbol, ticker in symbols.items()
-    }
 
     def __init__(
         self,
@@ -60,9 +53,7 @@ class FinnhubProvider(HttpProvider):
         self.api_key = normalized_key
         self.symbols = {
             symbol.strip().upper(): ticker.strip().upper()
-            for symbol, ticker in (
-                type(self).symbols if symbol_bindings is None else symbol_bindings
-            ).items()
+            for symbol, ticker in (symbol_bindings or {}).items()
         }
         if len(set(self.symbols.values())) != len(self.symbols):
             raise ValueError("Finnhub tickers must be unique")

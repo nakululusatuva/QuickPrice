@@ -36,16 +36,8 @@ class KrakenProvider(HttpProvider):
     websocket_url = "wss://ws.kraken.com/v2"
     feed = "kraken_spot"
 
-    symbols: ClassVar[dict[str, tuple[str, str]]] = {
-        "BTC:USDC": ("XBTUSDC", "BTC/USDC"),
-        "ETH:USDC": ("ETHUSDC", "ETH/USDC"),
-        "SOL:USDC": ("SOLUSDC", "SOL/USDC"),
-        "XMR:USDC": ("XMRUSDC", "XMR/USDC"),
-        "BNB:USDC": ("BNBUSDC", "BNB/USDC"),
-    }
-    _ws_reverse: ClassVar[dict[str, str]] = {
-        ws: canonical for canonical, (_, ws) in symbols.items()
-    }
+    symbols: ClassVar[dict[str, tuple[str, str]]] = {}
+    _ws_reverse: ClassVar[dict[str, str]] = {}
     _intervals: ClassVar[dict[str, int]] = {
         "1m": 1,
         "5m": 5,
@@ -64,7 +56,7 @@ class KrakenProvider(HttpProvider):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        raw_bindings = type(self).symbols if symbol_bindings is None else symbol_bindings
+        raw_bindings = symbol_bindings or {}
         normalized_bindings: dict[str, tuple[str, str]] = {}
         for raw_symbol, raw_pair in raw_bindings.items():
             symbol = raw_symbol.strip().upper()

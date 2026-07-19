@@ -10,6 +10,16 @@ import pytest
 
 from quickprice.analytics import calculate_changes
 from quickprice.domain import PricePoint, ProviderQuote
+from quickprice.provider_factory import (
+    create_builtin_alpaca_provider,
+    create_builtin_alpha_vantage_provider,
+    create_builtin_binance_provider,
+    create_builtin_coingecko_provider,
+    create_builtin_finnhub_provider,
+    create_builtin_fred_provider,
+    create_builtin_kraken_provider,
+    create_builtin_twelve_data_provider,
+)
 from quickprice.providers.alpaca import AlpacaProvider
 from quickprice.providers.alpha_vantage import AlphaVantageProvider
 from quickprice.providers.base import (
@@ -33,15 +43,13 @@ from quickprice.providers.coingecko import (
     coingecko_simple_price_id_batches,
 )
 from quickprice.providers.finnhub import FinnhubProvider
-from quickprice.providers.fred import FredProvider
 from quickprice.providers.kraken import KRAKEN_SYMBOLS_PER_SUBSCRIPTION, KrakenProvider
 from quickprice.providers.router import ProviderRouter
-from quickprice.providers.twelve_data import TwelveDataProvider
 
 
 @pytest.mark.asyncio
 async def test_binance_quote_and_unadjusted_kline_contract(fixture_json):
-    provider = BinanceProvider()
+    provider = create_builtin_binance_provider()
     provider._request_json = AsyncMock(
         side_effect=[fixture_json("binance_quote.json"), fixture_json("binance_history.json")]
     )
@@ -65,7 +73,7 @@ async def test_binance_quote_and_unadjusted_kline_contract(fixture_json):
 @pytest.mark.asyncio
 async def test_binance_internal_wbeth_leg_uses_current_book_midpoint():
     observed_at = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
-    provider = BinanceProvider(wall_clock=lambda: observed_at)
+    provider = create_builtin_binance_provider(wall_clock=lambda: observed_at)
     provider._request_json = AsyncMock(
         return_value={"symbol": "WBETHETH", "bidPrice": "1.1022", "askPrice": "1.1024"}
     )
@@ -85,7 +93,7 @@ async def test_binance_internal_wbeth_leg_uses_current_book_midpoint():
 @pytest.mark.asyncio
 async def test_binance_wide_internal_book_is_rejected_and_routed_to_fallback():
     observed_at = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
-    provider = BinanceProvider(wall_clock=lambda: observed_at)
+    provider = create_builtin_binance_provider(wall_clock=lambda: observed_at)
     provider._request_json = AsyncMock(
         return_value={"symbol": "WBETHETH", "bidPrice": "1.00", "askPrice": "1.02"}
     )
@@ -125,7 +133,7 @@ async def test_binance_wide_internal_book_is_rejected_and_routed_to_fallback():
 async def test_binance_extended_crypto_uses_canonical_usdc_markets(
     fixture_json, symbol: str, exchange_symbol: str
 ):
-    provider = BinanceProvider()
+    provider = create_builtin_binance_provider()
     provider._request_json = AsyncMock(
         side_effect=[fixture_json("binance_quote.json"), fixture_json("binance_history.json")]
     )
@@ -146,7 +154,7 @@ async def test_binance_extended_crypto_uses_canonical_usdc_markets(
 
 @pytest.mark.asyncio
 async def test_binance_rejects_xmr_without_a_supported_market():
-    provider = BinanceProvider()
+    provider = create_builtin_binance_provider()
 
     with pytest.raises(UnsupportedInstrument):
         await provider.get_quote("XMR:USDC")
@@ -170,7 +178,7 @@ def test_binance_shards_two_thousand_dynamic_stream_bindings_safely() -> None:
 
 @pytest.mark.asyncio
 async def test_kraken_trade_contract(fixture_json):
-    provider = KrakenProvider()
+    provider = create_builtin_kraken_provider()
     provider._request_json = AsyncMock(return_value=fixture_json("kraken_quote.json"))
 
     result = await provider.get_quote("BTC:USDC")
@@ -182,7 +190,9 @@ async def test_kraken_trade_contract(fixture_json):
 
 @pytest.mark.asyncio
 async def test_kraken_sol_and_xmr_use_canonical_rest_pairs(fixture_json):
-    provider = KrakenProvider()
+    provider = create_builtin_kraken_provider(
+        wall_clock=lambda: datetime(2026, 7, 20, 2, 1, tzinfo=UTC)
+    )
     timestamp = int(datetime(2026, 7, 20, 1, tzinfo=UTC).timestamp())
     provider._request_json = AsyncMock(
         side_effect=[
@@ -215,7 +225,9 @@ async def test_kraken_sol_and_xmr_use_canonical_rest_pairs(fixture_json):
 
 
 def test_kraken_bnb_uses_canonical_usdc_pair() -> None:
-    assert KrakenProvider.symbols["BNB:USDC"] == ("BNBUSDC", "BNB/USDC")
+    provider = create_builtin_kraken_provider()
+
+    assert provider.symbols["BNB:USDC"] == ("BNBUSDC", "BNB/USDC")
 
 
 def test_kraken_batches_two_thousand_subscriptions_on_one_connection() -> None:
@@ -236,7 +248,7 @@ def test_kraken_batches_two_thousand_subscriptions_on_one_connection() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("symbol", ["POL:USDC", "TRX:USDC"])
 async def test_kraken_rejects_assets_without_usdc_markets(symbol: str) -> None:
-    provider = KrakenProvider()
+    provider = create_builtin_kraken_provider()
 
     with pytest.raises(UnsupportedInstrument):
         await provider.get_quote(symbol)
@@ -244,7 +256,7 @@ async def test_kraken_rejects_assets_without_usdc_markets(symbol: str) -> None:
 
 @pytest.mark.asyncio
 async def test_coingecko_quote_is_usdc_ratio_with_components(fixture_json):
-    provider = CoinGeckoProvider("demo")
+    provider = create_builtin_coingecko_provider("demo")
     provider._request_json = AsyncMock(return_value=fixture_json("coingecko_quote.json"))
 
     result = await provider.get_quote("WBETH:USDC")
@@ -279,7 +291,7 @@ async def test_coingecko_quote_supports_direct_usd_without_usdc_normalization():
 async def test_coingecko_allows_subminute_wbeth_component_skew(fixture_json):
     payload = fixture_json("coingecko_quote.json")
     payload["usd-coin"]["last_updated_at"] -= 30
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
     provider._request_json = AsyncMock(return_value=payload)
 
     result = await provider.get_quote("WBETH:USDC")
@@ -291,10 +303,10 @@ async def test_coingecko_allows_subminute_wbeth_component_skew(fixture_json):
 async def test_coingecko_rejects_wbeth_component_skew_over_one_minute(fixture_json):
     payload = fixture_json("coingecko_quote.json")
     payload["usd-coin"]["last_updated_at"] -= 60
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
     provider._request_json = AsyncMock(return_value=payload)
 
-    with pytest.raises(MalformedResponse, match="configured limit"):
+    with pytest.raises(MalformedResponse, match="configured normalization limit"):
         await provider.get_quote("WBETH:USDC")
 
 
@@ -302,7 +314,7 @@ async def test_coingecko_rejects_wbeth_component_skew_over_one_minute(fixture_js
 async def test_coingecko_clamps_history_to_demo_365_day_boundary():
     end = datetime(2026, 7, 20, 15, tzinfo=UTC)
     boundary = end - timedelta(days=365)
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
     provider._request_json = AsyncMock(
         side_effect=[
             {"prices": [[int((boundary + timedelta(hours=9)).timestamp() * 1000), 4000.0]]},
@@ -332,7 +344,7 @@ async def test_coingecko_clamps_history_to_demo_365_day_boundary():
 @pytest.mark.asyncio
 async def test_coingecko_daily_boundary_uses_short_failure_and_long_success_ttls():
     monotonic = [0.0]
-    provider = CoinGeckoProvider("key", clock=lambda: monotonic[0])
+    provider = create_builtin_coingecko_provider("key", clock=lambda: monotonic[0])
     provider._request_json = AsyncMock(
         side_effect=[
             ProviderUnavailable("coingecko", "temporary failure"),
@@ -364,7 +376,7 @@ async def test_coingecko_daily_boundary_uses_short_failure_and_long_success_ttls
 @pytest.mark.asyncio
 async def test_coingecko_allows_slow_aggregated_staking_component_updates():
     timestamp = 1_768_000_000
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
     provider._request_json = AsyncMock(
         return_value={
             "wrapped-steth": {"usd": 4800, "last_updated_at": timestamp - 12},
@@ -395,7 +407,7 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
         "usd-coin": {"usd": 1, "last_updated_at": timestamp},
     }
-    provider = CoinGeckoProvider("key", clock=lambda: 10.0)
+    provider = create_builtin_coingecko_provider("key", clock=lambda: 10.0)
 
     async def request_json(*_args, **_kwargs):
         await asyncio.sleep(0)
@@ -445,7 +457,14 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
 async def test_coingecko_batches_and_merges_two_thousand_dynamic_ids_without_network() -> None:
     coin_ids = {f"C{index:04d}:USDC": f"coin-{index:04d}" for index in range(2_000)}
     expected_ids = {*coin_ids.values(), "usd-coin"}
-    provider = CoinGeckoProvider("key", coin_ids=coin_ids, clock=lambda: 10.0)
+    provider = CoinGeckoProvider(
+        "key",
+        coin_ids=coin_ids,
+        normalization_quote_asset="USDC",
+        normalization_coin_id="usd-coin",
+        normalization_component_symbol="USDC:USD",
+        clock=lambda: 10.0,
+    )
 
     async def request_json(*_args, **kwargs):
         requested = kwargs["params"]["ids"].split(",")
@@ -470,7 +489,7 @@ async def test_coingecko_batches_and_merges_two_thousand_dynamic_ids_without_net
 async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_failures():
     monotonic = [0.0]
     timestamp = 1_768_000_000
-    provider = CoinGeckoProvider(
+    provider = create_builtin_coingecko_provider(
         "key",
         cache_ttl_seconds=300,
         maximum_error_cache_ttl_seconds=3600,
@@ -512,7 +531,7 @@ async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_fai
 
 @pytest.mark.asyncio
 async def test_coingecko_does_not_claim_intraday_history_support():
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
 
     with pytest.raises(UnsupportedInstrument, match="only for configured"):
         await provider.get_history(
@@ -529,7 +548,7 @@ async def test_coingecko_does_not_claim_intraday_history_support():
     ["SOL:USDC", "XMR:USDC", "POL:USDC", "BNB:USDC", "TRX:USDC"],
 )
 async def test_coingecko_is_quote_only_for_ordinary_spot_fallbacks(symbol: str):
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
 
     with pytest.raises(UnsupportedInstrument, match="only for configured"):
         await provider.get_history(
@@ -545,7 +564,7 @@ async def test_coingecko_liquid_staking_history_is_normalized_to_usdc():
     start = datetime(2026, 7, 1, tzinfo=UTC)
     end = start + timedelta(days=2)
     timestamp = int((start + timedelta(hours=1)).timestamp())
-    provider = CoinGeckoProvider("key", clock=lambda: 10.0)
+    provider = create_builtin_coingecko_provider("key", clock=lambda: 10.0)
     provider._request_json = AsyncMock(
         side_effect=[
             {
@@ -584,7 +603,7 @@ async def test_coingecko_liquid_staking_history_is_normalized_to_usdc():
 async def test_coingecko_internal_usd_history_does_not_consume_usdc_quote_refresh():
     start = datetime(2026, 7, 1, tzinfo=UTC)
     end = start + timedelta(days=1)
-    provider = CoinGeckoProvider("key")
+    provider = create_builtin_coingecko_provider("key")
     provider._request_json = AsyncMock(
         return_value={"prices": [[int(start.timestamp() * 1000), "3000"]]}
     )
@@ -604,7 +623,7 @@ async def test_coingecko_internal_usd_history_does_not_consume_usdc_quote_refres
 
 @pytest.mark.asyncio
 async def test_alpaca_iex_quote_bars_and_regular_dividend(fixture_json):
-    provider = AlpacaProvider("key", "secret")
+    provider = create_builtin_alpaca_provider("key", "secret")
     provider._request_json = AsyncMock(
         side_effect=[
             fixture_json("alpaca_quote.json"),
@@ -682,7 +701,7 @@ async def test_alpaca_stream_trade_does_not_claim_market_clock_status():
             del args, kwargs
             return FakeWebsocket()
 
-    provider = AlpacaProvider("key", "secret", session=FakeSession())
+    provider = create_builtin_alpaca_provider("key", "secret", session=FakeSession())
 
     stream = provider.stream_quotes(("QQQM:USD",))
     streamed = await anext(stream)
@@ -695,7 +714,7 @@ async def test_alpaca_stream_trade_does_not_claim_market_clock_status():
 @pytest.mark.asyncio
 async def test_finnhub_quote_uses_header_auth_and_normalizes_trade(fixture_json):
     vendor_time = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
-    provider = FinnhubProvider("secret-finnhub-key")
+    provider = create_builtin_finnhub_provider("secret-finnhub-key")
     provider._request_json = AsyncMock(return_value=fixture_json("finnhub_quote.json"))
 
     result = await provider.get_quote("qqqm:usd")
@@ -723,7 +742,7 @@ async def test_finnhub_quote_uses_header_auth_and_normalizes_trade(fixture_json)
 async def test_finnhub_rejects_a_non_positive_vendor_timestamp(fixture_json):
     payload = fixture_json("finnhub_quote.json")
     payload["t"] = 0
-    provider = FinnhubProvider("key")
+    provider = create_builtin_finnhub_provider("key")
     provider._request_json = AsyncMock(return_value=payload)
 
     with pytest.raises(ProviderUnavailable, match="no current quote data"):
@@ -732,7 +751,7 @@ async def test_finnhub_rejects_a_non_positive_vendor_timestamp(fixture_json):
 
 @pytest.mark.asyncio
 async def test_finnhub_rejects_an_unmapped_instrument_before_request():
-    provider = FinnhubProvider("key")
+    provider = create_builtin_finnhub_provider("key")
     provider._request_json = AsyncMock()
 
     with pytest.raises(UnsupportedInstrument, match="unsupported symbol"):
@@ -762,7 +781,7 @@ async def test_finnhub_keeps_two_thousand_bindings_with_rest_overflow_after_stre
 
 @pytest.mark.asyncio
 async def test_finnhub_all_zero_quote_fails_closed():
-    provider = FinnhubProvider("key")
+    provider = create_builtin_finnhub_provider("key")
     provider._request_json = AsyncMock(
         return_value={"c": 0, "d": None, "dp": None, "h": 0, "l": 0, "o": 0, "pc": 0}
     )
@@ -773,7 +792,7 @@ async def test_finnhub_all_zero_quote_fails_closed():
 
 @pytest.mark.asyncio
 async def test_finnhub_rest_error_does_not_echo_the_vendor_message():
-    provider = FinnhubProvider("secret-finnhub-key")
+    provider = create_builtin_finnhub_provider("secret-finnhub-key")
     provider._request_json = AsyncMock(return_value={"error": "Invalid API key secret-finnhub-key"})
 
     with pytest.raises(ProviderUnavailable) as error:
@@ -795,7 +814,7 @@ async def test_finnhub_rest_error_does_not_echo_the_vendor_message():
     ],
 )
 async def test_finnhub_malformed_quote_is_rejected(payload):
-    provider = FinnhubProvider("key")
+    provider = create_builtin_finnhub_provider("key")
     provider._request_json = AsyncMock(return_value=payload)
 
     with pytest.raises(MalformedResponse):
@@ -854,7 +873,7 @@ async def test_finnhub_stream_subscribes_once_and_normalizes_millisecond_trades(
             return self.websocket
 
     session = FakeSession()
-    provider = FinnhubProvider(
+    provider = create_builtin_finnhub_provider(
         "secret-finnhub-key",
         session=session,
         proxy_url="http://10.0.1.7:7890",
@@ -921,7 +940,7 @@ async def test_finnhub_stream_error_fails_without_echoing_vendor_message_or_key(
             del args, kwargs
             return FakeWebsocket()
 
-    provider = FinnhubProvider("secret-finnhub-key", session=FakeSession())
+    provider = create_builtin_finnhub_provider("secret-finnhub-key", session=FakeSession())
     stream = provider.stream_quotes(("QQQM:USD",))
 
     with pytest.raises(ProviderUnavailable) as error:
@@ -936,7 +955,7 @@ async def test_finnhub_stream_error_fails_without_echoing_vendor_message_or_key(
 @pytest.mark.asyncio
 async def test_alpha_date_only_equity_quote_fails_closed_before_regular_close():
     wall_time = datetime(2026, 11, 27, 18, 30, tzinfo=UTC)
-    provider = AlphaVantageProvider("key", wall_clock=lambda: wall_time)
+    provider = create_builtin_alpha_vantage_provider("key", wall_clock=lambda: wall_time)
     provider._request_json = AsyncMock(
         return_value={
             "Global Quote": {
@@ -955,7 +974,7 @@ async def test_alpha_date_only_equity_quote_fails_closed_before_regular_close():
 @pytest.mark.asyncio
 async def test_alpha_date_only_equity_quote_never_returns_a_future_timestamp():
     wall_time = datetime(2026, 11, 27, 21, 1, tzinfo=UTC)
-    provider = AlphaVantageProvider("key", wall_clock=lambda: wall_time)
+    provider = create_builtin_alpha_vantage_provider("key", wall_clock=lambda: wall_time)
     provider._request_json = AsyncMock(
         return_value={
             "Global Quote": {
@@ -973,7 +992,7 @@ async def test_alpha_date_only_equity_quote_never_returns_a_future_timestamp():
 
 @pytest.mark.asyncio
 async def test_alpaca_excludes_return_of_capital_from_regular_dividend():
-    provider = AlpacaProvider("key", "secret")
+    provider = create_builtin_alpaca_provider("key", "secret")
     provider._request_json = AsyncMock(
         return_value={
             "cash_dividends": [
@@ -1072,7 +1091,7 @@ async def test_alpaca_applies_one_shared_rate_gate_to_all_rest_requests(monkeypa
 
 @pytest.mark.asyncio
 async def test_alpaca_nested_actions_accept_sgov_interest_distribution(fixture_json):
-    provider = AlpacaProvider("key", "secret")
+    provider = create_builtin_alpaca_provider("key", "secret")
     provider._request_json = AsyncMock(return_value=fixture_json("alpaca_sgov_dividends.json"))
 
     event = await provider.get_latest_dividend("SGOV:USD")
@@ -1086,7 +1105,7 @@ async def test_alpaca_nested_actions_accept_sgov_interest_distribution(fixture_j
 
 @pytest.mark.asyncio
 async def test_alpaca_rejects_malformed_nested_actions_envelope():
-    provider = AlpacaProvider("key", "secret")
+    provider = create_builtin_alpaca_provider("key", "secret")
     provider._request_json = AsyncMock(return_value={"corporate_actions": []})
 
     with pytest.raises(MalformedResponse, match="corporate_actions must be an object"):
@@ -1095,7 +1114,7 @@ async def test_alpaca_rejects_malformed_nested_actions_envelope():
 
 @pytest.mark.asyncio
 async def test_twelve_data_quote_and_history_contract(fixture_json):
-    provider = TwelveDataProvider("key")
+    provider = create_builtin_twelve_data_provider("key")
     provider._request_json = AsyncMock(
         side_effect=[fixture_json("twelve_history.json"), fixture_json("twelve_history.json")]
     )
@@ -1129,7 +1148,7 @@ async def test_twelve_router_allows_locally_paced_ninth_call(monkeypatch):
                 await asyncio.sleep(0.02)
 
     gate = Gate()
-    provider = TwelveDataProvider("key", rate_gate=gate, request_timeout=0.005)
+    provider = create_builtin_twelve_data_provider("key", rate_gate=gate, request_timeout=0.005)
     payload = {"values": [{"datetime": "2026-07-20 14:30:00", "close": "7.21530"}]}
     upstream = AsyncMock(return_value=payload)
     monkeypatch.setattr(HttpProvider, "_request_json", upstream)
@@ -1167,7 +1186,7 @@ async def test_twelve_local_gate_saturation_is_bounded_without_spending_fallback
         async def acquire(self):
             await blocked.wait()
 
-    provider = TwelveDataProvider(
+    provider = create_builtin_twelve_data_provider(
         "key",
         rate_gate=SaturatedGate(),
         rate_gate_timeout_seconds=0.005,
@@ -1210,7 +1229,7 @@ async def test_kraken_can_reject_an_illiquid_stale_trade_for_router_fallback(fix
     payload = fixture_json("kraken_quote.json")
     rows = next(value for key, value in payload["result"].items() if key != "last")
     rows[-1][2] = (now - timedelta(minutes=6)).timestamp()
-    provider = KrakenProvider(
+    provider = create_builtin_kraken_provider(
         max_quote_ages={"XMR:USDC": timedelta(minutes=5)},
         wall_clock=lambda: now,
     )
@@ -1222,7 +1241,7 @@ async def test_kraken_can_reject_an_illiquid_stale_trade_for_router_fallback(fix
 
 @pytest.mark.asyncio
 async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
-    provider = AlphaVantageProvider("key")
+    provider = create_builtin_alpha_vantage_provider("key")
     provider._request_json = AsyncMock(
         side_effect=[fixture_json("alpha_fx_quote.json"), fixture_json("alpha_dividends.json")]
     )
@@ -1242,7 +1261,7 @@ async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
     ("provider_factory", "payload"),
     [
         (
-            lambda: AlphaVantageProvider("key"),
+            lambda: create_builtin_alpha_vantage_provider("key"),
             {
                 "data": [
                     {
@@ -1254,7 +1273,7 @@ async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
             },
         ),
         (
-            lambda: AlpacaProvider("key", "secret"),
+            lambda: create_builtin_alpaca_provider("key", "secret"),
             {
                 "cash_dividends": [
                     {
@@ -1278,7 +1297,7 @@ async def test_unclassified_distribution_is_not_annualized(provider_factory, pay
 
 @pytest.mark.asyncio
 async def test_fred_boxx_proxy_contract(fixture_json):
-    provider = FredProvider("key")
+    provider = create_builtin_fred_provider("key")
     provider._request_json = AsyncMock(return_value=fixture_json("fred_dgs3mo.json"))
 
     result = await provider.get_yield("BOXX:USD")

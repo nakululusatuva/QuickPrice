@@ -280,7 +280,9 @@ a public or shared interface.
 ## Provider model
 
 Adapters implement uniform quote, history, dividend, yield, and accrual-index
-contracts. Routing is configured per instrument and capability. The router
+contracts. Provider modules contain no built-in trading-pair tables; each
+runtime generation injects validated vendor-symbol bindings from the managed
+catalog. Routing is configured per instrument and capability. The router
 applies timeouts, durable quota accounting, single-flight request merging,
 three-failure circuit breakers, 60-second half-open probes, and exponential
 reconnect backoff. The multi-request Ethereum exchange-rate algorithm has a

@@ -34,21 +34,9 @@ class BinanceProvider(HttpProvider):
     websocket_base_url = "wss://stream.binance.com:9443"
     feed = "binance_spot"
 
-    symbols: ClassVar[dict[str, str]] = {
-        "BTC:USDC": "BTCUSDC",
-        "ETH:USDC": "ETHUSDC",
-        "SOL:USDC": "SOLUSDC",
-        "POL:USDC": "POLUSDC",
-        "BNB:USDC": "BNBUSDC",
-        "TRX:USDC": "TRXUSDC",
-        "WBETH:ETH": "WBETHETH",
-        "WBETH:USDT": "WBETHUSDT",
-        "USDC:USDT": "USDCUSDT",
-    }
-    _reverse_symbols: ClassVar[dict[str, str]] = {value: key for key, value in symbols.items()}
-    _midpoint_symbols: ClassVar[frozenset[str]] = frozenset(
-        {"WBETH:ETH", "WBETH:USDT", "USDC:USDT"}
-    )
+    symbols: ClassVar[dict[str, str]] = {}
+    _reverse_symbols: ClassVar[dict[str, str]] = {}
+    _midpoint_symbols: ClassVar[frozenset[str]] = frozenset()
     _intervals: ClassVar[dict[str, str]] = {
         "1m": "1m",
         "5m": "5m",
@@ -70,16 +58,12 @@ class BinanceProvider(HttpProvider):
         super().__init__(*args, **kwargs)
         self.symbols = {
             symbol.strip().upper(): vendor_symbol.strip().upper()
-            for symbol, vendor_symbol in (
-                type(self).symbols if symbol_bindings is None else symbol_bindings
-            ).items()
+            for symbol, vendor_symbol in (symbol_bindings or {}).items()
         }
         if len(set(self.symbols.values())) != len(self.symbols):
             raise ValueError("Binance vendor symbols must be unique")
         self._reverse_symbols = {value: key for key, value in self.symbols.items()}
-        configured_midpoints = (
-            type(self)._midpoint_symbols if midpoint_symbols is None else midpoint_symbols
-        )
+        configured_midpoints = midpoint_symbols or ()
         self._midpoint_symbols = frozenset(
             symbol.strip().upper()
             for symbol in configured_midpoints
@@ -164,7 +148,7 @@ class BinanceProvider(HttpProvider):
         )
 
     async def _get_midpoint_quote(self, normalized: str, exchange_symbol: str):
-        """Observe a current book midpoint for synthetic-only WBETH legs.
+        """Observe a current book midpoint for configured thin synthetic legs.
 
         Last trades in these thin component markets can be minutes apart even
         while both books remain live. The book ticker is an observation at

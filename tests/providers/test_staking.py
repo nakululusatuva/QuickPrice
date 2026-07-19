@@ -17,6 +17,11 @@ from quickprice.domain import (
     YieldMetric,
     YieldRateType,
 )
+from quickprice.provider_factory import (
+    create_builtin_binance_yield_provider,
+    create_builtin_ethereum_yield_provider,
+    create_builtin_lido_provider,
+)
 from quickprice.providers.base import (
     Capability,
     MalformedResponse,
@@ -25,9 +30,6 @@ from quickprice.providers.base import (
 )
 from quickprice.providers.router import ProviderRouter
 from quickprice.providers.staking import (
-    BinanceWbethYieldProvider,
-    EthereumExchangeRateYieldProvider,
-    LidoAprProvider,
     StakingMarketRatioSpec,
     StakingMarketRatioYieldProvider,
 )
@@ -42,7 +44,7 @@ def _uint256(value: Decimal) -> str:
 @pytest.mark.asyncio
 async def test_ethereum_yield_uses_bounded_multi_rpc_route_budget_not_global_timeout():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         request_timeout=8,
         clock=lambda: now,
@@ -101,7 +103,7 @@ async def test_ethereum_rpc_keeps_individual_http_request_timeout():
             return Response()
 
     session = Session()
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         session=session,
         request_timeout=0.125,
@@ -117,7 +119,7 @@ async def test_ethereum_rpc_keeps_individual_http_request_timeout():
 @pytest.mark.asyncio
 async def test_ethereum_wbeth_exchange_rate_history_produces_trailing_apy():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         clock=lambda: now,
     )
@@ -188,7 +190,7 @@ async def test_ethereum_daily_exchange_rate_uses_daily_freshness_tolerance(
     expected_stale: bool,
 ) -> None:
     now = datetime(2026, 7, 20, 16, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         clock=lambda: now,
     )
@@ -224,7 +226,7 @@ async def test_ethereum_daily_exchange_rate_uses_daily_freshness_tolerance(
 @pytest.mark.asyncio
 async def test_ethereum_rpc_fails_over_after_wrong_chain_id():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         ("https://wrong.invalid", "https://mainnet.invalid"),
         clock=lambda: now,
     )
@@ -267,7 +269,7 @@ async def test_ethereum_endpoint_race_is_bounded_and_rotates():
         "https://two.invalid",
         "https://three.invalid",
     )
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         urls,
         clock=lambda: now,
         endpoint_race_width=2,
@@ -314,7 +316,7 @@ async def test_ethereum_endpoint_race_is_bounded_and_rotates():
 @pytest.mark.asyncio
 async def test_ethereum_current_index_rejects_event_and_state_mismatch():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         clock=lambda: now,
     )
@@ -351,7 +353,7 @@ async def test_ethereum_current_index_rejects_event_and_state_mismatch():
 @pytest.mark.asyncio
 async def test_ethereum_history_chunks_log_requests_to_configured_span():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = EthereumExchangeRateYieldProvider(
+    provider = create_builtin_ethereum_yield_provider(
         "https://rpc.example.invalid",
         clock=lambda: now,
         max_log_block_span=7,
@@ -395,7 +397,7 @@ async def test_ethereum_history_chunks_log_requests_to_configured_span():
 @pytest.mark.asyncio
 async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = BinanceWbethYieldProvider(
+    provider = create_builtin_binance_yield_provider(
         "read-only-key",
         "secret",
         clock=lambda: now,
@@ -445,7 +447,7 @@ async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
 @pytest.mark.asyncio
 async def test_binance_wbeth_rate_rejects_negative_vendor_apr():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = BinanceWbethYieldProvider(
+    provider = create_builtin_binance_yield_provider(
         "read-only-key",
         "secret",
         clock=lambda: now,
@@ -482,7 +484,7 @@ async def test_lido_official_sma_apr_preserves_token_accrual_mode(
     expected_mode: RewardAccrualMode,
 ):
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = LidoAprProvider(clock=lambda: now)
+    provider = create_builtin_lido_provider(clock=lambda: now)
     provider._request_json = AsyncMock(
         return_value={
             "data": {
@@ -519,7 +521,7 @@ async def test_lido_official_sma_apr_preserves_token_accrual_mode(
 @pytest.mark.asyncio
 async def test_lido_apr_rejects_unexpected_contract_metadata():
     now = datetime(2026, 7, 20, tzinfo=UTC)
-    provider = LidoAprProvider(clock=lambda: now)
+    provider = create_builtin_lido_provider(clock=lambda: now)
     provider._request_json = AsyncMock(
         return_value={
             "data": {
@@ -685,7 +687,7 @@ def test_market_ratio_rejects_non_value_accruing_tokens() -> None:
 
 
 def test_ethereum_exchange_rate_spec_rebinds_only_the_quote_currency() -> None:
-    provider = EthereumExchangeRateYieldProvider("https://ethereum.invalid")
+    provider = create_builtin_ethereum_yield_provider("https://ethereum.invalid")
 
     spec = provider._spec("WBETH:USD")
 

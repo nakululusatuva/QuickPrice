@@ -5,11 +5,9 @@ from __future__ import annotations
 import time as monotonic_time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, time
-from typing import Any, ClassVar
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from quickprice.equities import DIVIDEND_FREQUENCIES, LISTED_TICKERS
-from quickprice.fx import FX_HUB_SYMBOLS
 from quickprice.market import seconds_until_next_us_equity_open
 
 from ._models import date_value, decimal_value, dividend, point, quote, utc_datetime
@@ -30,11 +28,6 @@ class AlphaVantageProvider(HttpProvider):
     base_url = "https://www.alphavantage.co/query"
     feed = "alpha_vantage_eod"
     history_prefix_limited = True
-    equity_symbols: ClassVar[dict[str, str]] = dict(LISTED_TICKERS)
-    fx_symbols: ClassVar[dict[str, tuple[str, str]]] = {
-        symbol: tuple(symbol.split(":")) for symbol in FX_HUB_SYMBOLS
-    }
-    dividend_frequencies: ClassVar[dict[str, str]] = dict(DIVIDEND_FREQUENCIES)
     _new_york = ZoneInfo("America/New_York")
 
     def __init__(
@@ -54,13 +47,9 @@ class AlphaVantageProvider(HttpProvider):
         self.api_key = api_key
         self.equity_symbols = {
             symbol.strip().upper(): ticker.strip().upper()
-            for symbol, ticker in (
-                type(self).equity_symbols
-                if equity_symbol_bindings is None
-                else equity_symbol_bindings
-            ).items()
+            for symbol, ticker in (equity_symbol_bindings or {}).items()
         }
-        raw_fx_symbols = type(self).fx_symbols if fx_symbol_bindings is None else fx_symbol_bindings
+        raw_fx_symbols = fx_symbol_bindings or {}
         self.fx_symbols = {}
         for raw_symbol, raw_pair in raw_fx_symbols.items():
             symbol = raw_symbol.strip().upper()
@@ -75,11 +64,7 @@ class AlphaVantageProvider(HttpProvider):
             self.fx_symbols[symbol] = (parts[0], parts[1])
         self.dividend_frequencies = {
             symbol.strip().upper(): frequency.strip().lower()
-            for symbol, frequency in (
-                type(self).dividend_frequencies
-                if dividend_frequencies is None
-                else dividend_frequencies
-            ).items()
+            for symbol, frequency in (dividend_frequencies or {}).items()
             if symbol.strip().upper() in self.equity_symbols
         }
         self.fx_quote_ttl_seconds = max(21_600.0, fx_quote_ttl_seconds)

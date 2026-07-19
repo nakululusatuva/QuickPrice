@@ -7,19 +7,22 @@ from unittest.mock import AsyncMock
 import pytest
 
 from quickprice.domain import RewardAccrualMode, YieldRateType
+from quickprice.provider_factory import (
+    create_builtin_okx_market_provider,
+    create_builtin_okx_yield_provider,
+)
 from quickprice.providers.base import (
     MalformedResponse,
     ProviderRateLimited,
     ProviderUnavailable,
     UnsupportedInstrument,
 )
-from quickprice.providers.okx import OkxBethYieldProvider, OkxMarketProvider
 
 
 @pytest.mark.asyncio
 async def test_okx_ticker_uses_a_current_safe_book_midpoint(fixture_json) -> None:
     observed_at = datetime(2026, 7, 21, 8, 0, tzinfo=UTC)
-    provider = OkxMarketProvider(
+    provider = create_builtin_okx_market_provider(
         wall_clock=lambda: observed_at,
         minimum_request_interval_seconds=0,
     )
@@ -46,7 +49,7 @@ async def test_okx_ticker_uses_a_current_safe_book_midpoint(fixture_json) -> Non
 
 @pytest.mark.asyncio
 async def test_okx_rejects_a_wide_or_crossed_book() -> None:
-    provider = OkxMarketProvider(minimum_request_interval_seconds=0)
+    provider = create_builtin_okx_market_provider(minimum_request_interval_seconds=0)
     provider._request_json = AsyncMock(
         return_value={
             "code": "0",
@@ -68,7 +71,7 @@ async def test_okx_rejects_a_wide_or_crossed_book() -> None:
 
 @pytest.mark.asyncio
 async def test_okx_history_normalizes_descending_candles(fixture_json) -> None:
-    provider = OkxMarketProvider(minimum_request_interval_seconds=0)
+    provider = create_builtin_okx_market_provider(minimum_request_interval_seconds=0)
     provider._request_json = AsyncMock(return_value=fixture_json("okx_candles.json"))
     start = datetime.fromtimestamp(1784604000, tz=UTC)
     end = datetime.fromtimestamp(1784604240, tz=UTC)
@@ -96,7 +99,7 @@ async def test_okx_history_normalizes_descending_candles(fixture_json) -> None:
 
 @pytest.mark.asyncio
 async def test_okx_history_rejects_malformed_rows() -> None:
-    provider = OkxMarketProvider(minimum_request_interval_seconds=0)
+    provider = create_builtin_okx_market_provider(minimum_request_interval_seconds=0)
     provider._request_json = AsyncMock(return_value={"code": "0", "msg": "", "data": [["bad"]]})
 
     with pytest.raises(MalformedResponse, match="invalid candle"):
@@ -110,7 +113,7 @@ async def test_okx_history_rejects_malformed_rows() -> None:
 
 @pytest.mark.asyncio
 async def test_okx_rate_limit_code_is_normalized() -> None:
-    provider = OkxMarketProvider(minimum_request_interval_seconds=0)
+    provider = create_builtin_okx_market_provider(minimum_request_interval_seconds=0)
     provider._request_json = AsyncMock(
         return_value={"code": "50011", "msg": "rate limit reached", "data": []}
     )
@@ -122,12 +125,12 @@ async def test_okx_rate_limit_code_is_normalized() -> None:
 @pytest.mark.asyncio
 async def test_okx_beth_yield_is_provider_reported_apr_in_percent(fixture_json) -> None:
     latest = datetime.fromtimestamp(1784598300, tz=UTC)
-    provider = OkxBethYieldProvider(clock=lambda: latest + timedelta(hours=1))
+    provider = create_builtin_okx_yield_provider(clock=lambda: latest + timedelta(hours=1))
     provider._request_json = AsyncMock(return_value=fixture_json("okx_beth_apy.json"))
 
-    metric = await provider.get_yield("BETH:USD")
+    metric = await provider.get_yield("BETH:USDC")
 
-    assert metric.symbol == "BETH:USD"
+    assert metric.symbol == "BETH:USDC"
     assert metric.value == Decimal("2.11669700")
     assert metric.as_of == latest
     assert metric.method == "okx_beth_provider_reported_apr"
@@ -148,7 +151,7 @@ async def test_okx_beth_yield_is_provider_reported_apr_in_percent(fixture_json) 
 
 @pytest.mark.asyncio
 async def test_okx_beth_yield_has_no_synthetic_symbol_fallback() -> None:
-    provider = OkxBethYieldProvider()
+    provider = create_builtin_okx_yield_provider()
 
     with pytest.raises(UnsupportedInstrument):
         await provider.get_yield("WBETH:USDC")

@@ -10,11 +10,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from quickprice.equities import LISTED_SYMBOLS
-from quickprice.providers.alpha_vantage import AlphaVantageProvider
+from quickprice.provider_factory import (
+    builtin_fx_max_ages,
+    builtin_fx_requirements,
+    create_builtin_alpha_vantage_provider,
+    create_builtin_finnhub_provider,
+    create_builtin_twelve_data_provider,
+)
 from quickprice.providers.base import HttpProvider, ProviderRateLimited, ProviderUnavailable
-from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxQuoteProvider
-from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.registry import INSTRUMENTS
 
 
@@ -34,7 +38,7 @@ class VirtualClock:
 async def test_finnhub_rest_cache_keeps_the_listed_catalog_below_the_minute_limit() -> None:
     clock = VirtualClock()
     calls = 0
-    provider = FinnhubProvider(
+    provider = create_builtin_finnhub_provider(
         "key",
         quote_cache_clock=clock.monotonic,
     )
@@ -74,7 +78,7 @@ def test_coingecko_staking_cadence_fits_the_rolling_month_safe_daily_budget() ->
 async def test_twelve_fx_hub_cache_keeps_the_complete_matrix_under_daily_limit() -> None:
     clock = VirtualClock()
     calls: Counter[str] = Counter()
-    provider = TwelveDataProvider("key", quote_cache_clock=clock.monotonic)
+    provider = create_builtin_twelve_data_provider("key", quote_cache_clock=clock.monotonic)
 
     async def request_json(method, url, *, params, **kwargs):
         del method, url, kwargs
@@ -98,7 +102,12 @@ async def test_twelve_fx_hub_cache_keeps_the_complete_matrix_under_daily_limit()
         }
 
     provider._request_json = request_json
-    synthetic = UsdHubFxQuoteProvider(provider.get_quote, clock=clock.now)
+    synthetic = UsdHubFxQuoteProvider(
+        provider.get_quote,
+        requirements=builtin_fx_requirements(),
+        max_ages=builtin_fx_max_ages(),
+        clock=clock.now,
+    )
 
     for seconds in range(0, 86_400, 240):
         clock.seconds = float(seconds)
@@ -145,7 +154,7 @@ async def test_twelve_local_gate_timeout_is_not_negative_cached(monkeypatch) -> 
                 await asyncio.sleep(1)
 
     gate = Gate()
-    provider = TwelveDataProvider(
+    provider = create_builtin_twelve_data_provider(
         "key",
         rate_gate=gate,
         rate_gate_timeout_seconds=0.005,
@@ -173,7 +182,7 @@ async def test_twelve_upstream_failure_remains_negative_cached(monkeypatch) -> N
             self.calls += 1
 
     gate = Gate()
-    provider = TwelveDataProvider("key", rate_gate=gate)
+    provider = create_builtin_twelve_data_provider("key", rate_gate=gate)
     upstream = AsyncMock(side_effect=ProviderUnavailable("twelve_data", "fixture outage"))
     monkeypatch.setattr(HttpProvider, "_request_json", upstream)
 
@@ -189,7 +198,7 @@ async def test_twelve_upstream_failure_remains_negative_cached(monkeypatch) -> N
 async def test_alpha_fx_cache_limits_five_hub_legs_to_twenty_requests_per_day() -> None:
     clock = VirtualClock()
     calls: Counter[str] = Counter()
-    provider = AlphaVantageProvider("key", quote_cache_clock=clock.monotonic)
+    provider = create_builtin_alpha_vantage_provider("key", quote_cache_clock=clock.monotonic)
 
     async def request_json(method, url, *, params, **kwargs):
         del method, url, kwargs
@@ -211,7 +220,12 @@ async def test_alpha_fx_cache_limits_five_hub_legs_to_twenty_requests_per_day() 
         }
 
     provider._request_json = request_json
-    synthetic = UsdHubFxQuoteProvider(provider.get_quote, clock=clock.now)
+    synthetic = UsdHubFxQuoteProvider(
+        provider.get_quote,
+        requirements=builtin_fx_requirements(),
+        max_ages=builtin_fx_max_ages(),
+        clock=clock.now,
+    )
 
     for seconds in range(0, 86_400, 240):
         clock.seconds = float(seconds)
@@ -239,13 +253,13 @@ async def test_equity_fallback_cache_expires_at_the_next_session_open(
     clock.origin = datetime(2026, 7, 20, 13, 20, tzinfo=UTC)  # Monday 09:20 New York
     calls = 0
     provider = (
-        TwelveDataProvider(
+        create_builtin_twelve_data_provider(
             "key",
             quote_cache_clock=clock.monotonic,
             wall_clock=clock.now,
         )
         if provider_name == "twelve_data"
-        else AlphaVantageProvider(
+        else create_builtin_alpha_vantage_provider(
             "key",
             quote_cache_clock=clock.monotonic,
             wall_clock=clock.now,
@@ -286,7 +300,7 @@ async def test_equity_fallback_cache_expires_at_the_next_session_open(
 @pytest.mark.asyncio
 async def test_low_frequency_cache_negative_caches_expected_provider_failures() -> None:
     clock = VirtualClock()
-    provider = AlphaVantageProvider("key", quote_cache_clock=clock.monotonic)
+    provider = create_builtin_alpha_vantage_provider("key", quote_cache_clock=clock.monotonic)
     calls = 0
 
     async def request_json(*args, **kwargs):

@@ -7,9 +7,9 @@ import pytest
 
 from quickprice.domain import PricePoint, ProviderQuote
 from quickprice.fx import FX_CURRENCIES, FX_HUB_SYMBOLS, FX_SYMBOLS, fx_hub_requirements
+from quickprice.provider_factory import builtin_fx_max_ages, builtin_fx_requirements
 from quickprice.providers.base import UnsupportedInstrument
 from quickprice.providers.fx import (
-    FX_HUB_MAX_AGES,
     SyntheticComponentError,
     UsdHubFxHistoryProvider,
     UsdHubFxQuoteProvider,
@@ -59,7 +59,12 @@ async def test_fx_quote_provider_inverts_a_single_hub_with_provenance() -> None:
         calls.append(symbol)
         return make_quote("USD:EUR", "0.80", provider="alpha_vantage", fallback_level=1)
 
-    provider = UsdHubFxQuoteProvider(resolve, clock=lambda: NOW)
+    provider = UsdHubFxQuoteProvider(
+        resolve,
+        requirements=builtin_fx_requirements(),
+        max_ages=builtin_fx_max_ages(),
+        clock=lambda: NOW,
+    )
     result = await provider.get_quote("EUR:USD")
 
     assert calls == ["USD:EUR"]
@@ -89,7 +94,12 @@ async def test_fx_quote_provider_uses_usd_quote_over_usd_base() -> None:
         calls.append(symbol)
         return values[symbol]
 
-    provider = UsdHubFxQuoteProvider(resolve, clock=lambda: NOW)
+    provider = UsdHubFxQuoteProvider(
+        resolve,
+        requirements=builtin_fx_requirements(),
+        max_ages=builtin_fx_max_ages(),
+        clock=lambda: NOW,
+    )
     result = await provider.get_quote("GBP:CNH")
 
     assert set(calls) == {"USD:CNH", "USD:GBP"}
@@ -109,14 +119,20 @@ async def test_fx_quote_provider_rejects_stale_and_direct_components() -> None:
         assert symbol == "USD:CNH"
         return make_quote(symbol, "7.20", minutes_old=6)
 
-    provider = UsdHubFxQuoteProvider(stale_cnh, clock=lambda: NOW)
+    provider = UsdHubFxQuoteProvider(
+        stale_cnh,
+        requirements=builtin_fx_requirements(),
+        max_ages=builtin_fx_max_ages(),
+        clock=lambda: NOW,
+    )
     with pytest.raises(SyntheticComponentError, match="stale"):
         await provider.get_quote("CNH:USD")
     with pytest.raises(UnsupportedInstrument, match="direct providers"):
         await provider.get_quote("USD:CNH")
 
-    assert FX_HUB_MAX_AGES["USD:CNH"] == timedelta(minutes=5)
-    assert FX_HUB_MAX_AGES["USD:HKD"] == timedelta(minutes=20)
+    max_ages = builtin_fx_max_ages()
+    assert max_ages["USD:CNH"] == timedelta(minutes=5)
+    assert max_ages["USD:HKD"] == timedelta(minutes=20)
 
 
 @pytest.mark.asyncio
@@ -132,7 +148,10 @@ async def test_fx_history_never_uses_a_future_denominator() -> None:
             PricePoint(symbol, NOW + timedelta(minutes=1), Decimal("0.80"), "fixture"),
         )
 
-    provider = UsdHubFxHistoryProvider(resolve)
+    provider = UsdHubFxHistoryProvider(
+        resolve,
+        requirements=builtin_fx_requirements(),
+    )
     result = await provider.get_history(
         "GBP:EUR",
         interval="1m",
@@ -162,7 +181,10 @@ async def test_fx_inverse_history_preserves_source_timestamps() -> None:
         assert symbol == "USD:SGD"
         return source
 
-    provider = UsdHubFxHistoryProvider(resolve)
+    provider = UsdHubFxHistoryProvider(
+        resolve,
+        requirements=builtin_fx_requirements(),
+    )
     result = await provider.get_history(
         "SGD:USD",
         interval="1m",

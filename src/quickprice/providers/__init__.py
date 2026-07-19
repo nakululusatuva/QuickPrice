@@ -36,8 +36,6 @@ from .kraken import KrakenProvider
 from .okx import OkxBethYieldProvider, OkxMarketProvider
 from .router import ProviderRouter
 from .staking import (
-    WBETH_ETHEREUM_SPEC,
-    WBETH_MARKET_RATIO_SPEC,
     BinanceWbethYieldProvider,
     EthereumExchangeRateSpec,
     EthereumExchangeRateYieldProvider,
@@ -50,17 +48,13 @@ from .synthetic import (
     SyntheticRecipe,
     synthesize_division,
     synthesize_history,
-    synthesize_hkd_cnh,
     synthesize_inverse,
     synthesize_multiplication,
-    synthesize_wbeth,
 )
 from .twelve_data import TwelveDataProvider
 from .wiring import ProviderGraph, build_provider_graph
 
 __all__ = [
-    "WBETH_ETHEREUM_SPEC",
-    "WBETH_MARKET_RATIO_SPEC",
     "AccrualIndexProvider",
     "AllProvidersFailed",
     "AlpacaProvider",
@@ -102,8 +96,6 @@ __all__ = [
     "search_provider_symbols",
     "synthesize_division",
     "synthesize_history",
-    "synthesize_hkd_cnh",
     "synthesize_inverse",
     "synthesize_multiplication",
-    "synthesize_wbeth",
 ]

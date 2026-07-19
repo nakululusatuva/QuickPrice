@@ -75,41 +75,9 @@ class CoinGeckoProvider(HttpProvider):
     # retention policy cannot turn an otherwise useful one-year backfill into
     # an HTTP 401 response.
     maximum_history_lookback: ClassVar[timedelta] = timedelta(days=365)
-    coin_ids: ClassVar[dict[str, str]] = {
-        "BTC:USDC": "bitcoin",
-        "ETH:USDC": "ethereum",
-        "SOL:USDC": "solana",
-        "XMR:USDC": "monero",
-        "POL:USDC": "polygon-ecosystem-token",
-        "BNB:USDC": "binancecoin",
-        "TRX:USDC": "tron",
-        "WBETH:USDC": "wrapped-beacon-eth",
-        "BETH:USDC": "okx-beth",
-        "STETH:USDC": "staked-ether",
-        "WSTETH:USDC": "wrapped-steth",
-        "ETH:USD": "ethereum",
-        "STETH:USD": "staked-ether",
-        "WSTETH:USD": "wrapped-steth",
-    }
-    history_symbols: ClassVar[frozenset[str]] = frozenset(
-        {
-            "BETH:USDC",
-            "STETH:USDC",
-            "WSTETH:USDC",
-            "ETH:USD",
-            "STETH:USD",
-            "WSTETH:USD",
-        }
-    )
-    component_skew_limits: ClassVar[dict[str, timedelta]] = {
-        # CoinGecko aggregates the token and USDC observations independently.
-        # A sub-minute skew is expected and remains visible in ``components``;
-        # applying the exchange-leg two-second policy here rejected valid data.
-        "WBETH:USDC": timedelta(seconds=60),
-        "BETH:USDC": timedelta(seconds=60),
-        "STETH:USDC": timedelta(seconds=60),
-        "WSTETH:USDC": timedelta(seconds=60),
-    }
+    coin_ids: ClassVar[dict[str, str]] = {}
+    history_symbols: ClassVar[frozenset[str]] = frozenset()
+    component_skew_limits: ClassVar[dict[str, timedelta]] = {}
 
     def __init__(
         self,
@@ -118,6 +86,9 @@ class CoinGeckoProvider(HttpProvider):
         coin_ids: Mapping[str, str] | None = None,
         history_symbols: Sequence[str] | None = None,
         component_skew_limits: Mapping[str, timedelta] | None = None,
+        normalization_quote_asset: str | None = None,
+        normalization_coin_id: str | None = None,
+        normalization_component_symbol: str | None = None,
         cache_ttl_seconds: float = 300.0,
         maximum_error_cache_ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
@@ -126,13 +97,8 @@ class CoinGeckoProvider(HttpProvider):
         kwargs.setdefault("quota", rolling_month_safe_daily_budget(9_000))
         super().__init__(**kwargs)
         self.api_key = api_key
-        self.coin_ids = {
-            key.strip().upper(): value
-            for key, value in (type(self).coin_ids if coin_ids is None else coin_ids).items()
-        }
-        configured_history_symbols = (
-            type(self).history_symbols if history_symbols is None else history_symbols
-        )
+        self.coin_ids = {key.strip().upper(): value for key, value in (coin_ids or {}).items()}
+        configured_history_symbols = history_symbols or ()
         self.history_symbols = frozenset(
             symbol.strip().upper()
             for symbol in configured_history_symbols
@@ -140,13 +106,27 @@ class CoinGeckoProvider(HttpProvider):
         )
         self.component_skew_limits = {
             symbol.strip().upper(): value
-            for symbol, value in (
-                type(self).component_skew_limits
-                if component_skew_limits is None
-                else component_skew_limits
-            ).items()
+            for symbol, value in (component_skew_limits or {}).items()
             if symbol.strip().upper() in self.coin_ids
         }
+        self.normalization_quote_asset = (
+            None if normalization_quote_asset is None else normalization_quote_asset.strip().upper()
+        )
+        self.normalization_coin_id = (
+            None if normalization_coin_id is None else normalization_coin_id.strip().lower()
+        )
+        self.normalization_component_symbol = (
+            None
+            if normalization_component_symbol is None
+            else normalization_component_symbol.strip().upper()
+        )
+        normalization_values = (
+            self.normalization_quote_asset,
+            self.normalization_coin_id,
+            self.normalization_component_symbol,
+        )
+        if any(normalization_values) and not all(normalization_values):
+            raise ValueError("CoinGecko quote normalization policy is incomplete")
         self._cache_ttl_seconds = max(1.0, cache_ttl_seconds)
         self._maximum_error_cache_ttl_seconds = max(
             self._cache_ttl_seconds,
@@ -181,7 +161,7 @@ class CoinGeckoProvider(HttpProvider):
     async def get_quote(self, symbol: str):
         normalized = symbol.strip().upper()
         quote_asset = normalized.partition(":")[2]
-        if quote_asset not in {"USD", "USDC"}:
+        if quote_asset != "USD" and quote_asset != self.normalization_quote_asset:
             raise UnsupportedInstrument(
                 self.name,
                 f"unsupported quote asset {quote_asset}",
@@ -192,21 +172,25 @@ class CoinGeckoProvider(HttpProvider):
             asset = require_mapping(document[coin_id], self.name, coin_id)
             asset_price = decimal_value(asset["usd"])
             asset_time = utc_datetime(asset["last_updated_at"])
-            if quote_asset == "USDC":
-                usdc = require_mapping(document["usd-coin"], self.name, "usd-coin")
-                usdc_price = decimal_value(usdc["usd"])
-                usdc_time = utc_datetime(usdc["last_updated_at"])
+            if quote_asset == self.normalization_quote_asset:
+                normalization = require_mapping(
+                    document[self.normalization_coin_id],
+                    self.name,
+                    self.normalization_coin_id,
+                )
+                normalization_price = decimal_value(normalization["usd"])
+                normalization_time = utc_datetime(normalization["last_updated_at"])
                 skew_limit = self.component_skew_limits.get(normalized)
-                if skew_limit is not None and abs(asset_time - usdc_time) > skew_limit:
+                if skew_limit is not None and abs(asset_time - normalization_time) > skew_limit:
                     raise MalformedResponse(
                         self.name,
-                        "staking-token and USDC component timestamps exceed the configured limit",
+                        "component timestamps exceed the configured normalization limit",
                     )
-                result_price = asset_price / usdc_price
+                result_price = asset_price / normalization_price
             else:
                 result_price = asset_price
-                usdc_price = None
-                usdc_time = None
+                normalization_price = None
+                normalization_time = None
         except MalformedResponse:
             raise
         except (KeyError, ValueError, ZeroDivisionError) as exc:
@@ -222,26 +206,34 @@ class CoinGeckoProvider(HttpProvider):
                     role="numerator",
                 ),
                 component(
-                    symbol="USDC:USD",
+                    symbol=self.normalization_component_symbol,
                     provider=self.name,
-                    price=usdc_price,
-                    as_of=usdc_time,
+                    price=normalization_price,
+                    as_of=normalization_time,
                     feed=self.feed,
                     role="denominator",
                 ),
             )
-            if usdc_price is not None and usdc_time is not None
+            if normalization_price is not None and normalization_time is not None
             else ()
         )
         return quote(
             symbol=normalized,
             price=result_price,
-            as_of=min(asset_time, usdc_time) if usdc_time is not None else asset_time,
+            as_of=(
+                min(asset_time, normalization_time)
+                if normalization_time is not None
+                else asset_time
+            ),
             provider=self.name,
             feed=self.feed,
-            price_basis=("aggregated_spot_ratio" if quote_asset == "USDC" else "aggregated_spot"),
+            price_basis=(
+                "aggregated_spot_ratio"
+                if quote_asset == self.normalization_quote_asset
+                else "aggregated_spot"
+            ),
             market_status="open",
-            is_derived=quote_asset == "USDC",
+            is_derived=quote_asset == self.normalization_quote_asset,
             components=components,
             fallback_level=0,
             license_scope="personal_internal",
@@ -273,7 +265,10 @@ class CoinGeckoProvider(HttpProvider):
             self._cache_expires_at = now + self._cache_ttl_seconds
             self._price_cache = None
             self._refresh_error = None
-            id_batches = coingecko_simple_price_id_batches((*self.coin_ids.values(), "usd-coin"))
+            ids = list(self.coin_ids.values())
+            if self.normalization_coin_id is not None:
+                ids.append(self.normalization_coin_id)
+            id_batches = coingecko_simple_price_id_batches(ids)
             try:
                 merged: dict[str, object] = {}
                 for ids in id_batches:
@@ -315,7 +310,7 @@ class CoinGeckoProvider(HttpProvider):
     ):
         normalized = symbol.strip().upper()
         quote_asset = normalized.partition(":")[2]
-        if quote_asset not in {"USD", "USDC"}:
+        if quote_asset != "USD" and quote_asset != self.normalization_quote_asset:
             raise UnsupportedInstrument(
                 self.name,
                 f"unsupported quote asset {quote_asset}",
@@ -356,9 +351,9 @@ class CoinGeckoProvider(HttpProvider):
         )
         document = require_mapping(payload, self.name)
         prices = require_sequence(document.get("prices"), self.name, "historical prices")
-        quoted_in_usdc = quote_asset == "USDC"
+        quoted_in_usdc = quote_asset == self.normalization_quote_asset
         current_usdc_usd = (
-            await self._history_usdc_normalization_price() if quoted_in_usdc else decimal_value(1)
+            await self._history_normalization_price() if quoted_in_usdc else decimal_value(1)
         )
 
         result = []
@@ -443,9 +438,9 @@ class CoinGeckoProvider(HttpProvider):
             error_ttl_seconds=self.daily_snapshot_error_ttl_seconds,
         )
 
-    async def _history_usdc_normalization_price(self):
+    async def _history_normalization_price(self):
         # Historical changes are invariant to a constant quote-currency
-        # normalization. Reuse the most recently observed USDC/USD value even
+        # normalization. Reuse the most recently observed normalization value even
         # after the live-price TTL expires so hourly backfills do not consume a
         # second monthly credit stream. The first history request still obtains
         # a real observation if no quote has populated the cache yet.
@@ -453,10 +448,14 @@ class CoinGeckoProvider(HttpProvider):
         if document is None:
             document = await self._simple_prices()
         try:
-            usdc = require_mapping(document["usd-coin"], self.name, "usd-coin")
-            value = decimal_value(usdc["usd"])
+            normalization = require_mapping(
+                document[self.normalization_coin_id],
+                self.name,
+                self.normalization_coin_id,
+            )
+            value = decimal_value(normalization["usd"])
             if value <= 0:
-                raise ValueError("USDC price must be positive")
+                raise ValueError("normalization price must be positive")
             return value
         except (KeyError, ValueError) as exc:
-            raise MalformedResponse(self.name, "invalid USDC normalization price") from exc
+            raise MalformedResponse(self.name, "invalid quote normalization price") from exc

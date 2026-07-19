@@ -14,6 +14,12 @@ from quickprice.equities import (
     LISTED_TICKERS,
     QUARTERLY_STOCK_DIVIDEND_SYMBOLS,
 )
+from quickprice.provider_factory import (
+    create_builtin_alpaca_provider,
+    create_builtin_alpha_vantage_provider,
+    create_builtin_finnhub_provider,
+    create_builtin_twelve_data_provider,
+)
 from quickprice.providers.alpaca import AlpacaProvider
 from quickprice.providers.alpha_vantage import AlphaVantageProvider
 from quickprice.providers.base import Capability, UnsupportedInstrument
@@ -22,15 +28,22 @@ from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.providers.wiring import build_provider_graph
 
 
-def test_listed_ticker_maps_share_one_canonical_source() -> None:
-    assert AlpacaProvider.symbols == dict(LISTED_TICKERS)
-    assert FinnhubProvider.symbols == dict(LISTED_TICKERS)
-    assert AlphaVantageProvider.equity_symbols == dict(LISTED_TICKERS)
-    assert {symbol: TwelveDataProvider.symbols[symbol] for symbol in LISTED_SYMBOLS} == dict(
-        LISTED_TICKERS
-    )
-    assert AlpacaProvider._frequencies == dict(DIVIDEND_FREQUENCIES)
-    assert AlphaVantageProvider.dividend_frequencies == dict(DIVIDEND_FREQUENCIES)
+def test_builtin_factories_inject_one_canonical_listed_ticker_source() -> None:
+    alpaca = create_builtin_alpaca_provider("key", "secret")
+    finnhub = create_builtin_finnhub_provider("key")
+    alpha = create_builtin_alpha_vantage_provider("key")
+    twelve = create_builtin_twelve_data_provider("key")
+
+    assert alpaca.symbols == dict(LISTED_TICKERS)
+    assert finnhub.symbols == dict(LISTED_TICKERS)
+    assert alpha.equity_symbols == dict(LISTED_TICKERS)
+    assert {symbol: twelve.symbols[symbol] for symbol in LISTED_SYMBOLS} == dict(LISTED_TICKERS)
+    assert alpaca._frequencies == dict(DIVIDEND_FREQUENCIES)
+    assert alpha.dividend_frequencies == dict(DIVIDEND_FREQUENCIES)
+    assert not getattr(AlpacaProvider, "symbols", {})
+    assert not getattr(FinnhubProvider, "symbols", {})
+    assert not getattr(AlphaVantageProvider, "equity_symbols", {})
+    assert not getattr(TwelveDataProvider, "symbols", {})
     assert set(QUARTERLY_STOCK_DIVIDEND_SYMBOLS) == {
         "AAPL:USD",
         "MSFT:USD",
@@ -42,7 +55,7 @@ def test_listed_ticker_maps_share_one_canonical_source() -> None:
 
 @pytest.mark.asyncio
 async def test_alpaca_classifies_a_regular_stock_dividend() -> None:
-    provider = AlpacaProvider("key", "secret")
+    provider = create_builtin_alpaca_provider("key", "secret")
     provider._request_json = AsyncMock(
         return_value={
             "cash_dividends": [

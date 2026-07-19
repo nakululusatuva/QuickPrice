@@ -17,8 +17,27 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from quickprice.instrument_policy import (
+    BUILTIN_ALPACA_ALLOWED_DIVIDEND_SUBTYPES,
+    BUILTIN_BINANCE_MIDPOINT_SYMBOLS,
+    BUILTIN_BINANCE_SYMBOLS,
+    BUILTIN_COINGECKO_COIN_IDS,
+    BUILTIN_COINGECKO_COMPONENT_SKEW_SECONDS,
+    BUILTIN_COINGECKO_NORMALIZATION_COIN_ID,
+    BUILTIN_COINGECKO_NORMALIZATION_COMPONENT_SYMBOL,
+    BUILTIN_FRED_POLICIES,
+    BUILTIN_FX_HUB_MAX_AGE_SECONDS,
+    BUILTIN_KRAKEN_MAX_QUOTE_AGE_SECONDS,
+    BUILTIN_OKX_INTERNAL_ALIASES,
+    BUILTIN_OKX_MARKETS,
+    BUILTIN_PROVIDER_ROUTES,
+    BUILTIN_STAKING_RATIO_POLICIES,
+    BUILTIN_SYNTHETIC_RECIPES,
+    BUILTIN_TWELVE_FX_CACHE_FLOOR_SECONDS,
+    BUILTIN_TWELVE_FX_POLL_SETTING,
+    COINGECKO_SUPPORTED_QUOTE_ASSETS,
     SUPPORTED_DIVIDEND_STRATEGIES,
     TREASURY_3M_FRED_SERIES,
+    builtin_provider_symbols,
 )
 from quickprice.plugin_api import AssetClass, YieldStrategy
 from quickprice.registry import normalize_symbol
@@ -329,121 +348,15 @@ def configured_provider_names(settings: Any | None) -> frozenset[str]:
 
 def builtin_provider_policy(symbol: str) -> BuiltinProviderPolicy:
     """Return the settings-independent routes that preserve the shipped graph."""
-
-    from quickprice.equities import DIVIDEND_SYMBOLS, LISTED_TICKERS
-    from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS
-
-    from .binance import BinanceProvider
-    from .coingecko import CoinGeckoProvider
-    from .kraken import KrakenProvider
-
     canonical = normalize_symbol(symbol)
-    routes: dict[str, tuple[str, ...]] = {}
-    bindings: dict[str, str] = {}
-    if canonical in {"BTC:USDC", "ETH:USDC", "SOL:USDC", "BNB:USDC"}:
-        routes = {
-            "quote": ("binance", "kraken", "coingecko"),
-            "history": ("binance", "kraken"),
-        }
-    elif canonical in {"POL:USDC", "TRX:USDC"}:
-        routes = {
-            "quote": ("binance", "coingecko"),
-            "history": ("binance",),
-        }
-    elif canonical == "XMR:USDC":
-        routes = {
-            "quote": ("kraken", "coingecko"),
-            "history": ("kraken",),
-        }
-    elif canonical == "WBETH:USDC":
-        routes = {
-            "quote": (
-                "synthetic_wbeth_primary",
-                "synthetic_wbeth_alternate",
-                "coingecko",
-            ),
-            "history": (
-                "synthetic_wbeth_history_primary",
-                "synthetic_wbeth_history_alternate",
-            ),
-            "yield": (
-                "binance_wbeth_rate",
-                "ethereum_exchange_rate",
-                "staking_market_ratio_proxy",
-            ),
-        }
-    elif canonical == "BETH:USDC":
-        routes = {
-            "quote": (
-                "synthetic_beth_primary",
-                "synthetic_beth_alternate",
-                "coingecko",
-            ),
-            "history": (
-                "synthetic_beth_history_primary",
-                "synthetic_beth_history_alternate",
-                "coingecko",
-            ),
-            "yield": ("okx_beth_yield",),
-        }
-    elif canonical == "STETH:USDC":
-        routes = {
-            "quote": ("coingecko",),
-            "history": ("coingecko",),
-            "yield": ("lido",),
-        }
-    elif canonical == "WSTETH:USDC":
-        routes = {
-            "quote": ("coingecko",),
-            "history": ("coingecko",),
-            "yield": ("lido", "staking_market_ratio_proxy"),
-        }
-    elif canonical in LISTED_TICKERS:
-        routes = {
-            "quote": ("alpaca", "finnhub", "twelve_data", "alpha_vantage"),
-            "history": ("alpaca", "twelve_data", "alpha_vantage"),
-        }
-        if canonical in DIVIDEND_SYMBOLS:
-            routes["dividend"] = ("alpaca",)
-        if canonical == "BOXX:USD":
-            routes["yield"] = ("fred",)
-    elif canonical in FX_SYMBOLS:
-        if canonical in FX_HUB_SYMBOLS:
-            routes = {
-                "quote": ("twelve_data", "alpha_vantage"),
-                "history": ("twelve_data", "alpha_vantage"),
-            }
-        else:
-            routes = {
-                "quote": ("synthetic_fx",),
-                "history": ("synthetic_fx_history",),
-            }
-
-    if canonical in BinanceProvider.symbols and "binance" in {
-        provider for chain in routes.values() for provider in chain
-    }:
-        bindings["binance"] = BinanceProvider.symbols[canonical]
-    if canonical in KrakenProvider.symbols and "kraken" in {
-        provider for chain in routes.values() for provider in chain
-    }:
-        bindings["kraken"] = KrakenProvider.symbols[canonical][0]
-    if canonical in CoinGeckoProvider.coin_ids and "coingecko" in {
-        provider for chain in routes.values() for provider in chain
-    }:
-        bindings["coingecko"] = CoinGeckoProvider.coin_ids[canonical]
-    if canonical in LISTED_TICKERS:
-        ticker = LISTED_TICKERS[canonical]
-        for provider in ("alpaca", "finnhub", "twelve_data", "alpha_vantage"):
-            bindings[provider] = ticker
-        if canonical == "BOXX:USD":
-            bindings["fred"] = "DGS3MO"
-    if canonical in FX_HUB_SYMBOLS:
-        vendor_symbol = canonical.replace(":", "/")
-        bindings["twelve_data"] = vendor_symbol
-        bindings["alpha_vantage"] = vendor_symbol
+    route_policy = BUILTIN_PROVIDER_ROUTES.get(canonical, {})
+    routes = {
+        str(capability): tuple(str(provider) for provider in providers)
+        for capability, providers in route_policy.items()
+    }
     return BuiltinProviderPolicy(
         routes=MappingProxyType(routes),
-        provider_symbols=MappingProxyType(bindings),
+        provider_symbols=builtin_provider_symbols(canonical),
     )
 
 
@@ -530,20 +443,10 @@ def recommended_provider_chain(
 
 
 def _staking_yield_candidates(item: InstrumentRouteInput) -> tuple[str, ...]:
-    base = item.symbol.partition(":")[0]
+    builtin = BUILTIN_PROVIDER_ROUTES.get(item.symbol, {}).get(Capability.YIELD.value)
+    if builtin:
+        return tuple(str(provider) for provider in builtin)
     mode = _reward_mode_value(item.reward_accrual_mode)
-    if base == "WBETH":
-        return (
-            "binance_wbeth_rate",
-            "ethereum_exchange_rate",
-            "staking_market_ratio_proxy",
-        )
-    if base == "BETH" and mode == "distributed_units":
-        return ("okx_beth_yield",)
-    if base == "STETH":
-        return ("lido",)
-    if base == "WSTETH":
-        return ("lido", "staking_market_ratio_proxy")
     if mode == "value_accruing":
         return ("staking_market_ratio_proxy",)
     return ()
@@ -616,10 +519,10 @@ def _validate_chain(
         if (
             provider == "coingecko"
             and capability in {Capability.QUOTE, Capability.HISTORY}
-            and item.symbol.split(":", 1)[1] not in {"USD", "USDC"}
+            and item.symbol.split(":", 1)[1] not in COINGECKO_SUPPORTED_QUOTE_ASSETS
         ):
             raise RouteCompileError(
-                f"CoinGecko quote and history routing requires a USD or USDC quote: {item.symbol}"
+                f"CoinGecko route uses an unsupported quote asset: {item.symbol}"
             )
         if (
             provider == "staking_market_ratio_proxy"
@@ -702,25 +605,39 @@ def _validate_staking_ratio_dependencies(
     for symbol, route in compiled.items():
         if "staking_market_ratio_proxy" not in route.providers_for(Capability.YIELD):
             continue
-        # This built-in recipe deliberately uses WSTETH:USD and ETH:USD
-        # CoinGecko histories installed as controlled internal dependencies.
-        if symbol == "WSTETH:USDC":
-            continue
-        item = items[symbol]
-        if item.underlying_asset is None:
-            raise RouteCompileError(
-                f"market-ratio staking yield requires an underlying asset: {symbol}"
-            )
-        if not route.providers_for(Capability.HISTORY):
+        builtin_policy = next(
+            (policy for policy in BUILTIN_STAKING_RATIO_POLICIES if policy.symbol == symbol),
+            None,
+        )
+        if builtin_policy is not None and any(
+            dependency not in items
+            for dependency in (builtin_policy.staking_pair, builtin_policy.underlying_pair)
+        ):
+            if all(
+                dependency in BUILTIN_COINGECKO_COIN_IDS
+                for dependency in (builtin_policy.staking_pair, builtin_policy.underlying_pair)
+            ):
+                continue
+            raise RouteCompileError(f"built-in market-ratio dependency is unavailable: {symbol}")
+        if builtin_policy is not None:
+            staking_pair = builtin_policy.staking_pair
+            underlying_pair = builtin_policy.underlying_pair
+        else:
+            item = items[symbol]
+            if item.underlying_asset is None:
+                raise RouteCompileError(
+                    f"market-ratio staking yield requires an underlying asset: {symbol}"
+                )
+            quote_asset = symbol.split(":", 1)[1]
+            staking_pair = symbol
+            underlying_pair = f"{item.underlying_asset}:{quote_asset}"
+        staking = compiled.get(staking_pair)
+        underlying = compiled.get(underlying_pair)
+        if staking is None or underlying is None:
+            raise RouteCompileError(f"market-ratio staking dependency is not active: {symbol}")
+        if not staking.providers_for(Capability.HISTORY):
             raise RouteCompileError(
                 f"market-ratio staking token requires a usable history route: {symbol}"
-            )
-        quote_asset = symbol.split(":", 1)[1]
-        underlying_pair = f"{item.underlying_asset}:{quote_asset}"
-        underlying = compiled.get(underlying_pair)
-        if underlying is None:
-            raise RouteCompileError(
-                f"market-ratio staking underlying pair is not active: {symbol} -> {underlying_pair}"
             )
         if not underlying.providers_for(Capability.HISTORY):
             raise RouteCompileError(
@@ -1024,10 +941,25 @@ def _build_credit_estimates(
                         )
 
         if "staking_market_ratio_proxy" in route.providers_for(Capability.YIELD):
-            quote_asset = symbol.split(":", 1)[1]
-            if symbol == "WSTETH:USDC":
-                dependencies = ("WSTETH:USD", "ETH:USD")
-                for dependency in dependencies:
+            builtin_policy = next(
+                (policy for policy in BUILTIN_STAKING_RATIO_POLICIES if policy.symbol == symbol),
+                None,
+            )
+            if builtin_policy is not None:
+                dependencies = (
+                    builtin_policy.staking_pair,
+                    builtin_policy.underlying_pair,
+                )
+            elif item.underlying_asset is not None:
+                quote_asset = symbol.split(":", 1)[1]
+                dependencies = (symbol, f"{item.underlying_asset}:{quote_asset}")
+            else:
+                dependencies = ()
+            internal_dependencies = tuple(
+                dependency for dependency in dependencies if dependency not in compiled
+            )
+            if internal_dependencies:
+                for dependency in internal_dependencies:
                     if available_providers is None or "coingecko" in available_providers:
                         add(
                             "coingecko",
@@ -1039,8 +971,7 @@ def _build_credit_estimates(
                             ownership=item.ownership,
                             committed=True,
                         )
-            elif item.underlying_asset is not None:
-                dependencies = (symbol, f"{item.underlying_asset}:{quote_asset}")
+            else:
                 for dependency in dependencies:
                     dependency_route = compiled.get(dependency)
                     if dependency_route is None:
@@ -1066,26 +997,26 @@ def _build_credit_estimates(
         if key[0] == "coingecko" and key[1] is Capability.QUOTE
     ]
     if coingecko_quote:
-        from .coingecko import (
-            CoinGeckoProvider,
-            coingecko_simple_price_id_batches,
-        )
+        from .coingecko import coingecko_simple_price_id_batches
 
         access_interval = min(value.poll_seconds for _, value in coingecko_quote)
-        coin_ids = {"usd-coin"}
+        coin_ids = {BUILTIN_COINGECKO_NORMALIZATION_COIN_ID}
         for symbol, instrument_routes in compiled.items():
             if not any("coingecko" in providers for providers in instrument_routes.routes.values()):
                 continue
             coin_id = items[symbol].provider_symbols.get("coingecko")
             if coin_id is not None:
                 coin_ids.add(coin_id)
-        wsteth_routes = compiled.get("WSTETH:USDC")
-        if wsteth_routes is not None and "staking_market_ratio_proxy" in (
-            wsteth_routes.providers_for(Capability.YIELD)
-        ):
-            coin_ids.update(
-                CoinGeckoProvider.coin_ids[dependency] for dependency in ("WSTETH:USD", "ETH:USD")
-            )
+        for policy in BUILTIN_STAKING_RATIO_POLICIES:
+            routes = compiled.get(policy.symbol)
+            if routes is None or "staking_market_ratio_proxy" not in routes.providers_for(
+                Capability.YIELD
+            ):
+                continue
+            for dependency in (policy.staking_pair, policy.underlying_pair):
+                coin_id = BUILTIN_COINGECKO_COIN_IDS.get(dependency)
+                if coin_id is not None:
+                    coin_ids.add(coin_id)
         batch_count = len(coingecko_simple_price_id_batches(tuple(coin_ids)))
         refreshes = ceil(86_400 / max(300.0, access_interval))
         requests = refreshes * batch_count
@@ -1406,7 +1337,9 @@ def instrument_route_input_from_definition(definition: Any) -> InstrumentRouteIn
             managed_yield_strategy is YieldStrategy.TREASURY_3M_PROXY_MINUS_EXPENSE
             and managed_series != TREASURY_3M_FRED_SERIES
         ):
-            raise RouteCompileError("the three-month Treasury strategy requires DGS3MO")
+            raise RouteCompileError(
+                f"the three-month Treasury strategy requires {TREASURY_3M_FRED_SERIES}"
+            )
         explicit_series = symbols.get("fred")
         if explicit_series is not None and explicit_series.strip().upper() != managed_series:
             raise RouteCompileError("FRED provider binding must match IncomePolicy.fred_series")
@@ -1552,7 +1485,7 @@ def _install_instance_bindings(
     *,
     metrics: Any | None,
 ) -> None:
-    """Replace adapters before publication; class-level defaults remain untouched."""
+    """Replace adapters before publication using generation-local bindings."""
 
     from quickprice.domain import RewardAccrualMode
 
@@ -1562,12 +1495,7 @@ def _install_instance_bindings(
     from .coingecko import CoinGeckoProvider
     from .finnhub import FinnhubProvider
     from .fred import FredProvider
-    from .fx import (
-        FX_HUB_MAX_AGES,
-        UsdHubFxHistoryProvider,
-        UsdHubFxQuoteProvider,
-        dynamic_fx_requirements,
-    )
+    from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider, dynamic_fx_requirements
     from .kraken import KrakenProvider
     from .okx import OkxMarketProvider
     from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
@@ -1592,12 +1520,16 @@ def _install_instance_bindings(
 
     if "binance" in graph.providers:
         symbols = dict(bindings.get("binance", {}))
-        if "WBETH:USDC" in active_symbols:
-            for dependency in ("WBETH:ETH", "ETH:USDC", "WBETH:USDT", "USDC:USDT"):
-                symbols[dependency] = BinanceProvider.symbols[dependency]
+        for recipe in BUILTIN_SYNTHETIC_RECIPES.values():
+            if recipe.symbol not in active_symbols or not recipe.provider_name.endswith("binance"):
+                continue
+            for dependency in recipe.inputs:
+                vendor_symbol = BUILTIN_BINANCE_SYMBOLS.get(dependency)
+                if vendor_symbol is not None:
+                    symbols[dependency] = vendor_symbol
         replacement = BinanceProvider(
             symbol_bindings=symbols,
-            midpoint_symbols=BinanceProvider._midpoint_symbols,
+            midpoint_symbols=BUILTIN_BINANCE_MIDPOINT_SYMBOLS,
             **_proxy_options(settings, "binance"),
         )
         _replace_graph_provider(graph, "binance", replacement, metrics=metrics)
@@ -1606,7 +1538,11 @@ def _install_instance_bindings(
         symbols: dict[str, str | tuple[str, str]] = dict(bindings.get("kraken", {}))
         replacement = KrakenProvider(
             symbol_bindings=symbols,
-            max_quote_ages={"XMR:USDC": timedelta(minutes=5)},
+            max_quote_ages={
+                symbol: timedelta(seconds=seconds)
+                for symbol, seconds in BUILTIN_KRAKEN_MAX_QUOTE_AGE_SECONDS.items()
+                if symbol in symbols
+            },
             **_proxy_options(settings, "kraken"),
         )
         _replace_graph_provider(graph, "kraken", replacement, metrics=metrics)
@@ -1614,9 +1550,12 @@ def _install_instance_bindings(
     if "okx" in graph.providers:
         markets = dict(bindings.get("okx", {}))
         internal_aliases: dict[str, str] = {}
-        if "BETH:USDC" in active_symbols:
-            markets.update(OkxMarketProvider._canonical_markets)
-            internal_aliases.update(OkxMarketProvider._internal_aliases)
+        if any(
+            recipe.symbol in active_symbols and recipe.provider_name.endswith("okx")
+            for recipe in BUILTIN_SYNTHETIC_RECIPES.values()
+        ):
+            markets.update(BUILTIN_OKX_MARKETS)
+            internal_aliases.update(BUILTIN_OKX_INTERNAL_ALIASES)
         replacement = OkxMarketProvider(
             market_bindings=markets,
             internal_aliases=internal_aliases,
@@ -1628,10 +1567,17 @@ def _install_instance_bindings(
     if "coingecko" in graph.providers:
         coin_ids = dict(bindings.get("coingecko", {}))
         internal_history_symbols: set[str] = set()
-        if "staking_market_ratio_proxy" in plan.providers_for("WSTETH:USDC", Capability.YIELD):
-            for dependency in ("WSTETH:USD", "ETH:USD"):
-                coin_ids[dependency] = CoinGeckoProvider.coin_ids[dependency]
-                internal_history_symbols.add(dependency)
+        for policy in BUILTIN_STAKING_RATIO_POLICIES:
+            if "staking_market_ratio_proxy" not in plan.providers_for(
+                policy.symbol,
+                Capability.YIELD,
+            ):
+                continue
+            for dependency in (policy.staking_pair, policy.underlying_pair):
+                vendor_symbol = BUILTIN_COINGECKO_COIN_IDS.get(dependency)
+                if dependency not in active_symbols and vendor_symbol is not None:
+                    coin_ids[dependency] = vendor_symbol
+                    internal_history_symbols.add(dependency)
         history_symbols = {
             *internal_history_symbols,
             *(
@@ -1644,7 +1590,16 @@ def _install_instance_bindings(
             settings.coingecko_api_key,
             coin_ids=coin_ids,
             history_symbols=history_symbols,
-            component_skew_limits=CoinGeckoProvider.component_skew_limits,
+            component_skew_limits={
+                symbol: timedelta(seconds=seconds)
+                for symbol, seconds in BUILTIN_COINGECKO_COMPONENT_SKEW_SECONDS.items()
+                if symbol in coin_ids
+            },
+            normalization_quote_asset=(
+                BUILTIN_COINGECKO_NORMALIZATION_COMPONENT_SYMBOL.partition(":")[0]
+            ),
+            normalization_coin_id=BUILTIN_COINGECKO_NORMALIZATION_COIN_ID,
+            normalization_component_symbol=BUILTIN_COINGECKO_NORMALIZATION_COMPONENT_SYMBOL,
             quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
             **_proxy_options(settings, "coingecko"),
         )
@@ -1672,6 +1627,10 @@ def _install_instance_bindings(
             trading_base_url=settings.alpaca_trading_base_url,
             symbol_bindings=symbols,
             dividend_frequencies=dividend_frequencies,
+            regular_dividend_subtypes={
+                symbol: BUILTIN_ALPACA_ALLOWED_DIVIDEND_SUBTYPES.get(symbol, ("",))
+                for symbol in dividend_frequencies
+            },
             stream_symbol_limit=settings.alpaca_stream_symbol_limit,
             rest_calls_per_minute=settings.alpaca_rest_calls_per_minute,
             **_proxy_options(settings, "alpaca"),
@@ -1695,12 +1654,27 @@ def _install_instance_bindings(
             for symbol in bindings.get("twelve_data", {})
             if ":" in symbol and "/" in bindings["twelve_data"][symbol]
         }
+        input_by_symbol = {item.symbol: item for item in inputs}
+        fx_floors = {
+            symbol: BUILTIN_TWELVE_FX_CACHE_FLOOR_SECONDS.get(symbol, 900.0)
+            for symbol in fx_symbols
+        }
+        fx_ttls = {
+            symbol: (
+                float(getattr(settings, BUILTIN_TWELVE_FX_POLL_SETTING[symbol]))
+                if symbol in BUILTIN_TWELVE_FX_POLL_SETTING
+                else max(fx_floors[symbol], input_by_symbol.get(symbol).quote_poll_seconds)
+                if symbol in input_by_symbol
+                else fx_floors[symbol]
+            )
+            for symbol in fx_symbols
+        }
         replacement = TwelveDataProvider(
             settings.twelve_data_api_key,
             symbol_bindings=symbols,
             fx_symbols=fx_symbols,
-            usd_cnh_quote_ttl_seconds=settings.usd_cnh_poll_seconds,
-            usd_hkd_quote_ttl_seconds=settings.usd_hkd_poll_seconds,
+            fx_quote_ttl_floors_seconds=fx_floors,
+            fx_quote_ttl_seconds=fx_ttls,
             calls_per_minute=settings.twelve_calls_per_minute,
             rate_gate_timeout_seconds=settings.twelve_rate_gate_timeout_seconds,
             request_timeout=settings.provider_timeout_seconds,
@@ -1743,6 +1717,7 @@ def _install_instance_bindings(
         series_bindings: dict[str, str] = {}
         expense_ratios: dict[str, Decimal | float] = {}
         method_bindings: dict[str, str] = {}
+        component_role_bindings: dict[str, str] = {}
         for definition in definitions:
             vendor_symbol = bindings.get("fred", {}).get(definition.symbol)
             income = getattr(definition, "income", None)
@@ -1755,11 +1730,18 @@ def _install_instance_bindings(
                 if income.yield_strategy is YieldStrategy.TREASURY_3M_PROXY_MINUS_EXPENSE
                 else "treasury_series_proxy_minus_expense"
             )
+            builtin_policy = BUILTIN_FRED_POLICIES.get(definition.symbol)
+            component_role_bindings[definition.symbol] = (
+                str(builtin_policy["component_role"])
+                if builtin_policy is not None
+                else "treasury_yield_percent"
+            )
         replacement = FredProvider(
             settings.fred_api_key,
             series_bindings=series_bindings,
             expense_ratios=expense_ratios,
             method_bindings=method_bindings,
+            component_role_bindings=component_role_bindings,
             **_proxy_options(settings, "fred"),
         )
         _replace_graph_provider(graph, "fred", replacement, metrics=metrics)
@@ -1807,7 +1789,10 @@ def _install_instance_bindings(
             **getattr(quote_provider, "_requirements", {}),
             **managed_fx_requirements,
         }
-        maximum_ages = dict(FX_HUB_MAX_AGES)
+        maximum_ages = {
+            symbol: timedelta(seconds=seconds)
+            for symbol, seconds in BUILTIN_FX_HUB_MAX_AGE_SECONDS.items()
+        }
         for dependencies in managed_fx_requirements.values():
             for dependency in dependencies:
                 maximum_ages.setdefault(dependency, timedelta(minutes=20))

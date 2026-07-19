@@ -28,14 +28,16 @@ from quickprice.plugin_api import (
     MarketCalendar,
     YieldStrategy,
 )
-from quickprice.providers.alpha_vantage import AlphaVantageProvider
+from quickprice.provider_factory import (
+    create_builtin_alpha_vantage_provider,
+    create_builtin_twelve_data_provider,
+)
 from quickprice.providers.base import (
     Capability,
     ProviderBusy,
     ProviderUnavailable,
 )
 from quickprice.providers.router import ProviderRouter
-from quickprice.providers.twelve_data import TwelveDataProvider
 from quickprice.providers.wiring import build_provider_graph
 from quickprice.registry import InstrumentRegistry
 from quickprice.service import QuickPriceService
@@ -1266,7 +1268,7 @@ async def test_equity_fallback_keeps_finnhub_cadence_until_alpaca_recovers(
 
     alpaca = Alpaca()
     finnhub = Finnhub()
-    twelve = TwelveDataProvider(
+    twelve = create_builtin_twelve_data_provider(
         "key",
         quote_cache_clock=lambda: clock,
         wall_clock=lambda: observed_at + timedelta(seconds=clock),
@@ -1336,12 +1338,12 @@ async def test_sustained_equity_primary_failure_reuses_scarce_fallback_caches(
 
     alpaca = FailingPrimary("alpaca")
     finnhub = FailingPrimary("finnhub")
-    twelve = TwelveDataProvider(
+    twelve = create_builtin_twelve_data_provider(
         "key",
         quote_cache_clock=lambda: seconds,
         wall_clock=lambda: origin + timedelta(seconds=seconds),
     )
-    alpha = AlphaVantageProvider(
+    alpha = create_builtin_alpha_vantage_provider(
         "key",
         quote_cache_clock=lambda: seconds,
         wall_clock=lambda: origin + timedelta(seconds=seconds),
@@ -1461,7 +1463,10 @@ async def test_sustained_twelve_failure_reuses_six_hour_alpha_fx_cache() -> None
             raise ProviderUnavailable(self.name, "sustained outage")
 
     twelve = Twelve()
-    alpha = AlphaVantageProvider("key", quote_cache_clock=lambda: clock)
+    alpha = create_builtin_alpha_vantage_provider(
+        "key",
+        quote_cache_clock=lambda: clock,
+    )
 
     async def alpha_request(_method, _url, *, params, **_kwargs):
         counter = str(params["to_currency"])

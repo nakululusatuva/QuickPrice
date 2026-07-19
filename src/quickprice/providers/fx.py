@@ -7,10 +7,8 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import MappingProxyType
 
 from quickprice.domain import PricePoint, ProviderQuote
-from quickprice.fx import FX_HUB_SYMBOLS, FX_SYMBOLS, fx_hub_requirements
 
 from ._models import component, point, quote
 from .base import UnsupportedInstrument
@@ -22,12 +20,6 @@ from .synthetic import (
 )
 
 FX_MAX_SKEW = timedelta(minutes=20)
-FX_HUB_MAX_AGES: Mapping[str, timedelta] = MappingProxyType(
-    {
-        symbol: timedelta(minutes=5) if symbol == "USD:CNH" else timedelta(minutes=20)
-        for symbol in FX_HUB_SYMBOLS
-    }
-)
 _CURRENCY_PATTERN = re.compile(r"^[A-Z][A-Z0-9._-]{0,15}$")
 
 
@@ -48,10 +40,6 @@ def dynamic_fx_requirements(symbol: str) -> tuple[str, ...]:
     if quote_currency == "USD":
         return (f"USD:{base}",)
     return (f"USD:{quote_currency}", f"USD:{base}")
-
-
-def _default_fx_requirements() -> dict[str, tuple[str, ...]]:
-    return {symbol: fx_hub_requirements(symbol) for symbol in FX_SYMBOLS}
 
 
 def _validate_single_component(
@@ -126,7 +114,7 @@ class UsdHubFxQuoteProvider:
         resolver: Callable[[str], Awaitable[ProviderQuote]],
         *,
         requirements: Mapping[str, Sequence[str]] | None = None,
-        max_ages: Mapping[str, timedelta] = FX_HUB_MAX_AGES,
+        max_ages: Mapping[str, timedelta] | None = None,
         max_skew: timedelta = FX_MAX_SKEW,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -135,11 +123,9 @@ class UsdHubFxQuoteProvider:
             symbol.strip().upper(): tuple(
                 requirement.strip().upper() for requirement in dependencies
             )
-            for symbol, dependencies in (
-                _default_fx_requirements() if requirements is None else requirements
-            ).items()
+            for symbol, dependencies in (requirements or {}).items()
         }
-        self._max_ages = dict(max_ages)
+        self._max_ages = dict(max_ages or {})
         self._max_skew = max_skew
         self._clock = clock
 
@@ -147,11 +133,14 @@ class UsdHubFxQuoteProvider:
         normalized = symbol.strip().upper()
         try:
             base, quote_currency = normalized.split(":", 1)
-            requirements = self._requirements[normalized]
-        except (KeyError, ValueError) as exc:
+        except ValueError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported FX symbol {normalized}") from exc
         if base == "USD":
             raise UnsupportedInstrument(self.name, "USD hub pairs must use direct providers")
+        try:
+            requirements = self._requirements[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(self.name, f"unsupported FX symbol {normalized}") from exc
         try:
             ages = tuple(self._max_ages[item] for item in requirements)
         except KeyError as exc:
@@ -203,9 +192,7 @@ class UsdHubFxHistoryProvider:
             symbol.strip().upper(): tuple(
                 requirement.strip().upper() for requirement in dependencies
             )
-            for symbol, dependencies in (
-                _default_fx_requirements() if requirements is None else requirements
-            ).items()
+            for symbol, dependencies in (requirements or {}).items()
         }
         self._max_skew = max_skew
 
@@ -221,11 +208,14 @@ class UsdHubFxHistoryProvider:
         normalized = symbol.strip().upper()
         try:
             base, quote_currency = normalized.split(":", 1)
-            requirements = self._requirements[normalized]
-        except (KeyError, ValueError) as exc:
+        except ValueError as exc:
             raise UnsupportedInstrument(self.name, f"unsupported FX symbol {normalized}") from exc
         if base == "USD":
             raise UnsupportedInstrument(self.name, "USD hub pairs must use direct providers")
+        try:
+            requirements = self._requirements[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(self.name, f"unsupported FX symbol {normalized}") from exc
 
         if quote_currency == "USD":
             source = await self._resolver(
@@ -290,7 +280,6 @@ class UsdHubFxHistoryProvider:
 
 
 __all__ = [
-    "FX_HUB_MAX_AGES",
     "FX_MAX_SKEW",
     "UsdHubFxHistoryProvider",
     "UsdHubFxQuoteProvider",

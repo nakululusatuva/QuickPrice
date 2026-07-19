@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import Any
 from urllib.parse import urlencode
 
 from quickprice.domain import (
@@ -42,19 +42,6 @@ from .base import (
     require_mapping,
     require_sequence,
 )
-
-WBETH_ETHEREUM_ADDRESS = "0xa2e3356610840701bdf5611a53974510ae27e2e1"
-WBETH_EXCHANGE_RATE_CALL = "0x3ba0b9a9"
-WBETH_EXCHANGE_RATE_EVENT = "0x0b4e9390054347e2a16d95fd8376311b0d2deedecba526e9742bcaa40b059f0b"
-LIDO_STETH_ADDRESS = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
-
-
-def _canonical_staking_symbol(symbol: str, base: str, provider: str) -> str:
-    normalized = symbol.strip().upper()
-    parts = normalized.split(":")
-    if len(parts) != 2 or parts[0] != base or not parts[1]:
-        raise UnsupportedInstrument(provider, f"unsupported yield symbol {normalized}")
-    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,17 +86,6 @@ def _is_hex(value: str, *, bytes_length: int) -> bool:
     return True
 
 
-WBETH_ETHEREUM_SPEC = EthereumExchangeRateSpec(
-    symbol="WBETH:USDC",
-    index_symbol="WBETH:ETH",
-    underlying_asset="ETH",
-    contract_address=WBETH_ETHEREUM_ADDRESS,
-    chain_id=1,
-    call_data=WBETH_EXCHANGE_RATE_CALL,
-    event_topic=WBETH_EXCHANGE_RATE_EVENT,
-)
-
-
 def _hex_integer(value: Any, provider: str, context: str) -> int:
     if not isinstance(value, str) or not value.startswith("0x"):
         raise MalformedResponse(provider, f"{context} must be a hex integer")
@@ -134,7 +110,7 @@ class EthereumExchangeRateYieldProvider(HttpProvider):
         self,
         rpc_urls: str | Sequence[str],
         *,
-        specs: Sequence[EthereumExchangeRateSpec] = (WBETH_ETHEREUM_SPEC,),
+        specs: Sequence[EthereumExchangeRateSpec] = (),
         observation_window_days: int = 7,
         history_padding_days: int = 7,
         max_log_block_span: int = 10_000,
@@ -592,7 +568,7 @@ class _BinanceRateRow:
 
 
 class BinanceWbethYieldProvider(HttpProvider):
-    """Read Binance's signed, provider-reported WBETH APR."""
+    """Read Binance's signed, provider-reported staking APR."""
 
     name = "binance_wbeth_rate"
     base_url = "https://api.binance.com"
@@ -603,6 +579,7 @@ class BinanceWbethYieldProvider(HttpProvider):
         api_key: str,
         api_secret: str,
         *,
+        yield_policies: Mapping[str, Mapping[str, Any]] | None = None,
         clock: Callable[[], datetime] = utc_now,
         recv_window_ms: int = 5000,
         **kwargs: Any,
@@ -614,19 +591,42 @@ class BinanceWbethYieldProvider(HttpProvider):
             raise ValueError("Binance receive window must be between 1 and 60000 milliseconds")
         self.api_key = api_key
         self._api_secret = api_secret.encode("utf-8")
+        self.yield_policies = {
+            symbol.strip().upper(): dict(policy)
+            for symbol, policy in (yield_policies or {}).items()
+        }
         self._clock = clock
         self.recv_window_ms = recv_window_ms
 
+    def _policy(self, symbol: str) -> tuple[str, Mapping[str, Any]]:
+        normalized = symbol.strip().upper()
+        exact = self.yield_policies.get(normalized)
+        if exact is not None:
+            return normalized, exact
+        base, separator, quote_asset = normalized.partition(":")
+        matches = tuple(
+            policy
+            for configured, policy in self.yield_policies.items()
+            if configured.partition(":")[0] == base
+        )
+        if separator and quote_asset and len(matches) == 1:
+            return normalized, matches[0]
+        raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
+
     async def get_yield(self, symbol: str) -> YieldMetric:
-        normalized = _canonical_staking_symbol(symbol, "WBETH", self.name)
+        normalized, policy = self._policy(symbol)
+        index_symbol = str(policy["index_symbol"]).strip().upper()
+        underlying_asset = str(policy["underlying_asset"]).strip().upper()
+        accrual_mode = RewardAccrualMode(policy["accrual_mode"])
+        method = str(policy["method"]).strip()
         now = ensure_utc(self._clock())
         rows = await self._rows(now - timedelta(days=30), now)
         if not rows:
-            raise ProviderUnavailable(self.name, "WBETH rate history is empty")
+            raise ProviderUnavailable(self.name, "staking-rate history is empty")
         row = rows[-1]
         index = AccrualIndexPoint(
-            symbol="WBETH:ETH",
-            underlying_asset="ETH",
+            symbol=index_symbol,
+            underlying_asset=underlying_asset,
             value=row.exchange_rate,
             as_of=row.as_of,
             provider=self.name,
@@ -639,7 +639,7 @@ class BinanceWbethYieldProvider(HttpProvider):
             # It is already annualized and must not be multiplied by 365.
             value=row.apr_fraction * Decimal(100),
             as_of=row.as_of,
-            method="binance_wbeth_rate_history_apr",
+            method=method,
             provider=self.name,
             is_proxy=False,
             components=(
@@ -653,8 +653,8 @@ class BinanceWbethYieldProvider(HttpProvider):
                 ),
             ),
             rate_type=YieldRateType.APR,
-            accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
-            underlying_asset="ETH",
+            accrual_mode=accrual_mode,
+            underlying_asset=underlying_asset,
             is_estimate=False,
             accrual_index=index,
             quality=YieldQuality(
@@ -668,7 +668,7 @@ class BinanceWbethYieldProvider(HttpProvider):
     async def get_accrual_index(self, symbol: str) -> AccrualIndexPoint:
         metric = await self.get_yield(symbol)
         if metric.accrual_index is None:
-            raise ProviderUnavailable(self.name, "WBETH exchange rate is unavailable")
+            raise ProviderUnavailable(self.name, "staking exchange rate is unavailable")
         return metric.accrual_index
 
     async def get_accrual_index_history(
@@ -678,12 +678,14 @@ class BinanceWbethYieldProvider(HttpProvider):
         start: datetime,
         end: datetime,
     ) -> Sequence[AccrualIndexPoint]:
-        _canonical_staking_symbol(symbol, "WBETH", self.name)
+        _, policy = self._policy(symbol)
+        index_symbol = str(policy["index_symbol"]).strip().upper()
+        underlying_asset = str(policy["underlying_asset"]).strip().upper()
         rows = await self._rows(ensure_utc(start), ensure_utc(end))
         return tuple(
             AccrualIndexPoint(
-                symbol="WBETH:ETH",
-                underlying_asset="ETH",
+                symbol=index_symbol,
+                underlying_asset=underlying_asset,
                 value=row.exchange_rate,
                 as_of=row.as_of,
                 provider=self.name,
@@ -694,9 +696,9 @@ class BinanceWbethYieldProvider(HttpProvider):
 
     async def _rows(self, start: datetime, end: datetime) -> Sequence[_BinanceRateRow]:
         if start >= end:
-            raise ValueError("WBETH rate history start must be before end")
+            raise ValueError("staking-rate history start must be before end")
         if end - start > timedelta(days=93):
-            raise ValueError("Binance WBETH rate history cannot exceed three months")
+            raise ValueError("Binance staking-rate history cannot exceed three months")
         timestamp_ms = int(ensure_utc(self._clock()).timestamp() * 1000)
         params: dict[str, int | str] = {
             "startTime": int(start.timestamp() * 1000),
@@ -719,57 +721,77 @@ class BinanceWbethYieldProvider(HttpProvider):
             headers={"X-MBX-APIKEY": self.api_key},
         )
         document = require_mapping(payload, self.name)
-        rows = require_sequence(document.get("rows"), self.name, "WBETH rate rows")
+        rows = require_sequence(document.get("rows"), self.name, "staking-rate rows")
         result: list[_BinanceRateRow] = []
         for item in rows:
-            row = require_mapping(item, self.name, "WBETH rate row")
+            row = require_mapping(item, self.name, "staking-rate row")
             try:
                 as_of = utc_datetime(row["time"], milliseconds=True)
                 apr_fraction = decimal_value(row["annualPercentageRate"])
                 exchange_rate = decimal_value(row["exchangeRate"])
             except (KeyError, ValueError) as exc:
-                raise MalformedResponse(self.name, "invalid WBETH rate row") from exc
+                raise MalformedResponse(self.name, "invalid staking-rate row") from exc
             if apr_fraction < 0:
-                raise MalformedResponse(self.name, "WBETH APR cannot be negative")
+                raise MalformedResponse(self.name, "staking APR cannot be negative")
             if exchange_rate <= 0:
-                raise MalformedResponse(self.name, "WBETH exchange rate must be positive")
+                raise MalformedResponse(self.name, "staking exchange rate must be positive")
             if start <= as_of <= end:
                 result.append(_BinanceRateRow(as_of, apr_fraction, exchange_rate))
         return tuple(sorted(result, key=lambda row: row.as_of))
 
 
 class LidoAprProvider(HttpProvider):
-    """Read Lido's official seven-day simple-moving-average stETH APR."""
+    """Read Lido's official seven-day simple-moving-average staking APR."""
 
     name = "lido"
     base_url = "https://eth-api.lido.fi"
     path = "/v1/protocol/steth/apr/sma"
-    _accrual_modes: ClassVar[dict[str, RewardAccrualMode]] = {
-        "STETH": RewardAccrualMode.REBASING_BALANCE,
-        "WSTETH": RewardAccrualMode.VALUE_ACCRUING,
-    }
 
     def __init__(
         self,
         *,
+        yield_policies: Mapping[str, Mapping[str, Any]] | None = None,
+        expected_contract_address: str,
+        expected_chain_id: int = 1,
         clock: Callable[[], datetime] = utc_now,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self.yield_policies = {
+            symbol.strip().upper(): dict(policy)
+            for symbol, policy in (yield_policies or {}).items()
+        }
+        self.expected_contract_address = expected_contract_address.strip().lower()
+        if not _is_hex(self.expected_contract_address, bytes_length=20):
+            raise ValueError("Lido contract address must be a 20-byte hex value")
+        if expected_chain_id <= 0:
+            raise ValueError("Lido chain id must be positive")
+        self.expected_chain_id = expected_chain_id
         self._clock = clock
+
+    def _policy(self, symbol: str) -> Mapping[str, Any]:
+        normalized = symbol.strip().upper()
+        exact = self.yield_policies.get(normalized)
+        if exact is not None:
+            return exact
+        base, separator, quote_asset = normalized.partition(":")
+        matches = tuple(
+            policy
+            for configured, policy in self.yield_policies.items()
+            if configured.partition(":")[0] == base
+        )
+        if separator and quote_asset and len(matches) == 1:
+            return matches[0]
+        raise UnsupportedInstrument(self.name, f"unsupported yield symbol {normalized}")
 
     async def get_yield(self, symbol: str) -> YieldMetric:
         normalized = symbol.strip().upper()
         try:
-            base, quote_asset = normalized.split(":", 1)
-            if not quote_asset:
-                raise ValueError
-            accrual_mode = self._accrual_modes[base]
-        except KeyError as exc:
-            raise UnsupportedInstrument(
-                self.name, f"unsupported yield symbol {normalized}"
-            ) from exc
-        except ValueError as exc:
+            policy = self._policy(normalized)
+            provider_asset = str(policy["provider_asset"]).strip().lower()
+            accrual_mode = RewardAccrualMode(policy["accrual_mode"])
+            underlying_asset = str(policy["underlying_asset"]).strip().upper()
+        except (KeyError, TypeError, ValueError) as exc:
             raise UnsupportedInstrument(
                 self.name, f"unsupported yield symbol {normalized}"
             ) from exc
@@ -786,9 +808,9 @@ class LidoAprProvider(HttpProvider):
         except (TypeError, ValueError) as exc:
             raise MalformedResponse(self.name, "invalid Lido APR chain id") from exc
         if (
-            str(meta.get("symbol", "")).lower() != "steth"
-            or str(meta.get("address", "")).lower() != LIDO_STETH_ADDRESS.lower()
-            or chain_id != 1
+            str(meta.get("symbol", "")).lower() != provider_asset
+            or str(meta.get("address", "")).lower() != self.expected_contract_address
+            or chain_id != self.expected_chain_id
         ):
             raise MalformedResponse(self.name, "unexpected Lido APR metadata")
 
@@ -817,7 +839,7 @@ class LidoAprProvider(HttpProvider):
             rate_type=YieldRateType.APR,
             observation_window_days=Decimal(7),
             accrual_mode=accrual_mode,
-            underlying_asset="ETH",
+            underlying_asset=underlying_asset,
             is_estimate=True,
             quality=YieldQuality(
                 stale=staleness_ms > 2 * 24 * 60 * 60 * 1000,
@@ -854,23 +876,6 @@ class StakingMarketRatioSpec:
             raise ValueError("market-ratio lookback must be between 7 and 365 days")
 
 
-WBETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
-    symbol="WBETH:USDC",
-    staking_pair="WBETH:USDC",
-    underlying_pair="ETH:USDC",
-    underlying_asset="ETH",
-    accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
-)
-
-WSTETH_MARKET_RATIO_SPEC = StakingMarketRatioSpec(
-    symbol="WSTETH:USDC",
-    staking_pair="WSTETH:USD",
-    underlying_pair="ETH:USD",
-    underlying_asset="ETH",
-    accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
-)
-
-
 @dataclass(frozen=True, slots=True)
 class _MarketRatioObservation:
     index: AccrualIndexPoint
@@ -887,7 +892,7 @@ class StakingMarketRatioYieldProvider:
         self,
         history_provider: HistoryProvider,
         *,
-        specs: Sequence[StakingMarketRatioSpec] = (WBETH_MARKET_RATIO_SPEC,),
+        specs: Sequence[StakingMarketRatioSpec] = (),
         clock: Callable[[], datetime] = utc_now,
         lookback_days: int = 30,
         padding_days: int = 3,
