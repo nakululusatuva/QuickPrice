@@ -541,6 +541,25 @@ async def test_coingecko_exposes_negative_cache_retry_and_backs_off_repeated_fai
 
 
 @pytest.mark.asyncio
+async def test_coingecko_default_negative_cache_never_delays_quote_retry_past_reserve_cadence():
+    monotonic = [0.0]
+    provider = create_builtin_coingecko_provider(
+        "key",
+        clock=lambda: monotonic[0],
+    )
+    provider._request_json = AsyncMock(
+        side_effect=ProviderUnavailable("coingecko", "proxy tunnel failure")
+    )
+
+    for attempt in range(4):
+        with pytest.raises(ProviderUnavailable, match="proxy tunnel failure"):
+            await provider.get_quote("WSTETH:USDC")
+        assert provider.quote_failure_retry_after_seconds() == 600
+        assert provider._request_json.await_count == attempt + 1
+        monotonic[0] += 600
+
+
+@pytest.mark.asyncio
 async def test_coingecko_does_not_claim_intraday_history_support():
     provider = create_builtin_coingecko_provider("key")
 

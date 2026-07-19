@@ -25,6 +25,7 @@ from .base import (
 from .quota import QuotaBudget, rolling_month_safe_daily_budget
 
 COINGECKO_SHARED_QUOTE_CACHE_SECONDS = 600.0
+COINGECKO_MAXIMUM_QUOTE_ERROR_CACHE_SECONDS = COINGECKO_SHARED_QUOTE_CACHE_SECONDS
 COINGECKO_DAILY_QUOTE_RESERVE_CREDITS = math.ceil(86_400 / COINGECKO_SHARED_QUOTE_CACHE_SECONDS) + 1
 
 
@@ -103,7 +104,7 @@ class CoinGeckoProvider(HttpProvider):
         normalization_coin_id: str | None = None,
         normalization_component_symbol: str | None = None,
         cache_ttl_seconds: float = COINGECKO_SHARED_QUOTE_CACHE_SECONDS,
-        maximum_error_cache_ttl_seconds: float = 3600.0,
+        maximum_error_cache_ttl_seconds: float = COINGECKO_MAXIMUM_QUOTE_ERROR_CACHE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         **kwargs,
     ):
