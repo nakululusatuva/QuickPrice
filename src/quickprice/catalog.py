@@ -404,7 +404,10 @@ class ManagedInstrumentDefinition(_CatalogModel):
             market_calendar=item.market_calendar,
             quote_poll_seconds=item.quote_poll_seconds,
             stale_after_seconds=item.stale_after_seconds,
-            history=HistoryCollectionPolicy(enabled=item.history_enabled),
+            history=HistoryCollectionPolicy(
+                enabled=item.history_enabled,
+                poll_seconds=item.history_poll_seconds,
+            ),
             routes=tuple(routes),
             provider_symbols=tuple(provider_symbols),
             income=income,
@@ -432,6 +435,7 @@ class ManagedInstrumentDefinition(_CatalogModel):
             stale_after_seconds=self.stale_after_seconds,
             quote_poll_seconds=self.quote_poll_seconds,
             history_enabled=self.history.enabled,
+            history_poll_seconds=self.history.poll_seconds,
         )
 
     @property

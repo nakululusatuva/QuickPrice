@@ -18,7 +18,12 @@ from quickprice.provider_factory import (
     create_builtin_twelve_data_provider,
 )
 from quickprice.providers.base import HttpProvider, ProviderRateLimited, ProviderUnavailable
+from quickprice.providers.coingecko import (
+    COINGECKO_DAILY_QUOTE_RESERVE_CREDITS,
+    COINGECKO_SHARED_QUOTE_CACHE_SECONDS,
+)
 from quickprice.providers.fx import UsdHubFxQuoteProvider
+from quickprice.providers.quota import QuotaBudget
 from quickprice.registry import INSTRUMENTS
 
 
@@ -62,16 +67,18 @@ async def test_finnhub_rest_cache_keeps_the_listed_catalog_below_the_minute_limi
 
 
 def test_coingecko_staking_cadence_fits_the_rolling_month_safe_daily_budget() -> None:
-    poll_seconds = min(
-        INSTRUMENTS[symbol].quote_poll_seconds for symbol in ("STETH:USDC", "WSTETH:USDC")
-    )
-    batched_quote_requests = math.ceil(86_400 / poll_seconds)
-    hourly_history_requests = 2 * 3 * 24
-    initial_paging_overhead = 2 * 2
+    symbols = ("BETH:USDC", "STETH:USDC", "WSTETH:USDC")
+    assert {INSTRUMENTS[symbol].history_poll_seconds for symbol in symbols} == {21_600.0}
 
-    assert batched_quote_requests == 131
-    assert batched_quote_requests + hourly_history_requests + initial_paging_overhead == 279
-    assert 279 <= 9_000 // 31
+    batched_quote_requests = math.ceil(86_400 / COINGECKO_SHARED_QUOTE_CACHE_SECONDS)
+    history_requests = len(symbols) * (3 * 4 + 2)
+    ratio_history_requests = 2 * 4
+    planned_requests = batched_quote_requests + history_requests + ratio_history_requests
+
+    assert batched_quote_requests == 144
+    assert COINGECKO_DAILY_QUOTE_RESERVE_CREDITS == 145
+    assert planned_requests == 194
+    assert planned_requests <= 9_000 // 31
 
 
 @pytest.mark.asyncio
@@ -171,6 +178,30 @@ async def test_twelve_local_gate_timeout_is_not_negative_cached(monkeypatch) -> 
     assert result.price == Decimal("7.20")
     assert gate.calls == 2
     assert upstream.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_twelve_exhausted_history_is_rejected_before_the_short_window_gate() -> None:
+    class Gate:
+        calls = 0
+
+        async def acquire(self):
+            self.calls += 1
+
+    gate = Gate()
+    quota = QuotaBudget(2, 86_400, reserve=1, align_windows=False)
+    assert await quota.acquire()
+    provider = create_builtin_twelve_data_provider("key", quota=quota, rate_gate=gate)
+
+    with pytest.raises(ProviderRateLimited, match="local quota exhausted"):
+        await provider.get_history(
+            "USD:CNH",
+            interval="1m",
+            start=datetime(2026, 7, 20, tzinfo=UTC),
+            end=datetime(2026, 7, 20, 1, tzinfo=UTC),
+        )
+
+    assert gate.calls == 0
 
 
 @pytest.mark.asyncio

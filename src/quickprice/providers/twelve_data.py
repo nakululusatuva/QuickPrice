@@ -113,6 +113,13 @@ class TwelveDataProvider(HttpProvider):
         # Twelve applies a short-window ceiling independently from its daily
         # credit budget. Serialize every adapter request through one provider-
         # wide gate so concurrent startup quote/history work cannot burst 429s.
+        quota_cost = int(kwargs.get("quota_cost", 1))
+        allow_quota_reserve = bool(kwargs.get("allow_quota_reserve", False))
+        if self.quota is not None and not await self.quota.can_acquire(
+            quota_cost,
+            allow_reserve=allow_quota_reserve,
+        ):
+            raise ProviderRateLimited(self.name, "local quota exhausted")
         try:
             async with asyncio.timeout(self.rate_gate_timeout_seconds):
                 await self._rate_gate.acquire()
@@ -286,7 +293,7 @@ class TwelveDataProvider(HttpProvider):
                 "timezone": "UTC",
                 "apikey": self.api_key,
             },
-            allow_quota_reserve=normalized in self.fx_symbols,
+            allow_quota_reserve=False,
         )
         document = self._document(payload)
         rows = document.get("values")

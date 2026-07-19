@@ -1570,7 +1570,7 @@ async def test_coingecko_negative_cache_retries_slow_staking_quote_at_expiry() -
         await coordinator.graph.close()
 
     assert coordinator.registry["WSTETH:USDC"].quote_poll_seconds == 660
-    assert next_interval == provider._cache_ttl_seconds == 300
+    assert next_interval == provider._cache_ttl_seconds == 600
     assert provider._request_json.await_count == 1
     assert "simple-price refresh" not in coordinator._last_errors["quote:WSTETH:USDC"]["reason"]
 

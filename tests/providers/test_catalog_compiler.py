@@ -1693,7 +1693,7 @@ def test_coingecko_quote_credits_are_shared_across_the_batch_cache() -> None:
 
     plan = compile_route_plan(items, available_providers={"coingecko"})
 
-    assert plan.estimated_daily_credits["coingecko"] == Decimal(288)
+    assert plan.estimated_daily_credits["coingecko"] == Decimal(144)
     assert len(plan.credit_estimates) == 1
     assert plan.credit_estimates[0].symbol == "*"
     assert "shared_batch_cache" in plan.credit_estimates[0].bases
@@ -1721,8 +1721,8 @@ def test_coingecko_credit_plan_counts_two_thousand_dynamic_id_batches() -> None:
     )
 
     assert batch_count == 9
-    assert plan.estimated_daily_credits["coingecko"] == Decimal(288 * batch_count)
-    assert plan.credit_estimates[0].requests_per_day == 288 * batch_count
+    assert plan.estimated_daily_credits["coingecko"] == Decimal(144 * batch_count)
+    assert plan.credit_estimates[0].requests_per_day == 144 * batch_count
     assert f"shared_batch_count:{batch_count}" in plan.credit_estimates[0].bases
 
 

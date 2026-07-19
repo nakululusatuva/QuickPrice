@@ -184,6 +184,64 @@ def test_legacy_v2_rebasing_ratio_fallback_is_normalized_before_validation(tmp_p
         )
 
 
+def test_builtin_history_defaults_migrate_only_null_catalog_values(tmp_path) -> None:
+    path = tmp_path / "instruments.json"
+    InstrumentPolicyStore(path, build_registry())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["staged"] = copy.deepcopy(payload["active"])
+    payload["last_known_good"] = copy.deepcopy(payload["active"])
+
+    for generation_name in ("active", "staged", "last_known_good"):
+        generation = payload[generation_name]
+        by_symbol = {item["symbol"]: item for item in generation["instruments"]}
+        by_symbol["BETH:USDC"]["history"]["poll_seconds"] = None
+        by_symbol["STETH:USDC"]["history"]["poll_seconds"] = None
+        by_symbol["WSTETH:USDC"]["history"]["poll_seconds"] = 7_200.0
+        by_symbol["BTC:USDC"]["history"]["poll_seconds"] = None
+        generation["revision"] = hashlib.sha256(
+            json.dumps(
+                {"instruments": generation["instruments"]},
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = InstrumentPolicyStore(path, build_registry(), defer_migration=True)
+
+    for generation in (
+        store.active_generation(),
+        store.staged_generation(),
+        store.last_known_good_generation(),
+    ):
+        assert generation is not None
+        by_symbol = generation.by_symbol()
+        assert by_symbol["BETH:USDC"].history.poll_seconds == 21_600.0
+        assert by_symbol["STETH:USDC"].history.poll_seconds == 21_600.0
+        assert by_symbol["WSTETH:USDC"].history.poll_seconds == 7_200.0
+        assert by_symbol["BTC:USDC"].history.poll_seconds is None
+
+    store.persist_migration()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    for generation_name in ("active", "staged", "last_known_good"):
+        by_symbol = {item["symbol"]: item for item in persisted[generation_name]["instruments"]}
+        assert by_symbol["BETH:USDC"]["history"]["poll_seconds"] == 21_600.0
+        assert by_symbol["WSTETH:USDC"]["history"]["poll_seconds"] == 7_200.0
+
+
+def test_managed_definition_round_trip_preserves_history_poll_policy() -> None:
+    item = build_registry()["BETH:USDC"]
+    definition = ManagedInstrumentDefinition.from_instrument_spec(
+        item,
+        instrument_id="builtin-beth-usdc",
+        ownership=InstrumentOwnership.BUILTIN,
+    )
+
+    assert definition.history.poll_seconds == 21_600.0
+    assert definition.to_instrument_spec().history_poll_seconds == 21_600.0
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode validation")
 def test_catalog_rejects_a_file_writable_by_another_account(tmp_path) -> None:
     path = tmp_path / "instruments.json"

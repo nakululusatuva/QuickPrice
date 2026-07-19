@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,19 @@ from .base import (
     require_mapping,
     require_sequence,
 )
-from .quota import rolling_month_safe_daily_budget
+from .quota import QuotaBudget, rolling_month_safe_daily_budget
+
+COINGECKO_SHARED_QUOTE_CACHE_SECONDS = 600.0
+COINGECKO_DAILY_QUOTE_RESERVE_CREDITS = math.ceil(86_400 / COINGECKO_SHARED_QUOTE_CACHE_SECONDS) + 1
+
+
+def coingecko_quota_budget(monthly_credits: int) -> QuotaBudget:
+    """Reserve enough of the safe daily slice for the shared price batch."""
+
+    daily_limit = monthly_credits // 31
+    reserve = min(COINGECKO_DAILY_QUOTE_RESERVE_CREDITS, max(0, daily_limit - 1))
+    return rolling_month_safe_daily_budget(monthly_credits, reserve=reserve)
+
 
 # CoinGecko documents comma-separated IDs but no hard ID-count ceiling for
 # /simple/price. These conservative transport bounds keep both the number of
@@ -89,12 +102,12 @@ class CoinGeckoProvider(HttpProvider):
         normalization_quote_asset: str | None = None,
         normalization_coin_id: str | None = None,
         normalization_component_symbol: str | None = None,
-        cache_ttl_seconds: float = 300.0,
+        cache_ttl_seconds: float = COINGECKO_SHARED_QUOTE_CACHE_SECONDS,
         maximum_error_cache_ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         **kwargs,
     ):
-        kwargs.setdefault("quota", rolling_month_safe_daily_budget(9_000))
+        kwargs.setdefault("quota", coingecko_quota_budget(9_000))
         super().__init__(**kwargs)
         self.api_key = api_key
         self.coin_ids = {key.strip().upper(): value for key, value in (coin_ids or {}).items()}
@@ -281,6 +294,7 @@ class CoinGeckoProvider(HttpProvider):
                             "include_last_updated_at": "true",
                         },
                         headers=self._headers,
+                        allow_quota_reserve=True,
                     )
                     document = require_mapping(payload, self.name)
                     merged.update(document)

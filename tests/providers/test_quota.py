@@ -21,6 +21,8 @@ async def test_quota_hard_limit_and_reserve():
     )
 
     assert await budget.acquire(4)
+    assert not await budget.can_acquire()
+    assert await budget.can_acquire(allow_reserve=True)
     assert not await budget.acquire()
     assert await budget.acquire(allow_reserve=True)
     assert not await budget.acquire(allow_reserve=True)
@@ -106,7 +108,8 @@ async def test_quota_denies_upstream_reservation_when_persistence_fails():
 
 @pytest.mark.asyncio
 async def test_monthly_fallback_budget_is_safe_across_daily_boundaries():
-    budget = rolling_month_safe_daily_budget(9_000)
+    budget = rolling_month_safe_daily_budget(9_000, reserve=145)
     snapshot = await budget.snapshot()
     assert snapshot.limit == 290
+    assert budget.reserve == 145
     assert snapshot.limit * 31 <= 9_000

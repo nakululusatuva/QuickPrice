@@ -86,6 +86,22 @@ class QuotaBudget:
                     raise
             return True
 
+    async def can_acquire(self, cost: int = 1, *, allow_reserve: bool = False) -> bool:
+        """Check admission without reserving a credit.
+
+        Providers with a separate short-window gate can use this as an early
+        rejection before waiting in that gate. The subsequent ``acquire`` is
+        still authoritative because another task may consume capacity between
+        the two operations.
+        """
+
+        if cost <= 0:
+            raise ValueError("cost must be positive")
+        async with self._lock:
+            self._roll(self._clock())
+            ceiling = self.limit if allow_reserve else self.limit - self.reserve
+            return self._used + cost <= ceiling
+
     def _state(self) -> dict[str, int | float]:
         return {
             "version": 1,
@@ -180,7 +196,7 @@ def minute_budget(limit: int) -> QuotaBudget:
     return QuotaBudget(limit, 60)
 
 
-def rolling_month_safe_daily_budget(limit: int) -> QuotaBudget:
+def rolling_month_safe_daily_budget(limit: int, *, reserve: int = 0) -> QuotaBudget:
     """Conservatively enforce a monthly ceiling using UTC daily windows.
 
     Any rolling 30-day interval can touch at most 31 aligned UTC days. Limiting
@@ -190,4 +206,4 @@ def rolling_month_safe_daily_budget(limit: int) -> QuotaBudget:
 
     if limit < 31:
         raise ValueError("monthly limit must be at least 31")
-    return daily_budget(limit // 31)
+    return daily_budget(limit // 31, reserve=reserve)

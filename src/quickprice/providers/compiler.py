@@ -325,7 +325,7 @@ class CompiledRoutePlan:
                 "assumptions": [
                     "Activation admission uses committed primary demand; fallback demand is reported separately.",
                     "The active generation's committed demand may be used as the activation baseline when it already exceeds a configured cap.",
-                    "CoinGecko quote requests share the adapter's five-minute batch cache.",
+                    "CoinGecko quote requests share the adapter's ten-minute batch cache.",
                     "History demand includes cold backfill pages and steady 1m, 5m, and 1d refreshes.",
                     "Synthetic and staking-ratio dependency calls are budgeted independently of direct collection.",
                     "Shared FX spokes are deduplicated by provider, capability, and symbol.",
@@ -663,6 +663,19 @@ def _credit_budget_context(settings: Any | None) -> Mapping[str, Mapping[str, An
         int(settings.twelve_fx_reserve_credits),
         max(0, twelve_limit - 1),
     )
+    from .alpha_vantage import ALPHA_VANTAGE_DEFAULT_FX_QUOTE_RESERVE_CREDITS
+    from .coingecko import COINGECKO_DAILY_QUOTE_RESERVE_CREDITS
+
+    alpha_limit = int(settings.alpha_vantage_daily_credits)
+    alpha_reserve = min(
+        ALPHA_VANTAGE_DEFAULT_FX_QUOTE_RESERVE_CREDITS,
+        max(0, alpha_limit - 1),
+    )
+    coingecko_limit = int(settings.coingecko_monthly_credits) // 31
+    coingecko_reserve = min(
+        COINGECKO_DAILY_QUOTE_RESERVE_CREDITS,
+        max(0, coingecko_limit - 1),
+    )
     raw: dict[str, Mapping[str, Any]] = {
         "twelve_data": MappingProxyType(
             {
@@ -676,16 +689,19 @@ def _credit_budget_context(settings: Any | None) -> Mapping[str, Mapping[str, An
         "alpha_vantage": MappingProxyType(
             {
                 "period": "utc_day",
-                "limit": int(settings.alpha_vantage_daily_credits),
-                "daily_limit": int(settings.alpha_vantage_daily_credits),
-                "reserved_for_fx": 0,
+                "limit": alpha_limit,
+                "daily_limit": alpha_limit,
+                "reserved_for_fx": alpha_reserve,
+                "available_outside_reserve": max(0, alpha_limit - alpha_reserve),
             }
         ),
         "coingecko": MappingProxyType(
             {
                 "period": "rolling_month_safe_utc_day",
                 "monthly_limit": int(settings.coingecko_monthly_credits),
-                "daily_limit": int(settings.coingecko_monthly_credits) // 31,
+                "daily_limit": coingecko_limit,
+                "reserved_for_quotes": coingecko_reserve,
+                "available_outside_reserve": max(0, coingecko_limit - coingecko_reserve),
             }
         ),
         "finnhub": MappingProxyType(
@@ -997,7 +1013,10 @@ def _build_credit_estimates(
         if key[0] == "coingecko" and key[1] is Capability.QUOTE
     ]
     if coingecko_quote:
-        from .coingecko import coingecko_simple_price_id_batches
+        from .coingecko import (
+            COINGECKO_SHARED_QUOTE_CACHE_SECONDS,
+            coingecko_simple_price_id_batches,
+        )
 
         access_interval = min(value.poll_seconds for _, value in coingecko_quote)
         coin_ids = {BUILTIN_COINGECKO_NORMALIZATION_COIN_ID}
@@ -1018,7 +1037,7 @@ def _build_credit_estimates(
                 if coin_id is not None:
                     coin_ids.add(coin_id)
         batch_count = len(coingecko_simple_price_id_batches(tuple(coin_ids)))
-        refreshes = ceil(86_400 / max(300.0, access_interval))
+        refreshes = ceil(86_400 / max(COINGECKO_SHARED_QUOTE_CACHE_SECONDS, access_interval))
         requests = refreshes * batch_count
         cost = get_provider_descriptor("coingecko").quote_credit_cost
         bases = {basis for _, demand in coingecko_quote for basis in demand.bases}
@@ -1490,15 +1509,15 @@ def _install_instance_bindings(
     from quickprice.domain import RewardAccrualMode
 
     from .alpaca import AlpacaProvider
-    from .alpha_vantage import AlphaVantageProvider
+    from .alpha_vantage import AlphaVantageProvider, alpha_vantage_quota_budget
     from .binance import BinanceProvider
-    from .coingecko import CoinGeckoProvider
+    from .coingecko import CoinGeckoProvider, coingecko_quota_budget
     from .finnhub import FinnhubProvider
     from .fred import FredProvider
     from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider, dynamic_fx_requirements
     from .kraken import KrakenProvider
     from .okx import OkxMarketProvider
-    from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
+    from .quota import daily_budget, minute_budget
     from .staking import StakingMarketRatioSpec, StakingMarketRatioYieldProvider
     from .twelve_data import TwelveDataProvider
 
@@ -1600,7 +1619,7 @@ def _install_instance_bindings(
             ),
             normalization_coin_id=BUILTIN_COINGECKO_NORMALIZATION_COIN_ID,
             normalization_component_symbol=BUILTIN_COINGECKO_NORMALIZATION_COMPONENT_SYMBOL,
-            quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
+            quota=coingecko_quota_budget(settings.coingecko_monthly_credits),
             **_proxy_options(settings, "coingecko"),
         )
         _replace_graph_provider(graph, "coingecko", replacement, metrics=metrics)
@@ -1708,7 +1727,10 @@ def _install_instance_bindings(
             equity_symbol_bindings=equity_symbols,
             fx_symbol_bindings=fx_symbols,
             dividend_frequencies=dividend_frequencies,
-            quota=daily_budget(settings.alpha_vantage_daily_credits),
+            quota=alpha_vantage_quota_budget(
+                settings.alpha_vantage_daily_credits,
+                len(fx_symbols),
+            ),
             **_proxy_options(settings, "alpha_vantage"),
         )
         _replace_graph_provider(graph, "alpha_vantage", replacement, metrics=metrics)

@@ -489,6 +489,10 @@ async def test_coingecko_batches_and_merges_two_thousand_dynamic_ids_without_net
         len(",".join(batch)) <= COINGECKO_SIMPLE_PRICE_ID_CHARACTERS_PER_REQUEST
         for batch in batches
     )
+    assert all(
+        call.kwargs["allow_quota_reserve"] is True
+        for call in provider._request_json.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -1140,7 +1144,10 @@ async def test_twelve_data_quote_and_history_contract(fixture_json):
     assert quote_call.args[1].endswith("/time_series")
     assert quote_call.kwargs["params"]["outputsize"] == 1
     assert quote_call.kwargs["params"]["order"] == "DESC"
-    assert provider._request_json.await_args_list[1].kwargs["params"]["adjust"] == "none"
+    assert quote_call.kwargs["allow_quota_reserve"] is True
+    history_call = provider._request_json.await_args_list[1]
+    assert history_call.kwargs["params"]["adjust"] == "none"
+    assert history_call.kwargs["allow_quota_reserve"] is False
 
 
 @pytest.mark.asyncio
@@ -1257,6 +1264,8 @@ async def test_alpha_vantage_fx_and_dividend_contract(fixture_json):
 
     assert latest.price == Decimal("7.2152")
     assert latest.feed == "alpha_vantage_fx"
+    assert provider._request_json.await_args_list[0].kwargs["allow_quota_reserve"] is True
+    assert "allow_quota_reserve" not in provider._request_json.await_args_list[1].kwargs
     # Alpha Vantage's documented payload has no ordinary/special classifier.
     # The adapter fails safe instead of annualizing an unclassified payment.
     assert event is None

@@ -16,6 +16,7 @@ from quickprice.plugin_api import (
     ProviderBinding,
 )
 from quickprice.providers.alpaca import AlpacaProvider
+from quickprice.providers.alpha_vantage import AlphaVantageProvider
 from quickprice.providers.base import Capability, ProviderUnavailable
 from quickprice.providers.coingecko import CoinGeckoProvider
 from quickprice.providers.finnhub import FinnhubProvider
@@ -335,16 +336,40 @@ async def test_default_twelve_quota_reserves_fx_budget() -> None:
         quota = graph.providers["twelve_data"].quota
         snapshot = await quota.snapshot()
         assert snapshot.limit == 790
-        assert quota.reserve == 769
+        assert quota.reserve == 765
 
-        assert await quota.acquire(21)
+        assert await quota.acquire(25)
         assert not await quota.acquire()
-        assert await quota.acquire(769, allow_reserve=True)
+        assert await quota.acquire(765, allow_reserve=True)
         assert not await quota.acquire(allow_reserve=True)
 
         exhausted = await quota.snapshot()
         assert exhausted.used == 790
         assert exhausted.remaining == 0
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_scarce_fallback_providers_reserve_capacity_for_live_quotes() -> None:
+    graph = build_provider_graph(
+        Settings(
+            require_free_threaded=False,
+            background_enabled=False,
+            coingecko_api_key="coingecko-key",
+            alpha_vantage_api_key="alpha-key",
+        )
+    )
+    try:
+        coingecko = graph.providers["coingecko"]
+        alpha = graph.providers["alpha_vantage"]
+
+        assert isinstance(coingecko, CoinGeckoProvider)
+        assert coingecko.quota.limit == 290
+        assert coingecko.quota.reserve == 145
+        assert isinstance(alpha, AlphaVantageProvider)
+        assert alpha.quota.limit == 25
+        assert alpha.quota.reserve == 20
     finally:
         await graph.close()
 

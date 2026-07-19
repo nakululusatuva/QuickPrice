@@ -160,6 +160,8 @@ class InstrumentRegistry(Mapping[str, InstrumentSpec]):
             raise ValueError(f"instrument {symbol} has incomplete classification")
         if item.stale_after_seconds <= 0 or item.quote_poll_seconds <= 0:
             raise ValueError(f"instrument {symbol} has an invalid collection interval")
+        if item.history_poll_seconds is not None and not 1 <= item.history_poll_seconds <= 86_400:
+            raise ValueError(f"instrument {symbol} has an invalid history collection interval")
         if item.asset_class is AssetClass.BOND and item.yield_strategy is None:
             raise ValueError(f"bond instrument {symbol} requires a yield strategy")
         is_staking_asset = "staking" in item.asset_type.lower()

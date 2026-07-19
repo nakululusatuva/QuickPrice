@@ -757,8 +757,17 @@ def _reconcile_generation(
         seen_builtin_ids.add(item.id)
         baseline_payload = expected.model_dump(mode="json")
         persisted_payload = item.model_dump(mode="json")
-        for field_name in _BUILTIN_MUTABLE_FIELDS - {"routes"}:
+        for field_name in _BUILTIN_MUTABLE_FIELDS - {"history", "routes"}:
             baseline_payload[field_name] = persisted_payload[field_name]
+        baseline_history = baseline_payload["history"]
+        persisted_history = persisted_payload["history"]
+        baseline_history["enabled"] = persisted_history["enabled"]
+        baseline_history["backfill_days"] = persisted_history["backfill_days"]
+        if (
+            persisted_history["poll_seconds"] is not None
+            or baseline_history["poll_seconds"] is None
+        ):
+            baseline_history["poll_seconds"] = persisted_history["poll_seconds"]
         # An empty v2 route list predates the declarative built-in route compiler.
         # A valid advanced override always retains at least one required route.
         if persisted_payload["routes"]:

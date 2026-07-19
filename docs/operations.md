@@ -348,8 +348,9 @@ that cannot observe those units.
 ### Provider quota exhausted
 
 - Do not rotate keys to bypass a free plan.
-- Twelve Data protects 769 of its 790 daily credits for FX: 744 hub quotes plus
-  25 cold-start history pages. The remaining 21 credits fund listed-security fallback.
+- Twelve Data reserves 765 of its 790 daily credits for FX quotes. History and
+  listed-security fallback share the 25-credit general pool and cannot consume
+  the quote reserve; the five cached USD hubs require at most 744 quote credits.
 - Finnhub enforces a durable 60-call-per-minute local gate. Listed-security
   polling scales with the catalog and successful or expected-failure responses
   are cached briefly; do not lower the cadence below the calculated floor. A

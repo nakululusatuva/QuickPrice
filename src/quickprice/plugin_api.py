@@ -52,6 +52,7 @@ class InstrumentSpec:
     stale_after_seconds: float = 10.0
     quote_poll_seconds: float = 5.0
     history_enabled: bool = True
+    history_poll_seconds: float | None = None
 
 
 # Backward-compatible public spelling retained for adapter and application imports.

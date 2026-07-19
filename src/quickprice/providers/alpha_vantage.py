@@ -5,6 +5,7 @@ from __future__ import annotations
 import time as monotonic_time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, time
+from math import ceil
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,7 +21,17 @@ from .base import (
     UnsupportedInstrument,
     require_mapping,
 )
-from .quota import daily_budget
+from .quota import QuotaBudget, daily_budget
+
+ALPHA_VANTAGE_FX_QUOTE_TTL_SECONDS = 21_600.0
+ALPHA_VANTAGE_DEFAULT_FX_QUOTE_RESERVE_CREDITS = 20
+
+
+def alpha_vantage_quota_budget(daily_credits: int, fx_symbol_count: int) -> QuotaBudget:
+    refreshes_per_day = ceil(86_400 / ALPHA_VANTAGE_FX_QUOTE_TTL_SECONDS)
+    desired_reserve = refreshes_per_day * max(0, fx_symbol_count)
+    reserve = min(desired_reserve, max(0, daily_credits - 1))
+    return daily_budget(daily_credits, reserve=reserve)
 
 
 class AlphaVantageProvider(HttpProvider):
@@ -37,19 +48,19 @@ class AlphaVantageProvider(HttpProvider):
         equity_symbol_bindings: Mapping[str, str] | None = None,
         fx_symbol_bindings: Mapping[str, str | tuple[str, str]] | None = None,
         dividend_frequencies: Mapping[str, str] | None = None,
-        fx_quote_ttl_seconds: float = 21_600.0,
+        fx_quote_ttl_seconds: float = ALPHA_VANTAGE_FX_QUOTE_TTL_SECONDS,
         quote_cache_clock: Callable[[], float] = monotonic_time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         **kwargs,
     ):
-        kwargs.setdefault("quota", daily_budget(25))
+        raw_fx_symbols = fx_symbol_bindings or {}
+        kwargs.setdefault("quota", alpha_vantage_quota_budget(25, len(raw_fx_symbols)))
         super().__init__(**kwargs)
         self.api_key = api_key
         self.equity_symbols = {
             symbol.strip().upper(): ticker.strip().upper()
             for symbol, ticker in (equity_symbol_bindings or {}).items()
         }
-        raw_fx_symbols = fx_symbol_bindings or {}
         self.fx_symbols = {}
         for raw_symbol, raw_pair in raw_fx_symbols.items():
             symbol = raw_symbol.strip().upper()
@@ -67,7 +78,10 @@ class AlphaVantageProvider(HttpProvider):
             for symbol, frequency in (dividend_frequencies or {}).items()
             if symbol.strip().upper() in self.equity_symbols
         }
-        self.fx_quote_ttl_seconds = max(21_600.0, fx_quote_ttl_seconds)
+        self.fx_quote_ttl_seconds = max(
+            ALPHA_VANTAGE_FX_QUOTE_TTL_SECONDS,
+            fx_quote_ttl_seconds,
+        )
         self._quote_cache = AsyncTtlCache[str, Any](clock=quote_cache_clock)
         self._wall_clock = wall_clock
 
@@ -106,6 +120,7 @@ class AlphaVantageProvider(HttpProvider):
                 "to_currency": counter,
                 "apikey": self.api_key,
             },
+            allow_quota_reserve=True,
         )
         document = self._document(payload)
         row = require_mapping(

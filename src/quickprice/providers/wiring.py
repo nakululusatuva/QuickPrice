@@ -39,9 +39,11 @@ from quickprice.provider_factory import (
 )
 from quickprice.registry import InstrumentRegistry, build_registry
 
+from .alpha_vantage import alpha_vantage_quota_budget
 from .base import Capability
+from .coingecko import coingecko_quota_budget
 from .fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
-from .quota import daily_budget, minute_budget, rolling_month_safe_daily_budget
+from .quota import daily_budget, minute_budget
 from .router import ProviderRouter
 from .synthetic import SyntheticHistoryProvider, SyntheticQuoteProvider, SyntheticRecipe
 
@@ -102,7 +104,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     if settings.coingecko_api_key:
         providers["coingecko"] = create_builtin_coingecko_provider(
             settings.coingecko_api_key,
-            quota=rolling_month_safe_daily_budget(settings.coingecko_monthly_credits),
+            quota=coingecko_quota_budget(settings.coingecko_monthly_credits),
             **_proxy_options(settings, "coingecko"),
         )
     if settings.alpaca_api_key and settings.alpaca_api_secret:
@@ -143,7 +145,10 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     if settings.alpha_vantage_api_key:
         providers["alpha_vantage"] = create_builtin_alpha_vantage_provider(
             settings.alpha_vantage_api_key,
-            quota=daily_budget(settings.alpha_vantage_daily_credits),
+            quota=alpha_vantage_quota_budget(
+                settings.alpha_vantage_daily_credits,
+                len(BUILTIN_TWELVE_FX_POLL_SETTING),
+            ),
             **_proxy_options(settings, "alpha_vantage"),
         )
     if settings.fred_api_key:

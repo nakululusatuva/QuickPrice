@@ -173,6 +173,7 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             reward_accrual_mode=RewardAccrualMode.DISTRIBUTED_UNITS,
             underlying_asset="ETH",
             quote_poll_seconds=1.0,
+            history_poll_seconds=21_600.0,
         ),
         InstrumentSpec(
             symbol="STETH:USDC",
@@ -191,6 +192,7 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             underlying_asset="ETH",
             stale_after_seconds=1800.0,
             quote_poll_seconds=660.0,
+            history_poll_seconds=21_600.0,
         ),
         InstrumentSpec(
             symbol="WSTETH:USDC",
@@ -209,6 +211,7 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             underlying_asset="ETH",
             stale_after_seconds=1800.0,
             quote_poll_seconds=660.0,
+            history_poll_seconds=21_600.0,
         ),
         *COMMON_STOCK_INSTRUMENTS,
         InstrumentSpec(
