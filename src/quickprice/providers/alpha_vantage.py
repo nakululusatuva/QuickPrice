@@ -106,7 +106,22 @@ class AlphaVantageProvider(HttpProvider):
         # Alpha's free endpoint is sensitive to concurrent bursts. Keep one
         # in-flight request per key so the five emergency FX spokes do not
         # rate-limit one another during startup.
+        quota_cost = int(kwargs.get("quota_cost", 1))
+        allow_quota_reserve = bool(kwargs.get("allow_quota_reserve", False))
+        if self.quota is not None and not await self.quota.can_acquire(
+            quota_cost,
+            allow_reserve=allow_quota_reserve,
+        ):
+            raise ProviderRateLimited(self.name, "local quota exhausted")
         async with self._request_lock:
+            # Recheck after admission to the pacing queue. Concurrent callers
+            # may have consumed the last eligible credit while this task was
+            # waiting for the lock.
+            if self.quota is not None and not await self.quota.can_acquire(
+                quota_cost,
+                allow_reserve=allow_quota_reserve,
+            ):
+                raise ProviderRateLimited(self.name, "local quota exhausted")
             delay = self._next_request_at - self._request_clock()
             if delay > 0:
                 await self._request_sleeper(delay)

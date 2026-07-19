@@ -27,6 +27,7 @@ from quickprice.providers.base import (
     Capability,
     HttpProvider,
     MalformedResponse,
+    ProviderRateLimited,
     ProviderUnavailable,
     UnsupportedInstrument,
 )
@@ -1334,6 +1335,67 @@ async def test_alpha_vantage_paces_request_starts(monkeypatch) -> None:
 
     assert sleeps == [12.5]
     assert upstream.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_rejects_exhausted_history_before_pacing() -> None:
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    provider = create_builtin_alpha_vantage_provider(
+        "key",
+        request_sleeper=record_sleep,
+    )
+    assert await provider.quota.acquire(5)
+
+    with pytest.raises(ProviderRateLimited, match="local quota exhausted"):
+        await provider.get_history(
+            "USD:CNH",
+            interval="1d",
+            start=datetime(2026, 7, 1, tzinfo=UTC),
+            end=datetime(2026, 7, 2, tzinfo=UTC),
+        )
+
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_rechecks_quota_after_pacing_queue(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    provider = create_builtin_alpha_vantage_provider(
+        "key",
+        request_sleeper=record_sleep,
+    )
+    assert await provider.quota.acquire(4)
+
+    async def consume_quota(_self, _method, _url, **kwargs):
+        acquired = await provider.quota.acquire(
+            int(kwargs.get("quota_cost", 1)),
+            allow_reserve=bool(kwargs.get("allow_quota_reserve", False)),
+        )
+        if not acquired:
+            raise ProviderRateLimited(provider.name, "local quota exhausted")
+        return {}
+
+    monkeypatch.setattr(HttpProvider, "_request_json", consume_quota)
+    await provider._request_lock.acquire()
+    requests = [
+        asyncio.create_task(provider._request_json("GET", provider.base_url)) for _ in range(3)
+    ]
+    await asyncio.sleep(0)
+    provider._request_lock.release()
+
+    results = await asyncio.gather(*requests, return_exceptions=True)
+
+    assert sum(result == {} for result in results) == 1
+    assert sum(isinstance(result, ProviderRateLimited) for result in results) == 2
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
