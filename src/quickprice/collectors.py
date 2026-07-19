@@ -1054,15 +1054,28 @@ class MarketDataCoordinator:
             float(getattr(primary_provider, "stream_poll_suppression_seconds", 0.0)),
         )
         last_stream_observation = self._stream_observed_at.get((id(primary_provider), symbol))
+        stream_observation_age = (
+            None if last_stream_observation is None else time.monotonic() - last_stream_observation
+        )
         if (
             stream_suppression_seconds > 0
-            and last_stream_observation is not None
-            and time.monotonic() - last_stream_observation < stream_suppression_seconds
+            and stream_observation_age is not None
+            and stream_observation_age < stream_suppression_seconds
         ):
-            return max(
+            next_interval = max(
                 next_interval,
                 float(getattr(primary_provider, "minimum_quote_poll_seconds", 0.0)),
             )
+            stream_recheck_seconds = float(
+                getattr(primary_provider, "stream_poll_recheck_seconds", 0.0)
+            )
+            if stream_recheck_seconds > 0:
+                remaining_fresh_seconds = stream_suppression_seconds - stream_observation_age
+                next_interval = min(
+                    max(next_interval, stream_recheck_seconds),
+                    remaining_fresh_seconds,
+                )
+            return next_interval
         try:
             quote = self._normalize_market_status(await self.router.get_quote(symbol))
             self._queue_quote(quote)
@@ -1184,6 +1197,7 @@ class MarketDataCoordinator:
         provider: Any,
         symbols: tuple[str, ...],
     ) -> None:
+        requested_symbols = frozenset(symbols)
         delay = 1.0
         statistics = self._stream_statistics.setdefault(
             provider_name,
@@ -1220,12 +1234,14 @@ class MarketDataCoordinator:
                         )
                     statistics["messages"] += 1
                     statistics["last_message_at"] = utc_now().isoformat().replace("+00:00", "Z")
-                    if quote.symbol in self.registry:
+                    if quote.symbol in requested_symbols and quote.symbol in self.registry:
                         instrument = self.registry[quote.symbol]
                         source_age = max(0.0, (utc_now() - quote.as_of).total_seconds())
                         observation_key = (id(provider), quote.symbol)
                         if source_age <= instrument.stale_after_seconds:
-                            self._stream_observed_at[observation_key] = time.monotonic()
+                            self._stream_observed_at[observation_key] = (
+                                time.monotonic() - source_age
+                            )
                         else:
                             self._stream_observed_at.pop(observation_key, None)
                         self._queue_quote(quote)

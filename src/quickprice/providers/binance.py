@@ -33,6 +33,8 @@ class BinanceProvider(HttpProvider):
     rest_base_url = "https://api.binance.com"
     websocket_base_url = "wss://stream.binance.com:9443"
     feed = "binance_spot"
+    stream_poll_suppression_seconds = 120.0
+    stream_poll_recheck_seconds = 10.0
 
     symbols: ClassVar[dict[str, str]] = {}
     _reverse_symbols: ClassVar[dict[str, str]] = {}

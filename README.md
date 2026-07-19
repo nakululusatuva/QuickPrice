@@ -289,6 +289,12 @@ reconnect backoff. The multi-request Ethereum exchange-rate algorithm has a
 separate finite route budget derived from its per-request timeout; every JSON-
 RPC request remains subject to the shorter provider request timeout.
 
+For Binance and Kraken, a fresh primary WebSocket quote suppresses the
+duplicate REST quote poll. Suppression is bounded by the quote source time and
+the instrument staleness threshold, is periodically rechecked, and is cleared
+on disconnect. It never applies to fallback providers, unsolicited symbols, or
+internal synthetic-route components.
+
 The default route families are:
 
 - BTC, ETH, SOL, and BNB: Binance, Kraken, then CoinGecko for quotes; Binance

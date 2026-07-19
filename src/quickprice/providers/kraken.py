@@ -35,6 +35,8 @@ class KrakenProvider(HttpProvider):
     rest_base_url = "https://api.kraken.com/0/public"
     websocket_url = "wss://ws.kraken.com/v2"
     feed = "kraken_spot"
+    stream_poll_suppression_seconds = 120.0
+    stream_poll_recheck_seconds = 10.0
 
     symbols: ClassVar[dict[str, tuple[str, str]]] = {}
     _ws_reverse: ClassVar[dict[str, str]] = {}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -16,11 +16,11 @@ from quickprice.providers.quota import QuotaBudget
 from quickprice.providers.router import ProviderRouter
 
 
-def _quote(provider: str) -> ProviderQuote:
+def _quote(provider: str, *, as_of: datetime | None = None) -> ProviderQuote:
     return ProviderQuote(
         symbol="BTC:USDC",
         price=Decimal("10"),
-        as_of=datetime(2026, 7, 21, tzinfo=UTC),
+        as_of=as_of or datetime(2026, 7, 21, tzinfo=UTC),
         provider=provider,
         feed="fixture",
     )
@@ -187,7 +187,7 @@ async def test_quota_metrics_distinguish_local_accounting_from_untracked() -> No
 async def test_stream_health_records_connection_result_and_reconnects() -> None:
     class StreamProvider:
         async def stream_quotes(self, _symbols):
-            yield _quote("stream_fixture")
+            yield _quote("stream_fixture", as_of=datetime.now(UTC))
             raise RuntimeError("fixture disconnect")
 
     metrics = Metrics()
@@ -195,10 +195,11 @@ async def test_stream_health_records_connection_result_and_reconnects() -> None:
         SimpleNamespace(metrics=metrics),
         Settings(background_enabled=False),
     )
+    provider = StreamProvider()
     task = asyncio.create_task(
         coordinator._provider_stream_loop(
             "stream_fixture",
-            StreamProvider(),
+            provider,
             ("BTC:USDC",),
         )
     )
@@ -215,7 +216,64 @@ async def test_stream_health_records_connection_result_and_reconnects() -> None:
         operation = metrics.provider_statistics()["stream_fixture"]["operations"]["lifetime"]
         assert operation["capabilities"] == {"stream": 1}
         assert operation["last_outcome"] == "success"
+        assert (id(provider), "BTC:USDC") not in coordinator._stream_observed_at
     finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_observation_preserves_source_age_and_ignores_unsolicited_symbol() -> None:
+    source_age = 3.0
+    yielded = asyncio.Event()
+    release = asyncio.Event()
+
+    class StreamProvider:
+        async def stream_quotes(self, _symbols):
+            yield ProviderQuote(
+                symbol="BTC:USDC",
+                price=Decimal("10"),
+                as_of=datetime.now(UTC) - timedelta(seconds=source_age),
+                provider="stream_fixture",
+                feed="fixture",
+            )
+            yield ProviderQuote(
+                symbol="ETH:USDC",
+                price=Decimal("20"),
+                as_of=datetime.now(UTC),
+                provider="stream_fixture",
+                feed="fixture",
+            )
+            yielded.set()
+            await release.wait()
+
+    metrics = Metrics()
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(metrics=metrics),
+        Settings(background_enabled=False),
+    )
+    provider = StreamProvider()
+    observed_before = asyncio.get_running_loop().time()
+    task = asyncio.create_task(
+        coordinator._provider_stream_loop(
+            "stream_fixture",
+            provider,
+            ("BTC:USDC",),
+        )
+    )
+    try:
+        await asyncio.wait_for(yielded.wait(), timeout=1)
+        observed_after = asyncio.get_running_loop().time()
+        observation = coordinator._stream_observed_at[(id(provider), "BTC:USDC")]
+
+        assert observed_before - source_age - 0.5 <= observation
+        assert observation <= observed_after - source_age + 0.5
+        assert (id(provider), "ETH:USDC") not in coordinator._stream_observed_at
+        assert all(quote.symbol != "ETH:USDC" for quote in coordinator._pending.values())
+    finally:
+        release.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

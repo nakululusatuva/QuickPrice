@@ -70,6 +70,12 @@ async def test_binance_quote_and_unadjusted_kline_contract(fixture_json):
     assert points[1].timestamp - points[0].timestamp == timedelta(minutes=1)
 
 
+def test_crypto_streams_suppress_duplicate_rest_only_while_fresh() -> None:
+    for provider in (create_builtin_binance_provider(), create_builtin_kraken_provider()):
+        assert provider.stream_poll_suppression_seconds == 120.0
+        assert provider.stream_poll_recheck_seconds == 10.0
+
+
 @pytest.mark.asyncio
 async def test_binance_internal_wbeth_leg_uses_current_book_midpoint():
     observed_at = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)

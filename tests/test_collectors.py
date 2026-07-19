@@ -1604,6 +1604,201 @@ async def test_fresh_alpaca_stream_observation_suppresses_rest_poll(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_name", "symbol", "expected_interval"),
+    [
+        ("binance", "BTC:USDC", 9.0),
+        ("kraken", "XMR:USDC", 9.0),
+    ],
+)
+async def test_fresh_crypto_stream_observation_suppresses_duplicate_rest_poll(
+    monkeypatch,
+    provider_name: str,
+    symbol: str,
+    expected_interval: float,
+) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+    )
+    try:
+        provider = coordinator.graph.providers[provider_name]
+        provider.get_quote = AsyncMock()
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(provider), symbol)] = 99.0
+
+        next_interval = await coordinator._poll_quote_once(symbol)
+
+        assert next_interval == pytest.approx(expected_interval)
+        provider.get_quote.assert_not_awaited()
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_suppression_rechecks_before_quote_becomes_stale(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+    )
+    try:
+        provider = coordinator.graph.providers["binance"]
+        provider.get_quote = AsyncMock()
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(provider), "BTC:USDC")] = 90.5
+
+        next_interval = await coordinator._poll_quote_once("BTC:USDC")
+
+        assert next_interval == pytest.approx(0.5)
+        provider.get_quote.assert_not_awaited()
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_suppression_honors_dynamic_long_poll_staleness_deadline(
+    monkeypatch,
+) -> None:
+    import quickprice.collectors as collectors
+
+    instrument = InstrumentSpec(
+        symbol="DYNAMIC:USDC",
+        base="DYNAMIC",
+        quote="USDC",
+        name="Dynamic asset",
+        description="A long-poll stream suppression fixture.",
+        asset_class=AssetClass.CRYPTO,
+        asset_type="spot_crypto",
+        price_basis="last_trade",
+        stale_after_seconds=120.0,
+        quote_poll_seconds=120.0,
+    )
+
+    class StreamProvider:
+        name = "stream_fixture"
+        stream_poll_suppression_seconds = 120.0
+        stream_poll_recheck_seconds = 10.0
+
+        async def get_quote(self, symbol):
+            return ProviderQuote(
+                symbol=symbol,
+                price=Decimal("100"),
+                as_of=datetime.now(UTC),
+                provider=self.name,
+                feed="fixture",
+            )
+
+    provider = StreamProvider()
+
+    def install(context):
+        context.add_provider(provider.name, provider)
+        context.register(instrument.symbol, Capability.QUOTE, [provider])
+
+    registry = InstrumentRegistry(
+        (
+            InstrumentPlugin(
+                plugin_id="long-poll-stream-fixture",
+                version="1",
+                provider_installer=install,
+                instruments=(instrument,),
+            ),
+        )
+    )
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+        registry,
+    )
+    try:
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(provider), instrument.symbol)] = 99.0
+
+        next_interval = await coordinator._poll_quote_once(instrument.symbol)
+
+        assert next_interval == pytest.approx(119.0)
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_name", "symbol"),
+    [
+        ("binance", "BTC:USDC"),
+        ("kraken", "XMR:USDC"),
+    ],
+)
+async def test_expired_crypto_stream_observation_restores_rest_polling(
+    monkeypatch,
+    provider_name: str,
+    symbol: str,
+) -> None:
+    import quickprice.collectors as collectors
+
+    observed_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+    )
+    try:
+        provider = coordinator.graph.providers[provider_name]
+        provider.get_quote = AsyncMock(
+            return_value=ProviderQuote(
+                symbol=symbol,
+                price=Decimal("100"),
+                as_of=observed_at,
+                provider=provider_name,
+                feed="fixture",
+            )
+        )
+        monkeypatch.setattr(collectors, "utc_now", lambda: observed_at)
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 110.0)
+        coordinator._stream_observed_at[(id(provider), symbol)] = 100.0
+
+        await coordinator._poll_quote_once(symbol)
+
+        provider.get_quote.assert_awaited_once_with(symbol)
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
+async def test_fallback_stream_observation_cannot_suppress_primary_poll(monkeypatch) -> None:
+    import quickprice.collectors as collectors
+
+    observed_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
+    coordinator = MarketDataCoordinator(
+        SimpleNamespace(),
+        Settings(background_enabled=False),
+    )
+    try:
+        primary = coordinator.graph.providers["binance"]
+        fallback = coordinator.graph.providers["kraken"]
+        primary.get_quote = AsyncMock(
+            return_value=ProviderQuote(
+                symbol="BTC:USDC",
+                price=Decimal("100"),
+                as_of=observed_at,
+                provider="binance",
+                feed="fixture",
+            )
+        )
+        monkeypatch.setattr(collectors, "utc_now", lambda: observed_at)
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: 100.0)
+        coordinator._stream_observed_at[(id(fallback), "BTC:USDC")] = 99.0
+
+        await coordinator._poll_quote_once("BTC:USDC")
+
+        primary.get_quote.assert_awaited_once_with("BTC:USDC")
+    finally:
+        await coordinator.graph.close()
+
+
+@pytest.mark.asyncio
 async def test_closed_alpaca_quote_uses_fifteen_minute_floor(monkeypatch) -> None:
     import quickprice.collectors as collectors
 
