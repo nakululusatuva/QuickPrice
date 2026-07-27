@@ -96,3 +96,18 @@ async def test_http_proxy_is_applied_only_when_configured():
 
     assert proxied_session.calls[0][1]["proxy"] == "http://10.0.1.7:7890"
     assert "proxy" not in direct_session.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_requests_never_follow_redirects():
+    session = FakeSession(FakeResponse(200, {}))
+    provider = HttpProvider(session=session)
+
+    await provider._request_json(
+        "GET",
+        "https://provider.example/private",
+        params={"apikey": "query-secret"},
+        headers={"X-Provider-Key": "header-secret"},
+    )
+
+    assert session.calls[0][1]["allow_redirects"] is False

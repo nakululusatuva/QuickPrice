@@ -231,6 +231,7 @@ class HttpProvider:
                 headers=headers,
                 json=json_body,
                 timeout=self.request_timeout,
+                allow_redirects=False,
                 **self._proxy_request_options(),
             ) as response:
                 status = response.status
