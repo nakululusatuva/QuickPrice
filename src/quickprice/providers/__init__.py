@@ -37,6 +37,8 @@ from .kraken import KrakenProvider
 from .okx import OkxBethYieldProvider, OkxMarketProvider
 from .router import ProviderRouter
 from .staking import (
+    AaveReserveYieldSpec,
+    AaveV3YieldProvider,
     BinanceWbethYieldProvider,
     EthereumExchangeRateSpec,
     EthereumExchangeRateYieldProvider,
@@ -58,6 +60,8 @@ from .twelve_data import TwelveDataProvider
 from .wiring import ProviderGraph, build_provider_graph
 
 __all__ = [
+    "AaveReserveYieldSpec",
+    "AaveV3YieldProvider",
     "AccrualIndexProvider",
     "AllProvidersFailed",
     "AlpacaProvider",

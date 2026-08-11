@@ -21,6 +21,7 @@ from quickprice.plugin_api import ProviderInstallContext, YieldStrategy
 from quickprice.provider_factory import (
     builtin_fx_max_ages,
     builtin_fx_requirements,
+    create_builtin_aave_yield_provider,
     create_builtin_alpaca_provider,
     create_builtin_alpha_vantage_provider,
     create_builtin_binance_provider,
@@ -93,6 +94,7 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     )
     providers["staking_backing_proxy"] = create_builtin_staking_backing_quote_provider(
         router.get_quote,
+        underlying_history_resolver=router.get_history,
         rpc_urls=settings.ethereum_rpc_urls,
         request_timeout=settings.provider_timeout_seconds,
         **_proxy_options(settings, "staking_backing_proxy"),
@@ -106,6 +108,11 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
             **_proxy_options(settings, "binance_wbeth_rate"),
         )
     if settings.ethereum_rpc_urls:
+        providers["aave_v3"] = create_builtin_aave_yield_provider(
+            settings.ethereum_rpc_urls,
+            request_timeout=settings.provider_timeout_seconds,
+            **_proxy_options(settings, "aave_v3"),
+        )
         providers["ethereum_exchange_rate"] = create_builtin_ethereum_yield_provider(
             settings.ethereum_rpc_urls,
             request_timeout=settings.provider_timeout_seconds,

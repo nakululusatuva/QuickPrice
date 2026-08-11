@@ -23,6 +23,7 @@ from quickprice.providers.finnhub import FinnhubProvider
 from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvider
 from quickprice.providers.okx import OkxBethYieldProvider, OkxMarketProvider
 from quickprice.providers.staking import (
+    AaveV3YieldProvider,
     BinanceWbethYieldProvider,
     EthereumExchangeRateYieldProvider,
     LidoAprProvider,
@@ -70,6 +71,28 @@ async def test_wbeth_yield_route_prefers_binance_then_onchain_then_market_ratio(
             "staking_market_ratio_proxy",
         )
         assert chain[-1].lookback_days == 30
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_aave_weth_uses_backing_price_history_and_onchain_supply_apr() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        ethereum_rpc_urls=("https://ethereum-mainnet.invalid",),
+    )
+    graph = build_provider_graph(settings)
+    try:
+        quote_chain = graph.router.providers_for("AETHWETH:USDC", Capability.QUOTE)
+        history_chain = graph.router.providers_for("AETHWETH:USDC", Capability.HISTORY)
+        yield_chain = graph.router.providers_for("AETHWETH:USDC", Capability.YIELD)
+
+        assert tuple(provider.name for provider in quote_chain) == ("staking_backing_proxy",)
+        assert history_chain == quote_chain
+        assert len(yield_chain) == 1
+        assert isinstance(yield_chain[0], AaveV3YieldProvider)
+        assert yield_chain[0].name == "aave_v3"
     finally:
         await graph.close()
 

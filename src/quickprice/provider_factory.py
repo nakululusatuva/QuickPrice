@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any
 
 from .instrument_policy import (
+    BUILTIN_AAVE_RESERVE_YIELD_POLICIES,
     BUILTIN_ALPACA_ALLOWED_DIVIDEND_SUBTYPES,
     BUILTIN_ALPACA_DIVIDEND_FREQUENCIES,
     BUILTIN_BINANCE_MIDPOINT_SYMBOLS,
@@ -226,6 +227,7 @@ def create_builtin_ethereum_yield_provider(rpc_urls: Any, **kwargs: Any) -> Any:
 def create_builtin_staking_backing_quote_provider(
     underlying_resolver: Any,
     *,
+    underlying_history_resolver: Any | None = None,
     rpc_urls: Any = (),
     **kwargs: Any,
 ) -> Any:
@@ -252,9 +254,32 @@ def create_builtin_staking_backing_quote_provider(
     )
     return StakingBackingQuoteProvider(
         underlying_resolver,
+        underlying_history_resolver=underlying_history_resolver,
         rpc_urls=rpc_urls,
         **kwargs,
     )
+
+
+def create_builtin_aave_yield_provider(rpc_urls: Any, **kwargs: Any) -> Any:
+    from .providers.staking import AaveReserveYieldSpec, AaveV3YieldProvider
+
+    _default(
+        kwargs,
+        "specs",
+        tuple(
+            AaveReserveYieldSpec(
+                symbol=policy.symbol,
+                index_symbol=policy.index_symbol,
+                underlying_asset=policy.underlying_asset,
+                underlying_contract_address=policy.underlying_contract_address,
+                data_provider_address=policy.data_provider_address,
+                chain_id=policy.chain_id,
+                call_data=policy.call_data,
+            )
+            for policy in BUILTIN_AAVE_RESERVE_YIELD_POLICIES
+        ),
+    )
+    return AaveV3YieldProvider(rpc_urls, **kwargs)
 
 
 def create_builtin_lido_provider(**kwargs: Any) -> Any:
@@ -317,6 +342,7 @@ def builtin_fx_max_ages() -> dict[str, timedelta]:
 __all__ = [
     "builtin_fx_max_ages",
     "builtin_fx_requirements",
+    "create_builtin_aave_yield_provider",
     "create_builtin_alpaca_provider",
     "create_builtin_alpha_vantage_provider",
     "create_builtin_binance_provider",

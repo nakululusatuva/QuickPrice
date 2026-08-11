@@ -34,6 +34,7 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
         "BETH:USDC": Decimal("4995"),
         "STETH:USDC": Decimal("4990"),
         "WSTETH:USDC": Decimal("6000"),
+        "AETHWETH:USDC": Decimal("5000"),
         "QQQM:USD": Decimal("250"),
         "BOXX:USD": Decimal("110"),
         "SGOV:USD": Decimal("100.50"),
@@ -131,6 +132,11 @@ def seed_complete(service: QuickPriceService, *, missing: set[str] | None = None
             RewardAccrualMode.VALUE_ACCRUING,
             YieldRateType.APY,
             Decimal("1.20"),
+        ),
+        "AETHWETH:USDC": (
+            RewardAccrualMode.REBASING_BALANCE,
+            YieldRateType.APR,
+            Decimal("1.08"),
         ),
     }
     for symbol, (accrual_mode, rate_type, index_value) in staking_metrics.items():

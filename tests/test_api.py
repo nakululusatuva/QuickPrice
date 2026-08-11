@@ -193,6 +193,11 @@ def test_all_quotes_have_stable_schema_and_numeric_values(client, auth_headers):
     assert by_symbol["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
     assert by_symbol["STETH:USDC"]["estimated_annual_yield"] is not None
     assert by_symbol["WSTETH:USDC"]["estimated_annual_yield"] is not None
+    aethweth = by_symbol["AETHWETH:USDC"]
+    assert aethweth["name"] == "Aave Ethereum WETH"
+    assert aethweth["reward_accrual_mode"] == "rebasing_balance"
+    assert aethweth["underlying_asset"] == "ETH"
+    assert aethweth["estimated_annual_yield"]["rate_type"] == "apr"
     assert by_symbol["QQQM:USD"]["asset_class"] == "equity"
     assert by_symbol["BOXX:USD"]["asset_type"] == "growth_bond_etf"
     assert by_symbol["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"
@@ -350,6 +355,8 @@ def test_instruments_documents_classification_and_methods(client, auth_headers):
     assert items["BETH:USDC"]["reward_accrual_mode"] == "distributed_units"
     assert items["STETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
     assert items["WSTETH:USDC"]["reward_accrual_mode"] == "value_accruing"
+    assert items["AETHWETH:USDC"]["yield_method"] == "staking_provider_metric"
+    assert items["AETHWETH:USDC"]["reward_accrual_mode"] == "rebasing_balance"
     assert items["EUR:GBP"]["asset_class"] == "fx"
     assert items["QQQM:USD"]["dividend_method"] == "latest_regular_cash_annualized_x4"
     assert items["QQQM:USD"]["name"] == "Invesco NASDAQ 100 ETF"

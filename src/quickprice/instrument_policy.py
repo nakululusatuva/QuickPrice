@@ -81,6 +81,17 @@ class BuiltinStakingBackingQuotePolicy:
     scale: str = str(10**18)
 
 
+@dataclass(frozen=True, slots=True)
+class BuiltinAaveReserveYieldPolicy:
+    symbol: str
+    index_symbol: str
+    underlying_asset: str
+    underlying_contract_address: str
+    data_provider_address: str
+    chain_id: int
+    call_data: str
+
+
 BUILTIN_BINANCE_SYMBOLS = _deep_freeze(
     {
         "BTC:USDC": "BTCUSDC",
@@ -283,6 +294,27 @@ BUILTIN_STAKING_BACKING_QUOTE_POLICIES = (
         chain_id=1,
         call_data="0x035faf82",
     ),
+    BuiltinStakingBackingQuotePolicy(
+        symbol="AETHWETH:USDC",
+        ratio_symbol="AETHWETH:WETH",
+        underlying_pair="ETH:USDC",
+        underlying_asset="ETH",
+        ratio_kind="constant",
+    ),
+)
+BUILTIN_AAVE_RESERVE_YIELD_POLICIES = (
+    BuiltinAaveReserveYieldPolicy(
+        symbol="AETHWETH:USDC",
+        index_symbol="AETHWETH:WETH",
+        underlying_asset="ETH",
+        underlying_contract_address="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        data_provider_address="0x0a16f2fcc0d44fae41cc54e079281d84a363becd",
+        chain_id=1,
+        call_data=(
+            "0x35ea6a75"
+            "000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        ),
+    ),
 )
 BUILTIN_BINANCE_STAKING_RATE_POLICIES = _deep_freeze(
     {
@@ -407,6 +439,11 @@ BUILTIN_PROVIDER_ROUTES = _deep_freeze(
             "history": ("coingecko",),
             "yield": ("lido", "staking_market_ratio_proxy"),
         },
+        "AETHWETH:USDC": {
+            "quote": ("staking_backing_proxy",),
+            "history": ("staking_backing_proxy",),
+            "yield": ("aave_v3",),
+        },
         **{
             symbol: {
                 "quote": ("alpaca", "finnhub", "twelve_data", "alpha_vantage"),
@@ -455,6 +492,7 @@ def builtin_provider_symbols(symbol: str) -> Mapping[str, str]:
 
 
 __all__ = [
+    "BUILTIN_AAVE_RESERVE_YIELD_POLICIES",
     "BUILTIN_ALPACA_ALLOWED_DIVIDEND_SUBTYPES",
     "BUILTIN_ALPACA_DIVIDEND_FREQUENCIES",
     "BUILTIN_BINANCE_MIDPOINT_SYMBOLS",

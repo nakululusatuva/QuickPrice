@@ -1592,7 +1592,7 @@ async def test_seeded_builtin_catalog_compiles_strictly_without_optional_keys(tm
         strict=True,
     )
     try:
-        assert len(generation.definitions) == len(plan.instruments) == 54
+        assert len(generation.definitions) == len(plan.instruments) == 55
         assert plan.providers_for("BTC:USDC", Capability.QUOTE) == (
             "binance",
             "kraken",
@@ -1624,7 +1624,7 @@ async def test_seeded_builtin_catalog_compiles_strictly_without_optional_keys(tm
     ],
     ids=("public-only", "coingecko", "all-providers"),
 )
-async def test_all_54_builtin_routes_match_the_legacy_graph(
+async def test_all_55_builtin_routes_match_the_legacy_graph(
     tmp_path,
     provider_settings: dict[str, object],
 ) -> None:
@@ -1645,7 +1645,7 @@ async def test_all_54_builtin_routes_match_the_legacy_graph(
         strict=False,
     )
     try:
-        assert len(generation.definitions) == 54
+        assert len(generation.definitions) == 55
         for definition in generation.definitions:
             for capability in Capability:
                 legacy_names = tuple(

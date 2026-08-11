@@ -24,7 +24,7 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS[:11] == (
+    assert SYMBOLS[:12] == (
         "BTC:USDC",
         "ETH:USDC",
         "SOL:USDC",
@@ -36,16 +36,17 @@ def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> Non
         "BETH:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
+        "AETHWETH:USDC",
     )
-    assert SYMBOLS[11:21] == COMMON_STOCK_SYMBOLS
-    assert SYMBOLS[21:24] == (
+    assert SYMBOLS[12:22] == COMMON_STOCK_SYMBOLS
+    assert SYMBOLS[22:25] == (
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
     )
-    assert SYMBOLS[24:] == FX_SYMBOLS
-    assert len(SYMBOLS) == 54
-    assert BUILTIN_PLUGIN.version == "1.6.0"
+    assert SYMBOLS[25:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 55
+    assert BUILTIN_PLUGIN.version == "1.7.0"
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND
@@ -101,6 +102,16 @@ def test_lido_tokens_distinguish_rebasing_and_value_accrual() -> None:
     assert steth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert wsteth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert steth.underlying_asset == wsteth.underlying_asset == "ETH"
+
+
+def test_aave_weth_declares_rebasing_supply_income() -> None:
+    aethweth = INSTRUMENTS["AETHWETH:USDC"]
+
+    assert aethweth.name == "Aave Ethereum WETH"
+    assert aethweth.price_basis == "protocol_backing_proxy"
+    assert aethweth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
+    assert aethweth.reward_accrual_mode is RewardAccrualMode.REBASING_BALANCE
+    assert aethweth.underlying_asset == "ETH"
 
 
 def test_okx_beth_declares_distributed_unit_rewards() -> None:

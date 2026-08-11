@@ -19,6 +19,7 @@ from quickprice.domain import (
     YieldRateType,
 )
 from quickprice.provider_factory import (
+    create_builtin_aave_yield_provider,
     create_builtin_binance_yield_provider,
     create_builtin_ethereum_yield_provider,
     create_builtin_lido_provider,
@@ -75,6 +76,87 @@ async def test_constant_staking_backing_quote_is_explicitly_derived() -> None:
     ]
     assert result.components[-1].price == 1
     resolver.assert_awaited_once_with("ETH:USDC")
+
+
+@pytest.mark.asyncio
+async def test_constant_staking_backing_history_tracks_underlying_market() -> None:
+    start = datetime(2026, 7, 20, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    quote_resolver = AsyncMock()
+    history_resolver = AsyncMock(
+        return_value=(
+            PricePoint("ETH:USDC", start, Decimal("2000"), "binance"),
+            PricePoint("ETH:USDC", end, Decimal("2020"), "binance"),
+        )
+    )
+    provider = create_builtin_staking_backing_quote_provider(
+        quote_resolver,
+        underlying_history_resolver=history_resolver,
+    )
+
+    result = await provider.get_history(
+        "AETHWETH:USDC",
+        interval="1m",
+        start=start,
+        end=end,
+        limit=100,
+    )
+
+    assert [point.price for point in result] == [Decimal("2000"), Decimal("2020")]
+    assert all(point.symbol == "AETHWETH:USDC" for point in result)
+    assert all(point.provider == "staking_backing_proxy" for point in result)
+    assert all(point.is_derived for point in result)
+    history_resolver.assert_awaited_once_with(
+        "ETH:USDC",
+        interval="1m",
+        start=start,
+        end=end,
+        limit=100,
+    )
+
+
+@pytest.mark.asyncio
+async def test_aave_v3_yield_reads_current_liquidity_rate_from_reserve() -> None:
+    now = datetime(2026, 8, 11, 8, 30, tzinfo=UTC)
+    provider = create_builtin_aave_yield_provider(
+        "https://ethereum.invalid",
+        clock=lambda: now,
+    )
+    ray = 10**27
+    words = [0] * 12
+    words[5] = int(Decimal("0.0236") * ray)
+    words[9] = int(Decimal("1.087654321") * ray)
+    words[11] = int(now.timestamp()) - 60
+    encoded = "0x" + "".join(f"{word:064x}" for word in words)
+
+    async def rpc(_endpoint, method, params):
+        if method == "eth_chainId":
+            return "0x1"
+        if method == "eth_blockNumber":
+            return "0x1234"
+        if method == "eth_call":
+            assert params[0]["to"] == "0x0a16f2fcc0d44fae41cc54e079281d84a363becd"
+            assert params[0]["data"].startswith("0x35ea6a75")
+            assert params[0]["data"].endswith("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
+            assert params[1] == "0x1234"
+            return encoded
+        if method == "eth_getBlockByNumber":
+            return {"number": params[0], "timestamp": hex(int(now.timestamp()))}
+        raise AssertionError(method)
+
+    provider._rpc = AsyncMock(side_effect=rpc)
+
+    metric = await provider.get_yield("AETHWETH:USDC")
+
+    assert metric.value == Decimal("2.3600")
+    assert metric.method == "aave_v3_current_liquidity_rate_apr"
+    assert metric.rate_type is YieldRateType.APR
+    assert metric.accrual_mode is RewardAccrualMode.REBASING_BALANCE
+    assert metric.underlying_asset == "ETH"
+    assert metric.is_estimate is False
+    assert metric.accrual_index is not None
+    assert metric.accrual_index.symbol == "AETHWETH:WETH"
+    assert metric.accrual_index.value == Decimal("1.087654321")
 
 
 @pytest.mark.asyncio

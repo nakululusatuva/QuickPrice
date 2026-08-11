@@ -143,6 +143,7 @@ class StakingBackingQuoteProvider(HttpProvider):
         self,
         underlying_resolver: Callable[[str], Awaitable[ProviderQuote]],
         *,
+        underlying_history_resolver: Callable[..., Awaitable[Sequence[PricePoint]]] | None = None,
         specs: Sequence[StakingBackingQuoteSpec] = (),
         rpc_urls: str | Sequence[str] = (),
         maximum_underlying_age: timedelta = timedelta(seconds=30),
@@ -155,6 +156,7 @@ class StakingBackingQuoteProvider(HttpProvider):
     ) -> None:
         super().__init__(**kwargs)
         self.underlying_resolver = underlying_resolver
+        self.underlying_history_resolver = underlying_history_resolver
         self.specs = {spec.symbol.strip().upper(): spec for spec in specs}
         if len(self.specs) != len(specs):
             raise ValueError("duplicate staking backing quote symbol")
@@ -268,6 +270,48 @@ class StakingBackingQuoteProvider(HttpProvider):
             coverage="protocol_backing_proxy",
         )
 
+    async def get_history(
+        self,
+        symbol: str,
+        *,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        limit: int | None = None,
+    ) -> Sequence[PricePoint]:
+        normalized = symbol.strip().upper()
+        try:
+            spec = self.specs[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(
+                self.name, f"unsupported history symbol {normalized}"
+            ) from exc
+        if self.underlying_history_resolver is None:
+            raise ProviderUnavailable(self.name, "underlying history resolver is unavailable")
+        if spec.ratio_kind != "constant":
+            raise UnsupportedInstrument(
+                self.name,
+                f"historical on-chain backing ratios are unavailable for {normalized}",
+            )
+        points = await self.underlying_history_resolver(
+            spec.underlying_pair,
+            interval=interval,
+            start=ensure_utc(start),
+            end=ensure_utc(end),
+            limit=limit,
+        )
+        return tuple(
+            PricePoint(
+                symbol=normalized,
+                timestamp=point.timestamp,
+                price=point.price * spec.constant_ratio,
+                provider=self.name,
+                is_derived=True,
+                interval=point.interval,
+            )
+            for point in points
+        )
+
     async def _ethereum_ratio(self, spec: StakingBackingQuoteSpec) -> tuple[Decimal, datetime]:
         if not self.rpc_urls or spec.chain_id is None:
             raise ProviderUnavailable(self.name, "Ethereum JSON-RPC is not configured")
@@ -343,6 +387,193 @@ class StakingBackingQuoteProvider(HttpProvider):
         if "result" not in document or document["result"] is None:
             raise MalformedResponse(self.name, "JSON-RPC response has no result")
         return document["result"]
+
+
+@dataclass(frozen=True, slots=True)
+class AaveReserveYieldSpec:
+    """Controlled Aave V3 reserve used to read aToken supply APR."""
+
+    symbol: str
+    index_symbol: str
+    underlying_asset: str
+    underlying_contract_address: str
+    data_provider_address: str
+    chain_id: int
+    call_data: str
+    ray_scale: Decimal = Decimal(10**27)
+    accrual_mode: RewardAccrualMode = RewardAccrualMode.REBASING_BALANCE
+
+    def __post_init__(self) -> None:
+        if self.chain_id <= 0:
+            raise ValueError("Aave chain id must be positive")
+        if not _is_hex(self.underlying_contract_address, bytes_length=20):
+            raise ValueError("Aave underlying address must be a 20-byte hex value")
+        if not _is_hex(self.data_provider_address, bytes_length=20):
+            raise ValueError("Aave data provider address must be a 20-byte hex value")
+        if not _is_hex(self.call_data, bytes_length=36):
+            raise ValueError("Aave reserve call data must contain a selector and address")
+        if not self.call_data.lower().endswith(self.underlying_contract_address[2:].lower()):
+            raise ValueError("Aave reserve call data must target the configured underlying")
+        object.__setattr__(self, "ray_scale", decimal_value(self.ray_scale))
+        if self.ray_scale <= 0:
+            raise ValueError("Aave ray scale must be positive")
+
+
+class AaveV3YieldProvider(HttpProvider):
+    """Read a rebasing aToken's current supply APR from Aave V3 on-chain data."""
+
+    name = "aave_v3"
+
+    def __init__(
+        self,
+        rpc_urls: str | Sequence[str],
+        *,
+        specs: Sequence[AaveReserveYieldSpec] = (),
+        endpoint_race_width: int = 2,
+        clock: Callable[[], datetime] = utc_now,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        urls = (rpc_urls,) if isinstance(rpc_urls, str) else tuple(rpc_urls)
+        self.rpc_urls = tuple(url.strip() for url in urls if url.strip())
+        self.specs = {spec.symbol.strip().upper(): spec for spec in specs}
+        if len(self.specs) != len(specs):
+            raise ValueError("duplicate Aave reserve yield symbol")
+        if endpoint_race_width <= 0:
+            raise ValueError("Aave endpoint race width must be positive")
+        self.endpoint_race_width = min(endpoint_race_width, len(self.rpc_urls))
+        self._clock = clock
+        self._verified_endpoints: set[tuple[str, int]] = set()
+        self._endpoint_offset = 0
+
+    async def get_yield(self, symbol: str) -> YieldMetric:
+        normalized = symbol.strip().upper()
+        try:
+            spec = self.specs[normalized]
+        except KeyError as exc:
+            raise UnsupportedInstrument(
+                self.name, f"unsupported yield symbol {normalized}"
+            ) from exc
+        if not self.rpc_urls:
+            raise ProviderUnavailable(self.name, "Ethereum JSON-RPC is not configured")
+
+        start = self._endpoint_offset
+        width = min(self.endpoint_race_width, len(self.rpc_urls))
+        endpoints = tuple(
+            self.rpc_urls[(start + offset) % len(self.rpc_urls)] for offset in range(width)
+        )
+        self._endpoint_offset = (start + width) % len(self.rpc_urls)
+        tasks = tuple(
+            asyncio.create_task(self._yield_on_endpoint(endpoint, spec))
+            for endpoint in endpoints
+        )
+        try:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    return await task
+                except ProviderError:
+                    continue
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise ProviderUnavailable(self.name, "all configured Ethereum JSON-RPC endpoints failed")
+
+    async def _yield_on_endpoint(
+        self,
+        endpoint: str,
+        spec: AaveReserveYieldSpec,
+    ) -> YieldMetric:
+        key = (endpoint, spec.chain_id)
+        if key not in self._verified_endpoints:
+            actual_chain = _hex_integer(
+                await self._rpc(endpoint, "eth_chainId", ()),
+                self.name,
+                "chain id",
+            )
+            if actual_chain != spec.chain_id:
+                raise ProviderUnavailable(self.name, "JSON-RPC endpoint returned the wrong chain")
+            self._verified_endpoints.add(key)
+        block_number = _hex_integer(
+            await self._rpc(endpoint, "eth_blockNumber", ()),
+            self.name,
+            "latest block number",
+        )
+        block_tag = hex(block_number)
+        raw_reserve, raw_block = await asyncio.gather(
+            self._rpc(
+                endpoint,
+                "eth_call",
+                (
+                    {"to": spec.data_provider_address, "data": spec.call_data},
+                    block_tag,
+                ),
+            ),
+            self._rpc(endpoint, "eth_getBlockByNumber", (block_tag, False)),
+        )
+        words = _abi_uint256_words(raw_reserve, self.name, "Aave reserve data")
+        if len(words) < 12:
+            raise MalformedResponse(self.name, "Aave reserve data is incomplete")
+        liquidity_rate = Decimal(words[5]) / spec.ray_scale
+        liquidity_index = Decimal(words[9]) / spec.ray_scale
+        if liquidity_rate < 0 or liquidity_index <= 0:
+            raise MalformedResponse(self.name, "Aave reserve values are invalid")
+        block = require_mapping(raw_block, self.name, "latest block")
+        as_of = _block_timestamp(block, self.name)
+        if as_of > ensure_utc(self._clock()) + timedelta(seconds=30):
+            raise ProviderUnavailable(self.name, "Aave observation is in the future")
+        staleness_ms = _staleness_ms(self._clock(), as_of)
+        return YieldMetric(
+            symbol=spec.symbol.strip().upper(),
+            value=liquidity_rate * Decimal(100),
+            as_of=as_of,
+            method="aave_v3_current_liquidity_rate_apr",
+            provider=self.name,
+            is_proxy=False,
+            rate_type=YieldRateType.APR,
+            accrual_mode=spec.accrual_mode,
+            underlying_asset=spec.underlying_asset,
+            is_estimate=False,
+            accrual_index=AccrualIndexPoint(
+                symbol=spec.index_symbol,
+                underlying_asset=spec.underlying_asset,
+                value=liquidity_index,
+                as_of=as_of,
+                provider=self.name,
+                kind="aave_v3_liquidity_index",
+            ),
+            quality=YieldQuality(
+                stale=staleness_ms > 10 * 60 * 1000,
+                staleness_ms=staleness_ms,
+                confidence="high",
+            ),
+        )
+
+    async def _rpc(self, endpoint: str, method: str, params: Sequence[Any]) -> Any:
+        payload = await self._request_json(
+            "POST",
+            endpoint,
+            json_body={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
+        )
+        document = require_mapping(payload, self.name, "JSON-RPC response")
+        if document.get("error") is not None:
+            raise ProviderUnavailable(self.name, "JSON-RPC returned an error")
+        if "result" not in document or document["result"] is None:
+            raise MalformedResponse(self.name, "JSON-RPC response has no result")
+        return document["result"]
+
+
+def _abi_uint256_words(value: Any, provider: str, context: str) -> tuple[int, ...]:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        raise MalformedResponse(provider, f"{context} must be hex-encoded")
+    payload = value[2:]
+    if not payload or len(payload) % 64 != 0:
+        raise MalformedResponse(provider, f"{context} has invalid ABI length")
+    try:
+        return tuple(int(payload[offset : offset + 64], 16) for offset in range(0, len(payload), 64))
+    except ValueError as exc:
+        raise MalformedResponse(provider, f"{context} contains invalid hex") from exc
 
 
 class EthereumExchangeRateYieldProvider(HttpProvider):

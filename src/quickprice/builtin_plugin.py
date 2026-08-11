@@ -60,7 +60,7 @@ COMMON_STOCK_INSTRUMENTS = tuple(_common_stock_instrument(item) for item in COMM
 
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.6.0",
+    version="1.7.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -211,6 +211,24 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             underlying_asset="ETH",
             stale_after_seconds=1800.0,
             quote_poll_seconds=660.0,
+            history_poll_seconds=21_600.0,
+        ),
+        InstrumentSpec(
+            symbol="AETHWETH:USDC",
+            base="AETHWETH",
+            quote="USDC",
+            name="Aave Ethereum WETH",
+            description=(
+                "A rebasing Aave V3 aToken representing supplied WETH on Ethereum; "
+                "interest accrues through increases in the holder's token balance."
+            ),
+            asset_class=AssetClass.CRYPTO,
+            asset_type="liquid_staking_token",
+            price_basis="protocol_backing_proxy",
+            yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+            reward_accrual_mode=RewardAccrualMode.REBASING_BALANCE,
+            underlying_asset="ETH",
+            quote_poll_seconds=1.0,
             history_poll_seconds=21_600.0,
         ),
         *COMMON_STOCK_INSTRUMENTS,

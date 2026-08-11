@@ -65,7 +65,7 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in seed contains 54 canonical instruments. The administrator console
+The built-in seed contains 55 canonical instruments. The administrator console
 can add further instruments supported by installed providers without a code
 change or process restart. Built-in identity, classification, and income
 semantics remain immutable; their enabled state, bounded collection cadence,
@@ -74,7 +74,7 @@ and compatible provider order are operator-managed.
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
 | Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC`, `POL:USDC`, `BNB:USDC`, `TRX:USDC` | `crypto / spot_crypto` | None |
-| Liquid staking | `WBETH:USDC`, `BETH:USDC`, `STETH:USDC`, `WSTETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
+| Yield-bearing crypto | `WBETH:USDC`, `BETH:USDC`, `STETH:USDC`, `WSTETH:USDC`, `AETHWETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
 | Common stock | `AAPL:USD`, `MSFT:USD`, `GOOGL:USD`, `META:USD`, `NVDA:USD` | `equity / common_stock` | Latest regular quarterly cash dividend |
 | Common stock | `AMZN:USD`, `TSLA:USD`, `SPCX:USD`, `MSTR:USD`, `CRCL:USD` | `equity / common_stock` | No current regular dividend; returns `null` |
 | Equity ETF | `QQQM:USD` | `equity / equity_etf` | Latest regular cash dividend |
@@ -152,6 +152,11 @@ Income calculations are explicit:
   units.
 - stETH and wstETH use Lido's protocol APR as the primary yield source, with a
   trailing token-to-ETH market-ratio estimate as the final fallback.
+- aEthWETH is priced at its one-to-one WETH protocol backing while its rolling
+  price changes follow the underlying ETH market series. Its income is the
+  Aave V3 Ethereum reserve `currentLiquidityRate`, returned as APR with
+  `reward_accrual_mode=rebasing_balance`; interest is not counted again as a
+  per-unit price return.
 
 The market-ratio fallback uses the configured window, 30 days by default, and
 is marked `is_proxy=true`, `is_estimate=true`, and low confidence. For rebasing
