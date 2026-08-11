@@ -423,6 +423,9 @@ class AaveV3YieldProvider(HttpProvider):
     """Read a rebasing aToken's current supply APR from Aave V3 on-chain data."""
 
     name = "aave_v3"
+    _minimum_routing_timeout_seconds = 30.0
+    _maximum_routing_timeout_seconds = 120.0
+    _routing_request_budget = 3.0
 
     def __init__(
         self,
@@ -430,6 +433,7 @@ class AaveV3YieldProvider(HttpProvider):
         *,
         specs: Sequence[AaveReserveYieldSpec] = (),
         endpoint_race_width: int = 2,
+        routing_timeout_seconds: float | None = None,
         clock: Callable[[], datetime] = utc_now,
         **kwargs: Any,
     ) -> None:
@@ -442,6 +446,21 @@ class AaveV3YieldProvider(HttpProvider):
         if endpoint_race_width <= 0:
             raise ValueError("Aave endpoint race width must be positive")
         self.endpoint_race_width = min(endpoint_race_width, len(self.rpc_urls))
+        if routing_timeout_seconds is None:
+            # A reserve observation performs chain-id and block-height lookups
+            # before two concurrent calls at a consistent block. Keep each RPC
+            # request bounded by request_timeout while allowing the complete
+            # workflow to span three request windows on a high-latency proxy.
+            routing_timeout_seconds = min(
+                self._maximum_routing_timeout_seconds,
+                max(
+                    self._minimum_routing_timeout_seconds,
+                    self.request_timeout * self._routing_request_budget,
+                ),
+            )
+        if not math.isfinite(routing_timeout_seconds) or routing_timeout_seconds <= 0:
+            raise ValueError("Aave routing timeout must be finite and positive")
+        self.routing_timeout_seconds = float(routing_timeout_seconds)
         self._clock = clock
         self._verified_endpoints: set[tuple[str, int]] = set()
         self._endpoint_offset = 0

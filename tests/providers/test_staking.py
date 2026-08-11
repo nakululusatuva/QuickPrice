@@ -160,6 +160,92 @@ async def test_aave_v3_yield_reads_current_liquidity_rate_from_reserve() -> None
 
 
 @pytest.mark.asyncio
+async def test_aave_yield_uses_multi_rpc_route_budget_not_global_timeout() -> None:
+    now = datetime(2026, 8, 11, 8, 30, tzinfo=UTC)
+    provider = create_builtin_aave_yield_provider(
+        "https://ethereum.invalid",
+        request_timeout=8,
+        clock=lambda: now,
+    )
+    words = [0] * 12
+    words[5] = int(Decimal("0.02") * 10**27)
+    words[9] = 10**27
+    words[11] = int(now.timestamp())
+    encoded = "0x" + "".join(f"{word:064x}" for word in words)
+
+    async def slower_multi_rpc(_endpoint, method, _params):
+        await asyncio.sleep(0.006)
+        if method == "eth_chainId":
+            return "0x1"
+        if method == "eth_blockNumber":
+            return "0x1234"
+        if method == "eth_call":
+            return encoded
+        if method == "eth_getBlockByNumber":
+            return {"timestamp": hex(int(now.timestamp()))}
+        raise AssertionError(method)
+
+    provider._rpc = AsyncMock(side_effect=slower_multi_rpc)
+    router = ProviderRouter(
+        {("AETHWETH:USDC", Capability.YIELD): [provider]},
+        timeout_seconds=0.005,
+    )
+    try:
+        metric = await router.get_yield("AETHWETH:USDC")
+    finally:
+        await router.close()
+
+    assert provider.request_timeout == 8
+    assert provider.routing_timeout_seconds == 30
+    assert metric.value == Decimal("2.00")
+
+
+@pytest.mark.asyncio
+async def test_aave_rpc_keeps_individual_http_request_timeout() -> None:
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self, **_kwargs):
+            return {"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+
+    class Session:
+        def __init__(self):
+            self.timeout = None
+
+        def request(self, *_args, **kwargs):
+            self.timeout = kwargs["timeout"]
+            return Response()
+
+    session = Session()
+    provider = create_builtin_aave_yield_provider(
+        "https://ethereum.invalid",
+        session=session,
+        request_timeout=0.125,
+    )
+
+    result = await provider._rpc("https://ethereum.invalid", "eth_chainId", ())
+
+    assert result == "0x1"
+    assert session.timeout == 0.125
+    assert provider.routing_timeout_seconds == 30
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_aave_rejects_invalid_routing_timeout(value: float) -> None:
+    with pytest.raises(ValueError, match="routing timeout"):
+        create_builtin_aave_yield_provider(
+            "https://ethereum.invalid",
+            routing_timeout_seconds=value,
+        )
+
+
+@pytest.mark.asyncio
 async def test_wrapped_steth_backing_quote_uses_current_onchain_ratio() -> None:
     now = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
     resolver = AsyncMock(return_value=_underlying_quote(now, "1900"))
