@@ -310,10 +310,7 @@ BUILTIN_AAVE_RESERVE_YIELD_POLICIES = (
         underlying_contract_address="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
         data_provider_address="0x0a16f2fcc0d44fae41cc54e079281d84a363becd",
         chain_id=1,
-        call_data=(
-            "0x35ea6a75"
-            "000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
-        ),
+        call_data=("0x35ea6a75000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
     ),
 )
 BUILTIN_BINANCE_STAKING_RATE_POLICIES = _deep_freeze(

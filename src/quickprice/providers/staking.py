@@ -464,8 +464,7 @@ class AaveV3YieldProvider(HttpProvider):
         )
         self._endpoint_offset = (start + width) % len(self.rpc_urls)
         tasks = tuple(
-            asyncio.create_task(self._yield_on_endpoint(endpoint, spec))
-            for endpoint in endpoints
+            asyncio.create_task(self._yield_on_endpoint(endpoint, spec)) for endpoint in endpoints
         )
         try:
             for task in asyncio.as_completed(tasks):
@@ -571,7 +570,9 @@ def _abi_uint256_words(value: Any, provider: str, context: str) -> tuple[int, ..
     if not payload or len(payload) % 64 != 0:
         raise MalformedResponse(provider, f"{context} has invalid ABI length")
     try:
-        return tuple(int(payload[offset : offset + 64], 16) for offset in range(0, len(payload), 64))
+        return tuple(
+            int(payload[offset : offset + 64], 16) for offset in range(0, len(payload), 64)
+        )
     except ValueError as exc:
         raise MalformedResponse(provider, f"{context} contains invalid hex") from exc
 
