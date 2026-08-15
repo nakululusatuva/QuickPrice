@@ -65,7 +65,7 @@ the reverse-proxy contract described below.
 
 ## Built-in catalog
 
-The built-in seed contains 55 canonical instruments. The administrator console
+The built-in seed contains 56 canonical instruments. The administrator console
 can add further instruments supported by installed providers without a code
 change or process restart. Built-in identity, classification, and income
 semantics remain immutable; their enabled state, bounded collection cadence,
@@ -74,7 +74,7 @@ and compatible provider order are operator-managed.
 | Family | Canonical symbols | Classification | Income policy |
 |---|---|---|---|
 | Spot crypto | `BTC:USDC`, `ETH:USDC`, `SOL:USDC`, `XMR:USDC`, `POL:USDC`, `BNB:USDC`, `TRX:USDC` | `crypto / spot_crypto` | None |
-| Yield-bearing crypto | `WBETH:USDC`, `BETH:USDC`, `STETH:USDC`, `WSTETH:USDC`, `AETHWETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
+| Yield-bearing crypto | `WBETH:USDC`, `BNSOL:USDC`, `BETH:USDC`, `STETH:USDC`, `WSTETH:USDC`, `AETHWETH:USDC` | `crypto / liquid_staking_token` | Required annualized yield |
 | Common stock | `AAPL:USD`, `MSFT:USD`, `GOOGL:USD`, `META:USD`, `NVDA:USD` | `equity / common_stock` | Latest regular quarterly cash dividend |
 | Common stock | `AMZN:USD`, `TSLA:USD`, `SPCX:USD`, `MSTR:USD`, `CRCL:USD` | `equity / common_stock` | No current regular dividend; returns `null` |
 | Equity ETF | `QQQM:USD` | `equity / equity_etf` | Latest regular cash dividend |
@@ -144,6 +144,11 @@ Income calculations are explicit:
   fallback's daily exchange-rate event remains current for 36 hours: one normal
   24-hour publication interval plus 12 hours of scheduling and RPC/indexing
   grace.
+- BNSOL uses [signed Binance SOL staking rate history](https://developers.binance.com/en/docs/catalog/investment-and-services-staking/api/rest-api/sol-staking#get-bnsol-rate-history).
+  It reports Binance's provider-reported APR and SOL-per-BNSOL conversion rate.
+  Rewards increase that conversion rate rather than the token balance, so the
+  asset is `value_accruing`; a trailing BNSOL-to-SOL market-ratio estimate is
+  the final yield fallback.
 - BETH uses OKX's public 30-day ETH staking rate history and selects the latest
   provider-reported annualized rate. OKX distributes rewards as additional
   BETH units, so QuickPrice reports `rate_type=apr` and
@@ -324,6 +329,10 @@ The default route families are:
 - WBETH: Binance synthetic routes, then CoinGecko normalization for quotes;
   Binance synthetic routes for history; signed Binance APR, on-chain exchange-
   rate APY, then the declared 30-day market-ratio proxy for yield.
+- BNSOL: same-venue Binance `BNSOL/SOL * SOL/USDC`, then
+  `BNSOL/USDT / USDC/USDT`; CoinGecko is the final quote and history fallback.
+  Yield uses Binance's signed BNSOL rate history before the declared 30-day
+  BNSOL-to-SOL market-ratio proxy.
 - BETH: same-venue OKX `BETH/ETH * ETH/USDC`, then
   `BETH/USDT / USDC/USDT`; CoinGecko market price, then an explicitly derived
   1:1 ETH protocol-backing proxy are quote fallbacks. CoinGecko remains the
@@ -431,7 +440,7 @@ Provider egress can use an explicit HTTP CONNECT proxy without changing the
 inbound reverse proxy. Set `QUICKPRICE_PROVIDER_PROXY_URL` to proxy every REST
 and WebSocket provider by default. Set `QUICKPRICE_PROVIDER_PROXY_NAMES` to a
 comma-separated allowlist when only selected providers should use it. Built-in
-names include `binance`, `kraken`, `coingecko`, `binance_wbeth_rate`,
+names include `binance`, `kraken`, `coingecko`, `binance_staking_rate`,
 `ethereum_exchange_rate`, `staking_backing_proxy`, `lido`, `alpaca`, `finnhub`,
 `twelve_data`, `alpha_vantage`, and `fred`. A plugin installer can apply the same
 policy with `settings.proxy_url_for_provider(name)`. Treat an authenticated
@@ -725,6 +734,6 @@ connections, task counts, SQLite queues, database size, and WAL size.
   remains explicitly unspecified and its data is not redistributed.
 - Provider data must not be redistributed without the required license.
 - Fund issuer pages are not scraped; BOXX uses the documented FRED proxy.
-- Binance WBETH rate-history credentials must have no trading or withdrawal
+- Binance staking rate-history credentials must have no trading or withdrawal
   permission.
 - Production disables CORS and API documentation and serves no trading routes.
