@@ -703,7 +703,9 @@ def test_required_bond_yield_missing_is_unavailable(settings):
 
 
 def test_hkd_synthetic_freshness_matches_twenty_minute_component_policy(settings):
-    now = utc_now()
+    # Keep this freshness assertion independent of the wall-clock weekend,
+    # when FX snapshots intentionally remain usable while the market is closed.
+    now = datetime(2026, 7, 22, 12, tzinfo=UTC)
     service = QuickPriceService(settings)
     service.publish_quote(
         ProviderQuote("HKD:CNH", Decimal("0.92"), now, "synthetic_fx", "components"),
