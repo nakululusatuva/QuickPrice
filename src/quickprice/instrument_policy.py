@@ -102,10 +102,14 @@ BUILTIN_BINANCE_SYMBOLS = _deep_freeze(
         "TRX:USDC": "TRXUSDC",
         "WBETH:ETH": "WBETHETH",
         "WBETH:USDT": "WBETHUSDT",
+        "BNSOL:SOL": "BNSOLSOL",
+        "BNSOL:USDT": "BNSOLUSDT",
         "USDC:USDT": "USDCUSDT",
     }
 )
-BUILTIN_BINANCE_MIDPOINT_SYMBOLS = frozenset({"WBETH:ETH", "WBETH:USDT", "USDC:USDT"})
+BUILTIN_BINANCE_MIDPOINT_SYMBOLS = frozenset(
+    {"WBETH:ETH", "WBETH:USDT", "BNSOL:SOL", "BNSOL:USDT", "USDC:USDT"}
+)
 BUILTIN_KRAKEN_SYMBOLS = _deep_freeze(
     {
         "BTC:USDC": "XBTUSDC",
@@ -126,6 +130,7 @@ BUILTIN_COINGECKO_COIN_IDS = _deep_freeze(
         "BNB:USDC": "binancecoin",
         "TRX:USDC": "tron",
         "WBETH:USDC": "wrapped-beacon-eth",
+        "BNSOL:USDC": "binance-staked-sol",
         "BETH:USDC": "okx-beth",
         "STETH:USDC": "staked-ether",
         "WSTETH:USDC": "wrapped-steth",
@@ -137,6 +142,7 @@ BUILTIN_COINGECKO_COIN_IDS = _deep_freeze(
 BUILTIN_COINGECKO_HISTORY_SYMBOLS = frozenset(
     {
         "BETH:USDC",
+        "BNSOL:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
         "ETH:USD",
@@ -147,6 +153,7 @@ BUILTIN_COINGECKO_HISTORY_SYMBOLS = frozenset(
 BUILTIN_COINGECKO_COMPONENT_SKEW_SECONDS = _deep_freeze(
     {
         "WBETH:USDC": 60.0,
+        "BNSOL:USDC": 60.0,
         "BETH:USDC": 60.0,
         "STETH:USDC": 60.0,
         "WSTETH:USDC": 60.0,
@@ -240,6 +247,22 @@ BUILTIN_SYNTHETIC_RECIPES = _deep_freeze(
             (15.0, 15.0),
             "synthetic_binance",
         ),
+        "bnsol_primary": BuiltinSyntheticRecipePolicy(
+            "BNSOL:USDC",
+            "multiply",
+            ("BNSOL:SOL", "SOL:USDC"),
+            2.0,
+            (15.0, 15.0),
+            "synthetic_binance",
+        ),
+        "bnsol_alternate": BuiltinSyntheticRecipePolicy(
+            "BNSOL:USDC",
+            "divide",
+            ("BNSOL:USDT", "USDC:USDT"),
+            2.0,
+            (15.0, 15.0),
+            "synthetic_binance",
+        ),
         "beth_primary": BuiltinSyntheticRecipePolicy(
             "BETH:USDC",
             "multiply",
@@ -320,7 +343,17 @@ BUILTIN_BINANCE_STAKING_RATE_POLICIES = _deep_freeze(
             "underlying_asset": "ETH",
             "accrual_mode": RewardAccrualMode.VALUE_ACCRUING,
             "method": "binance_wbeth_rate_history_apr",
-        }
+            "rate_history_path": "/sapi/v1/eth-staking/eth/history/rateHistory",
+            "feed": "binance_eth_staking",
+        },
+        "BNSOL:USDC": {
+            "index_symbol": "BNSOL:SOL",
+            "underlying_asset": "SOL",
+            "accrual_mode": RewardAccrualMode.VALUE_ACCRUING,
+            "method": "binance_bnsol_rate_history_apr",
+            "rate_history_path": "/sapi/v1/sol-staking/sol/history/rateHistory",
+            "feed": "binance_sol_staking",
+        },
     }
 )
 BUILTIN_LIDO_YIELD_POLICIES = _deep_freeze(
@@ -345,6 +378,13 @@ BUILTIN_STAKING_RATIO_POLICIES = (
         staking_pair="WBETH:USDC",
         underlying_pair="ETH:USDC",
         underlying_asset="ETH",
+        accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+    ),
+    BuiltinStakingRatioPolicy(
+        symbol="BNSOL:USDC",
+        staking_pair="BNSOL:USDC",
+        underlying_pair="SOL:USDC",
+        underlying_asset="SOL",
         accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
     ),
     BuiltinStakingRatioPolicy(
@@ -407,8 +447,24 @@ BUILTIN_PROVIDER_ROUTES = _deep_freeze(
                 "synthetic_wbeth_history_alternate",
             ),
             "yield": (
-                "binance_wbeth_rate",
+                "binance_staking_rate",
                 "ethereum_exchange_rate",
+                "staking_market_ratio_proxy",
+            ),
+        },
+        "BNSOL:USDC": {
+            "quote": (
+                "synthetic_bnsol_primary",
+                "synthetic_bnsol_alternate",
+                "coingecko",
+            ),
+            "history": (
+                "synthetic_bnsol_history_primary",
+                "synthetic_bnsol_history_alternate",
+                "coingecko",
+            ),
+            "yield": (
+                "binance_staking_rate",
                 "staking_market_ratio_proxy",
             ),
         },

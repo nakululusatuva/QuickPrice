@@ -101,11 +101,11 @@ def install_builtin_provider_routes(context: ProviderInstallContext) -> None:
     )
 
     if settings.binance_api_key and settings.binance_api_secret:
-        providers["binance_wbeth_rate"] = create_builtin_binance_yield_provider(
+        providers["binance_staking_rate"] = create_builtin_binance_yield_provider(
             settings.binance_api_key,
             settings.binance_api_secret,
             request_timeout=settings.provider_timeout_seconds,
-            **_proxy_options(settings, "binance_wbeth_rate"),
+            **_proxy_options(settings, "binance_staking_rate"),
         )
     if settings.ethereum_rpc_urls:
         providers["aave_v3"] = create_builtin_aave_yield_provider(

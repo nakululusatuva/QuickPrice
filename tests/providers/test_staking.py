@@ -647,7 +647,32 @@ async def test_ethereum_history_chunks_log_requests_to_configured_span():
 
 
 @pytest.mark.asyncio
-async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
+@pytest.mark.parametrize(
+    ("symbol", "expected_path", "expected_feed", "expected_method", "expected_index"),
+    (
+        (
+            "WBETH:USD",
+            "/sapi/v1/eth-staking/eth/history/rateHistory",
+            "binance_eth_staking",
+            "binance_wbeth_rate_history_apr",
+            "WBETH:ETH",
+        ),
+        (
+            "BNSOL:USDC",
+            "/sapi/v1/sol-staking/sol/history/rateHistory",
+            "binance_sol_staking",
+            "binance_bnsol_rate_history_apr",
+            "BNSOL:SOL",
+        ),
+    ),
+)
+async def test_binance_staking_rate_preserves_annual_fraction_and_signs_request(
+    symbol: str,
+    expected_path: str,
+    expected_feed: str,
+    expected_method: str,
+    expected_index: str,
+):
     now = datetime(2026, 7, 20, tzinfo=UTC)
     provider = create_builtin_binance_yield_provider(
         "read-only-key",
@@ -667,12 +692,12 @@ async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
         }
     )
 
-    metric = await provider.get_yield("WBETH:USD")
+    metric = await provider.get_yield(symbol)
 
-    assert metric.symbol == "WBETH:USD"
+    assert metric.symbol == symbol
     assert metric.value == Decimal("2.300")
     assert metric.rate_type is YieldRateType.APR
-    assert metric.method == "binance_wbeth_rate_history_apr"
+    assert metric.method == expected_method
     assert metric.is_proxy is False
     assert metric.is_estimate is False
     assert metric.observation_window_days is None
@@ -681,9 +706,11 @@ async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
     assert metric.quality.confidence == "high"
     assert metric.quality.stale is False
     assert metric.accrual_index is not None
+    assert metric.accrual_index.symbol == expected_index
     assert metric.accrual_index.kind == "vendor_exchange_rate"
-    assert metric.components[0].feed == "binance_eth_staking"
+    assert metric.components[0].feed == expected_feed
     call = provider._request_json.await_args
+    assert call.args[1] == f"https://api.binance.com{expected_path}"
     params = dict(call.kwargs["params"])
     signature = params.pop("signature")
     expected = hmac.new(
@@ -697,7 +724,7 @@ async def test_binance_wbeth_rate_preserves_annual_fraction_and_signs_request():
 
 
 @pytest.mark.asyncio
-async def test_binance_wbeth_rate_rejects_negative_vendor_apr():
+async def test_binance_staking_rate_rejects_negative_vendor_apr():
     now = datetime(2026, 7, 20, tzinfo=UTC)
     provider = create_builtin_binance_yield_provider(
         "read-only-key",
@@ -719,6 +746,24 @@ async def test_binance_wbeth_rate_rejects_negative_vendor_apr():
 
     with pytest.raises(MalformedResponse, match="APR cannot be negative"):
         await provider.get_yield("WBETH:USDC")
+
+
+def test_binance_staking_rate_rejects_uncontrolled_endpoint_policy() -> None:
+    with pytest.raises(ValueError, match="controlled SAPI v1 path"):
+        create_builtin_binance_yield_provider(
+            "read-only-key",
+            "secret",
+            yield_policies={
+                "BAD:USDC": {
+                    "index_symbol": "BAD:SOL",
+                    "underlying_asset": "SOL",
+                    "accrual_mode": RewardAccrualMode.VALUE_ACCRUING,
+                    "method": "bad",
+                    "rate_history_path": "https://evil.invalid/rateHistory",
+                    "feed": "bad",
+                }
+            },
+        )
 
 
 @pytest.mark.asyncio

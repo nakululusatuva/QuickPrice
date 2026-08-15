@@ -196,10 +196,10 @@ def create_builtin_binance_yield_provider(
     api_secret: str,
     **kwargs: Any,
 ) -> Any:
-    from .providers.staking import BinanceWbethYieldProvider
+    from .providers.staking import BinanceStakingYieldProvider
 
     _default(kwargs, "yield_policies", BUILTIN_BINANCE_STAKING_RATE_POLICIES)
-    return BinanceWbethYieldProvider(api_key, api_secret, **kwargs)
+    return BinanceStakingYieldProvider(api_key, api_secret, **kwargs)
 
 
 def create_builtin_ethereum_yield_provider(rpc_urls: Any, **kwargs: Any) -> Any:

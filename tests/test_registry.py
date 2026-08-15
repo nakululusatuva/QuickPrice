@@ -24,7 +24,7 @@ from quickprice.registry import INSTRUMENTS, SYMBOLS, InstrumentRegistry, build_
 
 
 def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> None:
-    assert SYMBOLS[:12] == (
+    assert SYMBOLS[:13] == (
         "BTC:USDC",
         "ETH:USDC",
         "SOL:USDC",
@@ -33,20 +33,21 @@ def test_builtin_plugin_preserves_the_initial_catalog_and_asset_classes() -> Non
         "BNB:USDC",
         "TRX:USDC",
         "WBETH:USDC",
+        "BNSOL:USDC",
         "BETH:USDC",
         "STETH:USDC",
         "WSTETH:USDC",
         "AETHWETH:USDC",
     )
-    assert SYMBOLS[12:22] == COMMON_STOCK_SYMBOLS
-    assert SYMBOLS[22:25] == (
+    assert SYMBOLS[13:23] == COMMON_STOCK_SYMBOLS
+    assert SYMBOLS[23:26] == (
         "QQQM:USD",
         "BOXX:USD",
         "SGOV:USD",
     )
-    assert SYMBOLS[25:] == FX_SYMBOLS
-    assert len(SYMBOLS) == 55
-    assert BUILTIN_PLUGIN.version == "1.7.0"
+    assert SYMBOLS[26:] == FX_SYMBOLS
+    assert len(SYMBOLS) == 56
+    assert BUILTIN_PLUGIN.version == "1.8.0"
     assert INSTRUMENTS["BTC:USDC"].asset_class is AssetClass.CRYPTO
     assert INSTRUMENTS["QQQM:USD"].asset_class is AssetClass.EQUITY
     assert INSTRUMENTS["BOXX:USD"].asset_class is AssetClass.BOND
@@ -91,6 +92,16 @@ def test_builtin_wbeth_declares_required_staking_income_semantics() -> None:
     assert wbeth.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
     assert wbeth.reward_accrual_mode is RewardAccrualMode.VALUE_ACCRUING
     assert wbeth.underlying_asset == "ETH"
+
+
+def test_builtin_bnsol_declares_value_accruing_sol_income_semantics() -> None:
+    bnsol = INSTRUMENTS["BNSOL:USDC"]
+
+    assert bnsol.name == "Binance Staked SOL"
+    assert bnsol.price_basis == "synthetic_cross"
+    assert bnsol.yield_strategy is YieldStrategy.STAKING_PROVIDER_METRIC
+    assert bnsol.reward_accrual_mode is RewardAccrualMode.VALUE_ACCRUING
+    assert bnsol.underlying_asset == "SOL"
 
 
 def test_lido_tokens_distinguish_rebasing_and_value_accrual() -> None:

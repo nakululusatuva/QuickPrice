@@ -39,7 +39,7 @@ from .router import ProviderRouter
 from .staking import (
     AaveReserveYieldSpec,
     AaveV3YieldProvider,
-    BinanceWbethYieldProvider,
+    BinanceStakingYieldProvider,
     EthereumExchangeRateSpec,
     EthereumExchangeRateYieldProvider,
     StakingBackingQuoteProvider,
@@ -67,7 +67,7 @@ __all__ = [
     "AlpacaProvider",
     "AlphaVantageProvider",
     "BinanceProvider",
-    "BinanceWbethYieldProvider",
+    "BinanceStakingYieldProvider",
     "Capability",
     "CoinGeckoProvider",
     "CompiledRoutePlan",

@@ -1065,12 +1065,19 @@ class _BinanceRateRow:
     exchange_rate: Decimal
 
 
-class BinanceWbethYieldProvider(HttpProvider):
-    """Read Binance's signed, provider-reported staking APR."""
+_BINANCE_STAKING_RATE_PATHS = frozenset(
+    {
+        "/sapi/v1/eth-staking/eth/history/rateHistory",
+        "/sapi/v1/sol-staking/sol/history/rateHistory",
+    }
+)
 
-    name = "binance_wbeth_rate"
+
+class BinanceStakingYieldProvider(HttpProvider):
+    """Read signed Binance staking rates from controlled instrument policies."""
+
+    name = "binance_staking_rate"
     base_url = "https://api.binance.com"
-    path = "/sapi/v1/eth-staking/eth/history/rateHistory"
 
     def __init__(
         self,
@@ -1093,6 +1100,12 @@ class BinanceWbethYieldProvider(HttpProvider):
             symbol.strip().upper(): dict(policy)
             for symbol, policy in (yield_policies or {}).items()
         }
+        for policy in self.yield_policies.values():
+            path = str(policy.get("rate_history_path", "")).strip()
+            if path not in _BINANCE_STAKING_RATE_PATHS:
+                raise ValueError("Binance staking-rate path must be a controlled SAPI v1 path")
+            if not str(policy.get("feed", "")).strip():
+                raise ValueError("Binance staking-rate feed is required")
         self._clock = clock
         self.recv_window_ms = recv_window_ms
 
@@ -1117,8 +1130,9 @@ class BinanceWbethYieldProvider(HttpProvider):
         underlying_asset = str(policy["underlying_asset"]).strip().upper()
         accrual_mode = RewardAccrualMode(policy["accrual_mode"])
         method = str(policy["method"]).strip()
+        feed = str(policy["feed"]).strip()
         now = ensure_utc(self._clock())
-        rows = await self._rows(now - timedelta(days=30), now)
+        rows = await self._rows(policy, now - timedelta(days=30), now)
         if not rows:
             raise ProviderUnavailable(self.name, "staking-rate history is empty")
         row = rows[-1]
@@ -1146,7 +1160,7 @@ class BinanceWbethYieldProvider(HttpProvider):
                     provider=self.name,
                     price=index.value,
                     as_of=index.as_of,
-                    feed="binance_eth_staking",
+                    feed=feed,
                     role="vendor_exchange_rate",
                 ),
             ),
@@ -1179,7 +1193,7 @@ class BinanceWbethYieldProvider(HttpProvider):
         _, policy = self._policy(symbol)
         index_symbol = str(policy["index_symbol"]).strip().upper()
         underlying_asset = str(policy["underlying_asset"]).strip().upper()
-        rows = await self._rows(ensure_utc(start), ensure_utc(end))
+        rows = await self._rows(policy, ensure_utc(start), ensure_utc(end))
         return tuple(
             AccrualIndexPoint(
                 symbol=index_symbol,
@@ -1192,7 +1206,12 @@ class BinanceWbethYieldProvider(HttpProvider):
             for row in rows
         )
 
-    async def _rows(self, start: datetime, end: datetime) -> Sequence[_BinanceRateRow]:
+    async def _rows(
+        self,
+        policy: Mapping[str, Any],
+        start: datetime,
+        end: datetime,
+    ) -> Sequence[_BinanceRateRow]:
         if start >= end:
             raise ValueError("staking-rate history start must be before end")
         if end - start > timedelta(days=93):
@@ -1214,7 +1233,7 @@ class BinanceWbethYieldProvider(HttpProvider):
         ).hexdigest()
         payload = await self._request_json(
             "GET",
-            f"{self.base_url}{self.path}",
+            f"{self.base_url}{policy['rate_history_path']}",
             params=params,
             headers={"X-MBX-APIKEY": self.api_key},
         )

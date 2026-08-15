@@ -332,8 +332,8 @@ PROVIDER_CATALOG: Mapping[str, ProviderDescriptor] = {
             notes="Controlled United States Treasury series for proxy yields.",
         ),
         _descriptor(
-            "binance_wbeth_rate",
-            "Binance WBETH Rate",
+            "binance_staking_rate",
+            "Binance Staking Rate",
             kind=ProviderKind.INCOME_DATA,
             capabilities=frozenset({Capability.YIELD}),
             asset_classes=_CRYPTO,
@@ -434,6 +434,8 @@ _CANONICAL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]*:[A-Z0-9][A-Z0-9._-]*$")
 
 def canonical_provider_name(name: str) -> str:
     normalized = name.strip().lower()
+    if normalized == "binance_wbeth_rate":
+        return "binance_staking_rate"
     if normalized in PROVIDER_CATALOG:
         return normalized
     if normalized == "synthetic_fx_history":

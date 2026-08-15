@@ -24,7 +24,7 @@ from quickprice.providers.fx import UsdHubFxHistoryProvider, UsdHubFxQuoteProvid
 from quickprice.providers.okx import OkxBethYieldProvider, OkxMarketProvider
 from quickprice.providers.staking import (
     AaveV3YieldProvider,
-    BinanceWbethYieldProvider,
+    BinanceStakingYieldProvider,
     EthereumExchangeRateYieldProvider,
     LidoAprProvider,
     StakingBackingQuoteProvider,
@@ -61,16 +61,47 @@ async def test_wbeth_yield_route_prefers_binance_then_onchain_then_market_ratio(
         chain = graph.router.providers_for("WBETH:USDC", Capability.YIELD)
 
         assert tuple(type(provider) for provider in chain) == (
-            BinanceWbethYieldProvider,
+            BinanceStakingYieldProvider,
             EthereumExchangeRateYieldProvider,
             StakingMarketRatioYieldProvider,
         )
         assert tuple(provider.name for provider in chain) == (
-            "binance_wbeth_rate",
+            "binance_staking_rate",
             "ethereum_exchange_rate",
             "staking_market_ratio_proxy",
         )
         assert chain[-1].lookback_days == 30
+    finally:
+        await graph.close()
+
+
+@pytest.mark.asyncio
+async def test_bnsol_uses_binance_crosses_and_official_rate_before_ratio_fallback() -> None:
+    settings = Settings(
+        require_free_threaded=False,
+        background_enabled=False,
+        binance_api_key="read-only-key",
+        binance_api_secret="signing-secret",
+    )
+    graph = build_provider_graph(settings)
+    try:
+        quote_chain = graph.router.providers_for("BNSOL:USDC", Capability.QUOTE)
+        history_chain = graph.router.providers_for("BNSOL:USDC", Capability.HISTORY)
+        yield_chain = graph.router.providers_for("BNSOL:USDC", Capability.YIELD)
+
+        assert len(quote_chain) == len(history_chain) == 2
+        assert quote_chain[0]._recipes["BNSOL:USDC"].left_symbol == "BNSOL:SOL"
+        assert quote_chain[0]._recipes["BNSOL:USDC"].right_symbol == "SOL:USDC"
+        assert quote_chain[1]._recipes["BNSOL:USDC"].left_symbol == "BNSOL:USDT"
+        assert quote_chain[1]._recipes["BNSOL:USDC"].right_symbol == "USDC:USDT"
+        assert tuple(type(provider) for provider in yield_chain) == (
+            BinanceStakingYieldProvider,
+            StakingMarketRatioYieldProvider,
+        )
+        assert tuple(provider.name for provider in yield_chain) == (
+            "binance_staking_rate",
+            "staking_market_ratio_proxy",
+        )
     finally:
         await graph.close()
 
@@ -112,7 +143,7 @@ async def test_wbeth_yield_route_uses_onchain_before_proxy_without_binance_crede
             EthereumExchangeRateYieldProvider,
             StakingMarketRatioYieldProvider,
         )
-        assert "binance_wbeth_rate" not in graph.providers
+        assert "binance_staking_rate" not in graph.providers
     finally:
         await graph.close()
 
@@ -133,7 +164,7 @@ async def test_wbeth_yield_route_keeps_market_ratio_as_final_fallback_without_cr
         assert chain[0].name == "staking_market_ratio_proxy"
         assert chain[0].lookback_days == 37
         assert "ethereum_exchange_rate" not in graph.providers
-        assert "binance_wbeth_rate" not in graph.providers
+        assert "binance_staking_rate" not in graph.providers
     finally:
         await graph.close()
 

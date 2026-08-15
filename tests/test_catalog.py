@@ -264,6 +264,43 @@ def test_customized_builtin_quote_route_is_not_overwritten_by_migration(tmp_path
     assert retained.providers == ("staking_backing_proxy", "coingecko")
 
 
+def test_legacy_binance_wbeth_provider_name_migrates_without_losing_route_order(tmp_path) -> None:
+    path = tmp_path / "instruments.json"
+    InstrumentPolicyStore(path, build_registry())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    wbeth = next(
+        item for item in payload["active"]["instruments"] if item["symbol"] == "WBETH:USDC"
+    )
+    yield_route = next(route for route in wbeth["routes"] if route["capability"] == "yield")
+    yield_route["providers"] = [
+        "staking_market_ratio_proxy",
+        "binance_wbeth_rate",
+        "ethereum_exchange_rate",
+    ]
+    payload["active"]["revision"] = hashlib.sha256(
+        json.dumps(
+            {"instruments": payload["active"]["instruments"]},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = InstrumentPolicyStore(path, build_registry(), defer_migration=True)
+    migrated = next(
+        route
+        for route in store.active_generation().by_symbol()["WBETH:USDC"].routes
+        if route.capability == "yield"
+    )
+
+    assert migrated.providers == (
+        "staking_market_ratio_proxy",
+        "binance_staking_rate",
+        "ethereum_exchange_rate",
+    )
+
+
 def test_builtin_history_defaults_migrate_only_null_catalog_values(tmp_path) -> None:
     path = tmp_path / "instruments.json"
     InstrumentPolicyStore(path, build_registry())

@@ -275,7 +275,7 @@ const providers = [
   descriptor("fred", ["yield"], ["bond"], { kind: "income_data" }),
   descriptor("synthetic", ["quote", "history"], ["crypto", "fx", "equity", "bond"], { kind: "derived" }),
   descriptor("synthetic_fx", ["quote", "history"], ["fx"], { kind: "derived" }),
-  descriptor("binance_wbeth_rate", ["yield"], ["crypto"], { kind: "income_data" }),
+  descriptor("binance_staking_rate", ["yield"], ["crypto"], { kind: "income_data" }),
   descriptor("ethereum_exchange_rate", ["yield"], ["crypto"], { configured: false, kind: "income_data" }),
   descriptor("okx_beth_yield", ["yield"], ["crypto"], { kind: "income_data" }),
   descriptor("lido", ["yield"], ["crypto"], { kind: "income_data" }),
@@ -316,7 +316,12 @@ const wbeth = recommendedRoutesForDraft(draft({
   symbol: "WBETH:USDC", assetType: "staking_token", yieldStrategy: "staking_provider_metric",
   accrualMode: "value_accruing", providerSymbols: "binance=WBETHUSDC",
 }), providers);
-assertEqual(wbeth.yield, ["binance_wbeth_rate", "staking_market_ratio_proxy"], "WBETH staking semantics");
+assertEqual(wbeth.yield, ["binance_staking_rate", "staking_market_ratio_proxy"], "WBETH staking semantics");
+const bnsol = recommendedRoutesForDraft(draft({
+  symbol: "BNSOL:USDC", assetType: "staking_token", yieldStrategy: "staking_provider_metric",
+  accrualMode: "value_accruing", providerSymbols: "",
+}), providers);
+assertEqual(bnsol.yield, ["binance_staking_rate", "staking_market_ratio_proxy"], "BNSOL staking semantics");
 const beth = recommendedRoutesForDraft(draft({
   symbol: "BETH:USDC", assetType: "staking_token", yieldStrategy: "staking_provider_metric",
   accrualMode: "distributed_units", providerSymbols: "",

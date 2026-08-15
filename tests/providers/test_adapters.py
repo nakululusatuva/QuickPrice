@@ -80,14 +80,21 @@ def test_crypto_streams_suppress_duplicate_rest_only_while_fresh() -> None:
 
 
 @pytest.mark.asyncio
-async def test_binance_internal_wbeth_leg_uses_current_book_midpoint():
+@pytest.mark.parametrize(
+    ("symbol", "exchange_symbol"),
+    (("WBETH:ETH", "WBETHETH"), ("BNSOL:SOL", "BNSOLSOL")),
+)
+async def test_binance_internal_staking_leg_uses_current_book_midpoint(
+    symbol: str,
+    exchange_symbol: str,
+):
     observed_at = datetime(2026, 7, 20, 15, 30, tzinfo=UTC)
     provider = create_builtin_binance_provider(wall_clock=lambda: observed_at)
     provider._request_json = AsyncMock(
-        return_value={"symbol": "WBETHETH", "bidPrice": "1.1022", "askPrice": "1.1024"}
+        return_value={"symbol": exchange_symbol, "bidPrice": "1.1022", "askPrice": "1.1024"}
     )
 
-    result = await provider.get_quote("WBETH:ETH")
+    result = await provider.get_quote(symbol)
 
     assert result.price == Decimal("1.1023")
     assert result.as_of == observed_at
@@ -581,6 +588,7 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "binancecoin": {"usd": 800, "last_updated_at": timestamp},
         "tron": {"usd": 0.30, "last_updated_at": timestamp},
         "wrapped-beacon-eth": {"usd": 4_500, "last_updated_at": timestamp},
+        "binance-staked-sol": {"usd": 198, "last_updated_at": timestamp},
         "okx-beth": {"usd": 3_995, "last_updated_at": timestamp},
         "staked-ether": {"usd": 3_990, "last_updated_at": timestamp},
         "wrapped-steth": {"usd": 4_800, "last_updated_at": timestamp},
@@ -603,17 +611,19 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         provider.get_quote("BNB:USDC"),
         provider.get_quote("TRX:USDC"),
         provider.get_quote("WBETH:USDC"),
+        provider.get_quote("BNSOL:USDC"),
         provider.get_quote("BETH:USDC"),
         provider.get_quote("STETH:USDC"),
         provider.get_quote("WSTETH:USDC"),
     )
 
-    assert len(results) == 11
+    assert len(results) == 12
     assert results[2].price == Decimal("180")
     assert results[3].price == Decimal("325")
     assert results[4].price == Decimal("0.25")
     assert results[5].price == Decimal("800")
     assert results[6].price == Decimal("0.30")
+    assert results[8].price == Decimal("198")
     assert provider._request_json.await_count == 1
     requested_ids = provider._request_json.await_args.kwargs["params"]["ids"].split(",")
     assert set(requested_ids) == {
@@ -625,6 +635,7 @@ async def test_coingecko_batches_all_fallback_symbols_behind_one_refresh():
         "binancecoin",
         "tron",
         "wrapped-beacon-eth",
+        "binance-staked-sol",
         "okx-beth",
         "staked-ether",
         "wrapped-steth",

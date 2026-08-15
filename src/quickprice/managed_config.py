@@ -577,6 +577,19 @@ _BUILTIN_ROUTE_DEFAULT_MIGRATIONS: Final[dict[tuple[str, str], frozenset[tuple[s
     ),
     ("STETH:USDC", "quote"): frozenset({("coingecko",)}),
     ("WSTETH:USDC", "quote"): frozenset({("coingecko",)}),
+    ("WBETH:USDC", "yield"): frozenset(
+        {
+            (
+                "binance_wbeth_rate",
+                "ethereum_exchange_rate",
+                "staking_market_ratio_proxy",
+            )
+        }
+    ),
+}
+
+_BUILTIN_PROVIDER_NAME_MIGRATIONS: Final[dict[str, str]] = {
+    "binance_wbeth_rate": "binance_staking_rate",
 }
 
 
@@ -591,13 +604,18 @@ def _reconciled_builtin_routes(
     result: list[dict[str, Any]] = []
     for route in persisted_routes:
         capability = str(route["capability"])
-        providers = tuple(str(provider) for provider in route["providers"])
-        previous_defaults = _BUILTIN_ROUTE_DEFAULT_MIGRATIONS.get((symbol, capability), frozenset())
-        result.append(
-            baseline_by_capability[capability]
-            if providers in previous_defaults and capability in baseline_by_capability
-            else route
+        persisted_providers = tuple(str(provider) for provider in route["providers"])
+        providers = tuple(
+            _BUILTIN_PROVIDER_NAME_MIGRATIONS.get(provider, provider)
+            for provider in persisted_providers
         )
+        previous_defaults = _BUILTIN_ROUTE_DEFAULT_MIGRATIONS.get((symbol, capability), frozenset())
+        if persisted_providers in previous_defaults and capability in baseline_by_capability:
+            result.append(baseline_by_capability[capability])
+        elif providers != persisted_providers:
+            result.append({**route, "providers": list(providers)})
+        else:
+            result.append(route)
     return result
 
 

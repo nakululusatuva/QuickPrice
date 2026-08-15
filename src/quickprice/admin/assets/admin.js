@@ -1503,10 +1503,10 @@ function providerBindingNames(value) {
 
 function stakingYieldCandidates(symbol, accrualMode) {
   const base = symbol.split(":", 1)[0];
-  if (base === "WBETH") {
+  if (base === "WBETH" || base === "BNSOL") {
     return [
-      "binance_wbeth_rate",
-      "ethereum_exchange_rate",
+      "binance_staking_rate",
+      ...(base === "WBETH" ? ["ethereum_exchange_rate"] : []),
       ...(accrualMode === "value_accruing" ? ["staking_market_ratio_proxy"] : []),
     ];
   }

@@ -60,7 +60,7 @@ COMMON_STOCK_INSTRUMENTS = tuple(_common_stock_instrument(item) for item in COMM
 
 BUILTIN_PLUGIN = InstrumentPlugin(
     plugin_id="builtin",
-    version="1.7.0",
+    version="1.8.0",
     provider_installer="quickprice.providers.wiring:install_builtin_provider_routes",
     instruments=(
         InstrumentSpec(
@@ -156,6 +156,24 @@ BUILTIN_PLUGIN = InstrumentPlugin(
             reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
             underlying_asset="ETH",
             quote_poll_seconds=1.0,
+        ),
+        InstrumentSpec(
+            symbol="BNSOL:USDC",
+            base="BNSOL",
+            quote="USDC",
+            name="Binance Staked SOL",
+            description=(
+                "A value-accruing Binance liquid-staking token representing staked SOL; "
+                "rewards increase its SOL conversion rate each Solana epoch."
+            ),
+            asset_class=AssetClass.CRYPTO,
+            asset_type="liquid_staking_token",
+            price_basis="synthetic_cross",
+            yield_strategy=YieldStrategy.STAKING_PROVIDER_METRIC,
+            reward_accrual_mode=RewardAccrualMode.VALUE_ACCRUING,
+            underlying_asset="SOL",
+            quote_poll_seconds=1.0,
+            history_poll_seconds=21_600.0,
         ),
         InstrumentSpec(
             symbol="BETH:USDC",
